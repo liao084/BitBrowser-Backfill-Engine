@@ -44,8 +44,6 @@ class BackfillEngine:
         self.bite_id = bite_id
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = 120
-        # 互斥锁：用于解决插件开新标签页时的并发捕获冲突（串台问题）
-        self.tab_lock = asyncio.Lock()
 
     def get_debugger_address(self) -> Optional[str]:
         """
@@ -212,9 +210,9 @@ class BackfillEngine:
         else:
             logger.info(f"Worker-{worker_id} 未检测到三级弹窗，正常采集完成。")
 
-    async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]]):
+    async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]], list_index: int):
         """Worker 协程：处理指定页面上的所有日期分块任务"""
-        worker_id = f"卡片-{task_card_index}"
+        worker_id = f"卡片-{task_card_index}[{list_index}]"
         logger.info(f"Worker-{worker_id} 启动，绑定页面: {page.url[-25:]}")
         
         # --- 页面初始化清理 ---
@@ -276,59 +274,55 @@ class BackfillEngine:
                 
                 logger.info(f"Worker-{worker_id} 等待查询结果容器渲染 (最多45秒)...")
                 try:
-                    await page.wait_for_selector('.testContent_list:has-text("京东商智")', state='visible', timeout=45000)
+                    await page.wait_for_selector('.testContent_list', state='visible', timeout=45000)
                     logger.info(f"Worker-{worker_id} 查询结果已渲染完成！")
                 except PlaywrightTimeoutError:
                     logger.warning(f"Worker-{worker_id} 等待查询结果超时(45s)，仍继续尝试下一步。")
                 
-                # 保险起见，给 500ms 让后续的按钮 DOM 渲染完全
+                # 缓冲 500ms 让顶部的统计状态栏渲染完全
                 await page.wait_for_timeout(500)
                 
-                # 点击补齐数据
-                logger.info(f"Worker-{worker_id} 点击补齐数据按钮...")
+                # --- 核心优化：直接读取统计文本判定缺失状态，彻底抛弃脆弱的 Toast 探测 ---
+                try:
+                    # 获取统计缺失数据的 span 文本
+                    missing_span = page.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
+                    missing_text = await missing_span.inner_text()
+                    
+                    # 使用正则提取数字
+                    match = re.search(r'\d+', missing_text)
+                    missing_count = int(match.group()) if match else 0
+                    
+                    if missing_count == 0:
+                        logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，无缺失数据，跳过！")
+                        continue
+                    else:
+                        logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，共缺失 {missing_count} 条数据。")
+                except Exception as e:
+                    logger.warning(f"Worker-{worker_id} 读取统计文本发生异常: {e}，将强制走补齐流程防错...")
+
+                # --- 既然有缺失数据（或探测异常兜底），则走后续补齐流程 ---
+                logger.info(f"Worker-{worker_id} 准备点击补齐数据按钮...")
                 backfill_btn_selector = "span.lostDataBtn:visible"
                 
-                # 无论是否有缺失数据，按钮都存在，直接点击
                 if await page.locator(backfill_btn_selector).count() > 0:
                     await page.locator(backfill_btn_selector).first.click(force=True)
                 else:
-                    # 防错处理：如果网页还没加载出按钮，等待后重试
                     logger.warning(f"Worker-{worker_id} 找不到补齐数据按钮，重试一次...")
                     await page.wait_for_selector(backfill_btn_selector, timeout=5000)
                     await page.locator(backfill_btn_selector).first.click(force=True)
                 
-                logger.info(f"Worker-{worker_id} 正在探测是否有【无需补齐】提示...")
-                try:
-                    # 如果 3 秒内等到了“无需补齐”的 Toast，说明真没数据缺失
-                    await page.wait_for_selector(".el-message__content:has-text('无需补齐')", state="attached", timeout=3000)
-                    logger.info(f"Worker-{worker_id} 检测到【无需补齐】提示，当日无缺失数据，跳过该日期！")
-                    
-                    # 关键修复：等待该绿色提示框彻底消失再 continue，防止把残影带入下一天的检测
-                    logger.info(f"Worker-{worker_id} 等待【无需补齐】提示框消失...")
-                    await page.wait_for_selector(".el-message__content:has-text('无需补齐')", state="detached", timeout=5000)
-                    continue # 采集完成（无缺失），直接进入下一个循环
-                except PlaywrightTimeoutError:
-                    # 3秒还没等到 Toast，说明没有出现“无需补齐”，那么必然是弹出了二级弹窗
-                    logger.info(f"Worker-{worker_id} 未检测到【无需补齐】，说明进入了二级弹窗，继续后续补齐流程...")
-                
 
                 whole_store_btn_selector = "#loseDays_shop_btn"
                 
-                # 捕获点击“全店补齐”后新开的蓝页标签
-                logger.info(f"Worker-{worker_id} 确认存在缺失数据，准备获取全局锁以安全捕获新标签页...")
-                new_tab = None
+                logger.info(f"Worker-{worker_id} 等待二级弹窗加载并点击全店补齐...")
                 try:
-                    # 获取互斥锁：确保同一瞬间只有一个 worker 在触发插件弹窗，彻底解决串台问题
-                    async with self.tab_lock:
-                        async with page.context.expect_page(timeout=8000) as new_page_info:
-                            await page.click(whole_store_btn_selector, force=True)
-                        new_tab = await new_page_info.value
-                    logger.info(f"Worker-{worker_id} 成功安全捕获到新弹出的京东数智标签页: {new_tab.url}")
-                except PlaywrightTimeoutError:
-                    logger.warning(f"Worker-{worker_id} 点击全店补齐后，5秒内未捕获到新标签页，将继续在主页面监听。")
-                    # 如果超时没捕获到，可能网络慢或按钮触发失败，确保已经点击了
+                    # 关键修复：显式等待二级弹窗内的“全店补齐”按钮渲染并可见
+                    await page.wait_for_selector(whole_store_btn_selector, state="visible", timeout=10000)
+                    
+                    # 剥离锁和捕获逻辑，新开的商智标签页全权交由全局 GC 守护进程接管
+                    await page.click(whole_store_btn_selector, force=True)
                 except Exception as e:
-                    logger.warning(f"Worker-{worker_id} 捕获新标签页时出现异常: {e}")
+                    logger.warning(f"Worker-{worker_id} 点击全店补齐时出现异常: {e}")
                 
                 # 4. 开始完工判定（交由 GC 守护进程管理蓝页，此处只需判定本页弹窗状态）
                 await self.wait_for_completion_or_heartbeat(page, worker_id)
@@ -410,8 +404,8 @@ class BackfillEngine:
                 # 动态生成该任务专属的 date_chunks
                 date_chunks = self.generate_date_chunks(config["start"], config["end"], config["chunk_days"])
                 
-                # 将协程任务加入列表，把 task_card_index 传进去
-                worker_tasks.append(self.worker(task_card_index=task_card_index, page=page, date_chunks=date_chunks))
+                # 将协程任务加入列表，把 task_card_index 和当前的 list_index 传进去
+                worker_tasks.append(self.worker(task_card_index=task_card_index, page=page, date_chunks=date_chunks, list_index=i))
             
             if worker_tasks:
                 logger.info(f"\n{'='*40}\n开始并发执行 {len(worker_tasks)} 个标签页任务...\n{'='*40}")
@@ -425,7 +419,7 @@ if __name__ == "__main__":
     # 任务配置列表：每个字典代表分配给一个标签页的采集任务
     # 注意：支持多个标签页同时采集同一个卡片（比如 4 个标签页同时跑卡片 5，但日期不同）
     tasks_config = [
-        {"card": 3, "start": "2026-05-01", "end": "2026-05-31", "chunk_days": 1},
+        {"card": 3, "start": "2025-07-01", "end": "2025-07-31", "chunk_days": 1},
         {"card": 5, "start": "2025-07-01", "end": "2025-07-15", "chunk_days": 1},
         {"card": 5, "start": "2025-07-16", "end": "2025-07-31", "chunk_days": 1},
         {"card": 5, "start": "2025-08-01", "end": "2025-08-15", "chunk_days": 1},

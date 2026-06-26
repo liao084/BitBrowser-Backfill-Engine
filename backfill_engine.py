@@ -15,8 +15,7 @@ from typing import Optional, List, Tuple
 import requests
 from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
 
-# 配置日志
-# 配置日志（同时输出到控制台和本地文件）
+# 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("BackfillEngine")
 logger.setLevel(logging.INFO)
@@ -142,7 +141,7 @@ class BackfillEngine:
 
     async def inject_dates(self, page: Page, start_date: str, end_date: str, worker_id: str):
         """
-        核心日期修改逻辑：改用 Playwright 真实键盘模拟，破解 Vue 的双向绑定失效问题。
+        日期注入逻辑：通过模拟真实的物理键盘事件，确保触发 Vue 框架的数据双向绑定。
         """
         logger.info(f"Worker-{worker_id} 开始注入采集区间: {start_date} 至 {end_date}")
         try:
@@ -158,7 +157,7 @@ class BackfillEngine:
             await page.keyboard.press("Enter")
             await page.wait_for_timeout(200)
             
-            # 为什么不用 JS evaluate？因为 JS 强行赋值往往无法触发 ElementUI 内部的 v-model 更新，导致点击检测时依旧使用了默认日期。
+            # 避免使用直接赋值，以确保 ElementUI 内部的 v-model 能够正确捕捉到数据变更。
         except Exception as e:
             logger.error(f"Worker-{worker_id} 日期注入失败: {e}")
             raise
@@ -279,50 +278,112 @@ class BackfillEngine:
                 except PlaywrightTimeoutError:
                     logger.warning(f"Worker-{worker_id} 等待查询结果超时(45s)，仍继续尝试下一步。")
                 
-                # 缓冲 500ms 让顶部的统计状态栏渲染完全
-                await page.wait_for_timeout(500)
+                # 缓冲 1000ms 让顶部的统计状态栏渲染完全
+                await page.wait_for_timeout(1000)
                 
-                # --- 核心优化：直接读取统计文本判定缺失状态，彻底抛弃脆弱的 Toast 探测 ---
+                # --- 防抖读取统计文本判定缺失状态 ---
+                is_missing_data = True # 默认兜底为存在缺失数据
                 try:
-                    # 获取统计缺失数据的 span 文本
-                    missing_span = page.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
-                    missing_text = await missing_span.inner_text()
-                    
-                    # 使用正则提取数字
-                    match = re.search(r'\d+', missing_text)
-                    missing_count = int(match.group()) if match else 0
-                    
-                    if missing_count == 0:
-                        logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，无缺失数据，跳过！")
-                        continue
-                    else:
-                        logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，共缺失 {missing_count} 条数据。")
+                    for retry_idx in range(3):
+                        missing_span = page.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
+                        await missing_span.wait_for(state='attached', timeout=10000)
+                        missing_text = await missing_span.inner_text()
+                        
+                        # 兼容负数情况，支持提取前置的负号
+                        match = re.search(r'-?\d+', missing_text)
+                        
+                        if not match:
+                            # 彻底没有提取到数字，说明真的是无缺失数据（纯文本 "[ 有条 缺失数据 ]"）
+                            logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，未检测到数字标识 [{missing_text}]，确认为无缺失数据，跳过！")
+                            is_missing_data = False
+                            break
+                        
+                        missing_count = int(match.group())
+                        if missing_count > 0:
+                            logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，识别到统计文本 [{missing_text}]，确认缺失 {missing_count} 条数据。")
+                            is_missing_data = True
+                            break
+                        else:
+                            # 提取到了 0 或 负数，前端渲染假象 Bug
+                            if retry_idx < 2:
+                                logger.warning(f"Worker-{worker_id} 提取到异常缺失量 0 或 负数 (前端渲染假象)，第 {retry_idx+1} 次重新点击【启动检测】...")
+                                await page.click("#checkbutn", force=True)
+                                
+                                # 重新点击启动检测后，等待数据容器重新渲染
+                                await page.wait_for_timeout(500) # 缓冲系统销毁旧 DOM 的时间
+                                try:
+                                    await page.wait_for_selector('.testContent_list', state='visible', timeout=45000)
+                                    logger.info(f"Worker-{worker_id} 第 {retry_idx+1} 次重试：检测容器已重新渲染成功！")
+                                except PlaywrightTimeoutError:
+                                    pass
+                                await page.wait_for_timeout(500) # 缓冲统计状态栏渲染完全
+                            else:
+                                logger.warning(f"Worker-{worker_id} 重试 3 次后统计文本仍显示 0 或 负数，放弃重试，强制触发补齐流程兜底！")
+                                is_missing_data = True
                 except Exception as e:
                     logger.warning(f"Worker-{worker_id} 读取统计文本发生异常: {e}，将强制走补齐流程防错...")
 
+                if not is_missing_data:
+                    continue
+
                 # --- 既然有缺失数据（或探测异常兜底），则走后续补齐流程 ---
-                logger.info(f"Worker-{worker_id} 准备点击补齐数据按钮...")
+                logger.info(f"Worker-{worker_id} 准备点击一级补齐数据按钮...")
                 backfill_btn_selector = "span.lostDataBtn:visible"
                 
                 if await page.locator(backfill_btn_selector).count() > 0:
-                    await page.locator(backfill_btn_selector).first.click(force=True)
+                    await page.locator(backfill_btn_selector).first.click()
                 else:
-                    logger.warning(f"Worker-{worker_id} 找不到补齐数据按钮，重试一次...")
+                    logger.warning(f"Worker-{worker_id} 找不到一级补齐数据按钮，重试一次...")
                     await page.wait_for_selector(backfill_btn_selector, timeout=5000)
-                    await page.locator(backfill_btn_selector).first.click(force=True)
+                    await page.locator(backfill_btn_selector).first.click()
                 
-
+                # --- 二级弹窗处理与全店补齐 ---
+                drawer_selector = "div.el-drawer.rtl:visible"
                 whole_store_btn_selector = "#loseDays_shop_btn"
                 
-                logger.info(f"Worker-{worker_id} 等待二级弹窗加载并点击全店补齐...")
+                logger.info(f"Worker-{worker_id} 等待二级弹窗渲染 (最多45秒)...")
                 try:
-                    # 关键修复：显式等待二级弹窗内的“全店补齐”按钮渲染并可见
-                    await page.wait_for_selector(whole_store_btn_selector, state="visible", timeout=10000)
+                    # 显式等待二级弹窗组件渲染完毕
+                    await page.wait_for_selector(drawer_selector, state="visible", timeout=45000)
+                    logger.info(f"Worker-{worker_id} 二级弹窗已安全渲染！")
                     
-                    # 剥离锁和捕获逻辑，新开的商智标签页全权交由全局 GC 守护进程接管
-                    await page.click(whole_store_btn_selector, force=True)
+                    # 弹窗重试与恢复策略：遭遇 UI 遮挡等异常时，主动关闭抽屉并重新拉起
+                    click_success = False
+                    for click_retry in range(3):
+                        try:
+                            # 二次确保按钮本身在 DOM 中可见
+                            await page.wait_for_selector(whole_store_btn_selector, state="visible", timeout=5000)
+                            # 依赖 Playwright 原生拦截检测机制，若有遮挡则主动抛出异常进入恢复流
+                            await page.click(whole_store_btn_selector)
+                            logger.info(f"Worker-{worker_id} 点击【全店补齐】指令发送成功！")
+                            click_success = True
+                            break
+                        except Exception as e:
+                            logger.warning(f"Worker-{worker_id} 第 {click_retry+1} 次点击全店补齐失败(可能遭遇subtree遮挡): {str(e)[:100]}...")
+                            if click_retry < 2:
+                                logger.info(f"Worker-{worker_id} 启动恢复流程：关闭二级弹窗并重新打开...")
+                                # 1. 点击二级弹窗的关闭(X)按钮
+                                drawer_close_btn = "i.el-icon-close:visible"
+                                if await page.locator(drawer_close_btn).count() > 0:
+                                    await page.locator(drawer_close_btn).last.click(force=True)
+                                    await page.wait_for_timeout(1000)
+                                
+                                # 2. 重新点击一级弹窗的补齐按钮
+                                logger.info(f"Worker-{worker_id} 重新点击一级补齐数据按钮...")
+                                if await page.locator(backfill_btn_selector).count() > 0:
+                                    await page.locator(backfill_btn_selector).first.click()
+                                
+                                # 3. 等待二级弹窗重新渲染
+                                await page.wait_for_selector(drawer_selector, state="visible", timeout=15000)
+                                await page.wait_for_timeout(1000) # 给一点缓冲时间让动画结束
+                            
+                    if not click_success:
+                        logger.error(f"Worker-{worker_id} 连续 3 次尝试点击全店补齐均告失败！可能需要人工干预。")
+                        
+                except PlaywrightTimeoutError:
+                    logger.error(f"Worker-{worker_id} 等待二级弹窗超时(45s)，弹窗未出现！")
                 except Exception as e:
-                    logger.warning(f"Worker-{worker_id} 点击全店补齐时出现异常: {e}")
+                    logger.error(f"Worker-{worker_id} 二级弹窗处理阶段发生未知异常: {e}")
                 
                 # 4. 开始完工判定（交由 GC 守护进程管理蓝页，此处只需判定本页弹窗状态）
                 await self.wait_for_completion_or_heartbeat(page, worker_id)
@@ -420,10 +481,10 @@ if __name__ == "__main__":
     # 注意：支持多个标签页同时采集同一个卡片（比如 4 个标签页同时跑卡片 5，但日期不同）
     tasks_config = [
         {"card": 3, "start": "2025-07-01", "end": "2025-07-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-07-01", "end": "2025-07-15", "chunk_days": 1},
         {"card": 5, "start": "2025-07-16", "end": "2025-07-31", "chunk_days": 1},
         {"card": 5, "start": "2025-08-01", "end": "2025-08-15", "chunk_days": 1},
         {"card": 5, "start": "2025-08-16", "end": "2025-08-31", "chunk_days": 1},
+        {"card": 5, "start": "2025-09-01", "end": "2025-09-15", "chunk_days": 1},
     ]
     
     engine = BackfillEngine(bite_id)

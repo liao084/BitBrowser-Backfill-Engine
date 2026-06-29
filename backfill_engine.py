@@ -6,14 +6,15 @@ RPA 历史数据自动化补采调度引擎 (Playwright Async 版)
 """
 
 import asyncio
-import json
 import logging
 import re
+import sys
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, List, Tuple
 
 import requests
-from playwright.async_api import async_playwright, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright, Locator, Page, TimeoutError as PlaywrightTimeoutError
 
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -25,13 +26,19 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 
-# 2. 输出到本地文件 (会自动在 exe 同目录下生成 backfill_run.log)
+# 2. 输出到本地文件：打包后位于 exe 同目录，源码运行时位于脚本同目录。
+runtime_dir = (
+    Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).resolve().parent
+)
+log_path = runtime_dir / "backfill_run.log"
 try:
-    file_handler = logging.FileHandler('backfill_run.log', encoding='utf-8')
+    file_handler = logging.FileHandler(log_path, encoding='utf-8')
     file_handler.setFormatter(log_formatter)
     logger.addHandler(file_handler)
 except Exception as e:
-    print(f"无法创建日志文件: {e}")
+    print(f"无法创建日志文件 {log_path}: {e}")
 
 
 
@@ -103,9 +110,6 @@ class BackfillEngine:
             try:
                 # 等待心跳弹窗，超时时间为 180 秒
                 await page.wait_for_selector(toast_selector, state="attached", timeout=180000)
-                # 等待弹窗消失，防止重复触发
-                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
-                logger.debug(f"[GC Daemon] 商智网页 {url_suffix} 心跳正常。")
             except PlaywrightTimeoutError:
                 # 180 秒内无任何心跳，判定为残留僵尸网页
                 if not page.is_closed():
@@ -117,6 +121,20 @@ class BackfillEngine:
                 break
             except Exception:
                 # 网页可能在这期间被正常关闭了
+                break
+
+            try:
+                # 等待弹窗消失，防止重复触发
+                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
+            except PlaywrightTimeoutError:
+                if not page.is_closed():
+                    logger.warning(f"[GC Daemon] 商智网页 {url_suffix} 心跳弹窗超过 15 秒未消失，判定页面状态异常，执行强制关闭。")
+                    try:
+                        await page.close()
+                    except Exception as e:
+                        logger.warning(f"[GC Daemon] 关闭网页发生异常: {e}")
+                break
+            except Exception:
                 break
         
         logger.debug(f"[GC Daemon] 网页 {url_suffix} 监控任务结束。")
@@ -139,13 +157,87 @@ class BackfillEngine:
         logger.info(f"✓ 任务队列生成完毕，共切分为 {len(chunks)} 个任务块")
         return chunks
 
+    def _primary_drawer(self, page: Page) -> Locator:
+        """一级弹窗：内部包含【启动检测】按钮的 Drawer。"""
+        return page.locator("div.el-drawer.rtl").filter(
+            has=page.locator("#checkbutn")
+        )
+
+    def _secondary_drawer(self, page: Page) -> Locator:
+        """二级弹窗：内部包含【全店补齐】按钮的 Drawer。"""
+        return page.locator("div.el-drawer.rtl").filter(
+            has=page.locator("#loseDays_shop_btn")
+        )
+
+    def _progress_dialog(self, page: Page) -> Locator:
+        """三级弹窗：包含采集进度标题的可见 Dialog。"""
+        return page.locator("div.el-dialog:visible").filter(
+            has=page.locator("div.dialog-title")
+        )
+
+    async def _close_layer_if_visible(
+        self,
+        container: Locator,
+        layer_name: str,
+        worker_id: str,
+        timeout_ms: int = 8000,
+    ) -> bool:
+        """关闭指定容器内唯一的叉号，并等待该容器真正隐藏。"""
+        if await container.count() == 0 or not await container.is_visible():
+            return False
+
+        close_button = container.locator("i.el-icon-close")
+        close_count = await close_button.count()
+        if close_count != 1:
+            raise RuntimeError(
+                f"Worker-{worker_id} {layer_name}内部预期 1 个关闭按钮，实际找到 {close_count} 个"
+            )
+
+        logger.info(f"Worker-{worker_id} 正在关闭{layer_name}...")
+        await close_button.click(timeout=5000)
+        # ElementUI Drawer 关闭后会保留在 DOM 中并变成零尺寸，hidden 可同时兼容隐藏和移除。
+        await container.wait_for(state="hidden", timeout=timeout_ms)
+        logger.info(f"Worker-{worker_id} {layer_name}已关闭。")
+        return True
+
+    async def _restore_primary_state(self, page: Page, worker_id: str):
+        """依次关闭三级、二级弹窗，恢复到可操作的一级弹窗。"""
+        await self._close_layer_if_visible(
+            self._progress_dialog(page), "三级进度弹窗", worker_id
+        )
+        await self._close_layer_if_visible(
+            self._secondary_drawer(page), "二级补采弹窗", worker_id
+        )
+
+        primary_drawer = self._primary_drawer(page)
+        await primary_drawer.wait_for(state="visible", timeout=10000)
+        # trial 只做完整可点击性检查，不触发实际检测。
+        await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+
+    async def _close_all_task_layers(self, page: Page, worker_id: str):
+        """Worker 初始化时按层级关闭三级、二级和一级弹窗。"""
+        await self._close_layer_if_visible(
+            self._progress_dialog(page), "三级进度弹窗", worker_id
+        )
+        await self._close_layer_if_visible(
+            self._secondary_drawer(page), "二级补采弹窗", worker_id
+        )
+        await self._close_layer_if_visible(
+            self._primary_drawer(page), "一级任务弹窗", worker_id
+        )
+
     async def inject_dates(self, page: Page, start_date: str, end_date: str, worker_id: str):
         """
         日期注入逻辑：通过模拟真实的物理键盘事件，确保触发 Vue 框架的数据双向绑定。
         """
         logger.info(f"Worker-{worker_id} 开始注入采集区间: {start_date} 至 {end_date}")
         try:
-            inputs = page.locator("input.el-range-input")
+            primary_drawer = self._primary_drawer(page)
+            inputs = primary_drawer.locator("input.el-range-input")
+
+            input_count = await inputs.count()
+            if input_count < 2:
+                raise RuntimeError(f"一级弹窗内预期至少 2 个日期输入框，实际找到 {input_count} 个")
             
             # 填充开始日期并按回车确认
             await inputs.nth(0).fill(start_date)
@@ -162,7 +254,7 @@ class BackfillEngine:
             logger.error(f"Worker-{worker_id} 日期注入失败: {e}")
             raise
 
-    async def wait_for_completion_or_heartbeat(self, page: Page, worker_id: str):
+    async def wait_for_completion_or_heartbeat(self, page: Page, worker_id: str) -> bool:
         """
         基于心跳静默的完工判定机制与弹窗清理。
         如果在指定的静默期内没有再出现新的心跳弹窗，则认为能够补采的数据已经全部下发完毕（或已卡死）。
@@ -177,37 +269,35 @@ class BackfillEngine:
             try:
                 # 等待绿色弹窗出现
                 await page.wait_for_selector(toast_selector, state="attached", timeout=silent_timeout_ms)
-                logger.debug(f"Worker-{worker_id} 收到心跳弹窗，正在采集中...")
-                
-                # 等待该弹窗消失，准备迎接下一次弹窗
-                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
-                
             except PlaywrightTimeoutError:
                 logger.info(f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} 秒无新心跳，判定当前区间补采结束或卡死。")
                 break
             except Exception as e:
                 logger.error(f"Worker-{worker_id} 监听过程中发生未知异常: {e}")
                 raise e
+
+            try:
+                # 等待该弹窗消失，准备迎接下一次弹窗
+                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
+            except PlaywrightTimeoutError:
+                logger.warning(f"Worker-{worker_id} 心跳弹窗超过 15 秒未消失，停止心跳监听并进入终态检查。")
+                break
+            except Exception as e:
+                logger.error(f"Worker-{worker_id} 等待心跳弹窗消失时发生异常: {e}")
+                raise
                 
-        # 通过三级弹窗的可见性判定是否卡死
+        # 心跳停止后，通过精确绑定的三级弹窗判定是否卡死。
         logger.info(f"Worker-{worker_id} 心跳停止，开始探测卡死状态...")
-        stuck_indicator = page.locator("div.dialog-title:visible")
-        
-        if await stuck_indicator.count() > 0:
-            logger.warning(f"Worker-{worker_id} 检测到三级弹窗依然存在，判定为卡死，准备关闭多层弹窗...")
-            close_btns = page.locator("i.el-icon-close:visible")
-            
-            # 依次点击关闭按钮（分别关闭三级和二级弹窗）
-            for _ in range(2):
-                if await close_btns.count() > 0:
-                    try:
-                        await close_btns.last.click(force=True)
-                        await page.wait_for_timeout(1000) # 等待动画消失
-                    except Exception as e:
-                        logger.warning(f"Worker-{worker_id} 关闭卡死弹窗失败: {e}")
+        progress_dialog = self._progress_dialog(page)
+
+        if await progress_dialog.count() > 0 and await progress_dialog.is_visible():
+            logger.warning(f"Worker-{worker_id} 检测到三级弹窗依然存在，判定为卡死，准备按层级清理...")
+            await self._restore_primary_state(page, worker_id)
             logger.info(f"Worker-{worker_id} 卡死弹窗清理完毕，退回主页面。")
+            return False
         else:
             logger.info(f"Worker-{worker_id} 未检测到三级弹窗，正常采集完成。")
+            return True
 
     async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]], list_index: int):
         """Worker 协程：处理指定页面上的所有日期分块任务"""
@@ -217,20 +307,18 @@ class BackfillEngine:
         # --- 页面初始化清理 ---
         try:
             logger.info(f"Worker-{worker_id} 执行页面初始化清理...")
-            # 1. 尝试关闭当前弹窗（如果存在可见的 X 号）
-            # 注意：使用 :visible 伪类，确保只找肉眼看得见的叉号，避免点到隐藏的残留 DOM
-            close_dialog_btn = "i.el-icon-close:visible" 
-            if await page.locator(close_dialog_btn).count() > 0:
-                await page.locator(close_dialog_btn).first.click()
-                await page.wait_for_timeout(1000) # 等待弹窗动画消失
+            # 1. 按层级清理可能遗留的三级、二级和一级弹窗。
+            await self._close_all_task_layers(page, worker_id)
                 
             # 2. 点击进入“补采专属任务卡片”
             nth_index = task_card_index - 1
             backfill_card_selector = f"div.workTool_page_card_test_dataCard >> nth={nth_index}"
             await page.click(backfill_card_selector)
             
-            # 等待补采详情弹窗加载出来
-            await page.wait_for_selector("span:has-text('缺失数据')", state="visible", timeout=15000)
+            # 等待包含启动按钮的一级弹窗真正展开。
+            primary_drawer = self._primary_drawer(page)
+            await primary_drawer.wait_for(state="visible", timeout=15000)
+            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
             logger.info(f"Worker-{worker_id} 初始化完成，已成功进入补采专属弹窗！")
             
             # 不需要记录基准线，依靠锚点即可
@@ -243,19 +331,9 @@ class BackfillEngine:
             logger.info(f"Worker-{worker_id} 开始处理任务: {start_date} 至 {end_date}")
             
             try:
-                # 每轮开始前检查：如果上一次意外遗留了三级弹窗，直接关掉
-                stuck_indicator = page.locator("div.dialog-title:visible")
-                if await stuck_indicator.count() > 0:
-                    logger.warning(f"Worker-{worker_id} 循环开始前发现残留的卡死弹窗，进行清理...")
-                    
-                    close_btns = page.locator("i.el-icon-close:visible")
-                    for _ in range(2):
-                        if await close_btns.count() > 0:
-                            try:
-                                await close_btns.last.click(force=True)
-                                await page.wait_for_timeout(500)
-                            except Exception:
-                                pass
+                # 每轮开始前都恢复到一级弹窗，避免二级容器遮挡启动按钮。
+                await self._restore_primary_state(page, worker_id)
+                primary_drawer = self._primary_drawer(page)
 
                 # 1. 注入时间
                 await self.inject_dates(page, start_date, end_date, worker_id)
@@ -263,17 +341,18 @@ class BackfillEngine:
 
 
                 # 2. 启动检测
-                start_btn_selector = "#checkbutn"
-                # 使用 force=True 确保点击触发，避免被其他元素遮挡
-                await page.click(start_btn_selector, force=True)
+                start_btn = primary_drawer.locator("#checkbutn")
+                # 保留 Playwright 的遮挡检查；被二级弹窗覆盖时不再强制点击底层按钮。
+                await start_btn.click(timeout=10000)
                 
                 # --- 等待查询结果容器渲染 ---
                 # 给系统一点时间销毁旧容器（如果存在）
                 await page.wait_for_timeout(500)
                 
                 logger.info(f"Worker-{worker_id} 等待查询结果容器渲染 (最多45秒)...")
+                result_list = primary_drawer.locator('.testContent_list')
                 try:
-                    await page.wait_for_selector('.testContent_list', state='visible', timeout=45000)
+                    await result_list.wait_for(state='visible', timeout=45000)
                     logger.info(f"Worker-{worker_id} 查询结果已渲染完成！")
                 except PlaywrightTimeoutError:
                     logger.warning(f"Worker-{worker_id} 等待查询结果超时(45s)，仍继续尝试下一步。")
@@ -285,7 +364,7 @@ class BackfillEngine:
                 is_missing_data = True # 默认兜底为存在缺失数据
                 try:
                     for retry_idx in range(3):
-                        missing_span = page.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
+                        missing_span = primary_drawer.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
                         await missing_span.wait_for(state='attached', timeout=10000)
                         missing_text = await missing_span.inner_text()
                         
@@ -307,12 +386,12 @@ class BackfillEngine:
                             # 提取到了 0 或 负数，前端渲染假象 Bug
                             if retry_idx < 2:
                                 logger.warning(f"Worker-{worker_id} 提取到异常缺失量 0 或 负数 (前端渲染假象)，第 {retry_idx+1} 次重新点击【启动检测】...")
-                                await page.click("#checkbutn", force=True)
+                                await start_btn.click(timeout=10000)
                                 
                                 # 重新点击启动检测后，等待数据容器重新渲染
                                 await page.wait_for_timeout(500) # 缓冲系统销毁旧 DOM 的时间
                                 try:
-                                    await page.wait_for_selector('.testContent_list', state='visible', timeout=45000)
+                                    await result_list.wait_for(state='visible', timeout=45000)
                                     logger.info(f"Worker-{worker_id} 第 {retry_idx+1} 次重试：检测容器已重新渲染成功！")
                                 except PlaywrightTimeoutError:
                                     pass
@@ -328,33 +407,28 @@ class BackfillEngine:
 
                 # --- 既然有缺失数据（或探测异常兜底），则走后续补齐流程 ---
                 logger.info(f"Worker-{worker_id} 准备点击一级补齐数据按钮...")
-                backfill_btn_selector = "span.lostDataBtn:visible"
-                
-                if await page.locator(backfill_btn_selector).count() > 0:
-                    await page.locator(backfill_btn_selector).first.click()
-                else:
-                    logger.warning(f"Worker-{worker_id} 找不到一级补齐数据按钮，重试一次...")
-                    await page.wait_for_selector(backfill_btn_selector, timeout=5000)
-                    await page.locator(backfill_btn_selector).first.click()
+                backfill_btn = primary_drawer.locator("span.lostDataBtn")
+                await backfill_btn.wait_for(state="visible", timeout=5000)
+                await backfill_btn.click(timeout=10000)
                 
                 # --- 二级弹窗处理与全店补齐 ---
-                drawer_selector = "div.el-drawer.rtl:visible"
-                whole_store_btn_selector = "#loseDays_shop_btn"
+                secondary_drawer = self._secondary_drawer(page)
+                whole_store_btn = secondary_drawer.locator("#loseDays_shop_btn")
                 
                 logger.info(f"Worker-{worker_id} 等待二级弹窗渲染 (最多45秒)...")
+                click_success = False
                 try:
-                    # 显式等待二级弹窗组件渲染完毕
-                    await page.wait_for_selector(drawer_selector, state="visible", timeout=45000)
+                    # 等待内部包含全店补齐按钮的二级 Drawer 展开，不再误命中一级 Drawer。
+                    await secondary_drawer.wait_for(state="visible", timeout=45000)
                     logger.info(f"Worker-{worker_id} 二级弹窗已安全渲染！")
                     
                     # 弹窗重试与恢复策略：遭遇 UI 遮挡等异常时，主动关闭抽屉并重新拉起
-                    click_success = False
                     for click_retry in range(3):
                         try:
-                            # 二次确保按钮本身在 DOM 中可见
-                            await page.wait_for_selector(whole_store_btn_selector, state="visible", timeout=5000)
+                            # 按钮只从已确认的二级容器内定位。
+                            await whole_store_btn.wait_for(state="visible", timeout=5000)
                             # 依赖 Playwright 原生拦截检测机制，若有遮挡则主动抛出异常进入恢复流
-                            await page.click(whole_store_btn_selector)
+                            await whole_store_btn.click(timeout=10000)
                             logger.info(f"Worker-{worker_id} 点击【全店补齐】指令发送成功！")
                             click_success = True
                             break
@@ -362,32 +436,36 @@ class BackfillEngine:
                             logger.warning(f"Worker-{worker_id} 第 {click_retry+1} 次点击全店补齐失败(可能遭遇subtree遮挡): {str(e)[:100]}...")
                             if click_retry < 2:
                                 logger.info(f"Worker-{worker_id} 启动恢复流程：关闭二级弹窗并重新打开...")
-                                # 1. 点击二级弹窗的关闭(X)按钮
-                                drawer_close_btn = "i.el-icon-close:visible"
-                                if await page.locator(drawer_close_btn).count() > 0:
-                                    await page.locator(drawer_close_btn).last.click(force=True)
-                                    await page.wait_for_timeout(1000)
+                                # 1. 精确关闭三级/二级容器，并确认一级按钮可操作。
+                                await self._restore_primary_state(page, worker_id)
                                 
                                 # 2. 重新点击一级弹窗的补齐按钮
                                 logger.info(f"Worker-{worker_id} 重新点击一级补齐数据按钮...")
-                                if await page.locator(backfill_btn_selector).count() > 0:
-                                    await page.locator(backfill_btn_selector).first.click()
+                                await backfill_btn.click(timeout=10000)
                                 
                                 # 3. 等待二级弹窗重新渲染
-                                await page.wait_for_selector(drawer_selector, state="visible", timeout=15000)
-                                await page.wait_for_timeout(1000) # 给一点缓冲时间让动画结束
-                            
-                    if not click_success:
-                        logger.error(f"Worker-{worker_id} 连续 3 次尝试点击全店补齐均告失败！可能需要人工干预。")
+                                await secondary_drawer.wait_for(state="visible", timeout=15000)
                         
                 except PlaywrightTimeoutError:
-                    logger.error(f"Worker-{worker_id} 等待二级弹窗超时(45s)，弹窗未出现！")
+                    logger.error(f"Worker-{worker_id} 二级弹窗打开、按钮点击或恢复流程发生超时。")
                 except Exception as e:
                     logger.error(f"Worker-{worker_id} 二级弹窗处理阶段发生未知异常: {e}")
+
+                if not click_success:
+                    logger.error(f"Worker-{worker_id} 全店补齐未成功提交，当前区间不进入心跳判定。")
+                    try:
+                        await self._restore_primary_state(page, worker_id)
+                    except Exception as cleanup_error:
+                        logger.warning(f"Worker-{worker_id} 提交失败后清理弹窗异常: {cleanup_error}")
+                    logger.warning(f"Worker-{worker_id} 跳过 {start_date} 至 {end_date}，继续下一个区间。")
+                    continue
                 
                 # 4. 开始完工判定（交由 GC 守护进程管理蓝页，此处只需判定本页弹窗状态）
-                await self.wait_for_completion_or_heartbeat(page, worker_id)
-                logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")
+                completed_normally = await self.wait_for_completion_or_heartbeat(page, worker_id)
+                if completed_normally:
+                    logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")
+                else:
+                    logger.warning(f"Worker-{worker_id} 当前区间判定为卡死并已清理: {start_date} 至 {end_date}")
                 
             except Exception as e:
                 error_msg = str(e).lower()
@@ -400,10 +478,10 @@ class BackfillEngine:
                 logger.warning(f"Worker-{worker_id} 由于执行异常，将跳过 {start_date} 至 {end_date} 区间，继续尝试下一个。")
                 await asyncio.sleep(5)
 
-        logger.info(f"Worker-{worker_id} 所有任务处理完毕。")
+        logger.info(f"Worker-{worker_id} 所有任务区间已遍历完毕。")
 
         # --- 阶段三：收尾（保留现场） ---
-        logger.info(f"Worker-{worker_id} 完工！遵照指示保留当前任务弹窗，供人工复核。")
+        logger.info(f"Worker-{worker_id} 调度结束，保留当前任务弹窗供人工复核。")
     async def run(self, tasks_config: list = None):
         cdp_address = self.get_debugger_address()
         if not cdp_address:
@@ -480,11 +558,11 @@ if __name__ == "__main__":
     # 任务配置列表：每个字典代表分配给一个标签页的采集任务
     # 注意：支持多个标签页同时采集同一个卡片（比如 4 个标签页同时跑卡片 5，但日期不同）
     tasks_config = [
-        {"card": 3, "start": "2025-07-01", "end": "2025-07-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-07-16", "end": "2025-07-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-08-01", "end": "2025-08-15", "chunk_days": 1},
-        {"card": 5, "start": "2025-08-16", "end": "2025-08-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-09-01", "end": "2025-09-15", "chunk_days": 1},
+        {"card": 3, "start": "2025-07-01", "end": "2025-12-31", "chunk_days": 1},
+        {"card": 5, "start": "2025-09-01", "end": "2025-09-30", "chunk_days": 1},
+        {"card": 5, "start": "2025-10-01", "end": "2025-10-31", "chunk_days": 1},
+        {"card": 5, "start": "2025-11-01", "end": "2025-11-30", "chunk_days": 1},
+        {"card": 5, "start": "2025-12-01", "end": "2025-12-31", "chunk_days": 1},
     ]
     
     engine = BackfillEngine(bite_id)

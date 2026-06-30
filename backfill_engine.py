@@ -14,7 +14,13 @@ from pathlib import Path
 from typing import Any, Dict, Optional, List, Tuple
 
 import requests
-from playwright.async_api import async_playwright, Locator, Page, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import (
+    ElementHandle,
+    Locator,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
 from task_ledger import TaskLedger
 
@@ -52,6 +58,9 @@ class BackfillEngine:
         self.bite_id = bite_id
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = 120
+        # 红色错误提示保留时间：既给人工观察留出窗口，也避免长期堆积遮挡页面。
+        self.error_toast_grace_seconds = 30
+        self._error_toast_close_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _fatal_page_error_reason(error: Exception) -> Optional[str]:
@@ -118,6 +127,181 @@ class BackfillEngine:
     def _on_new_page(self, page: Page):
         """拦截浏览器新建标签页的事件"""
         asyncio.create_task(self._delayed_check(page))
+
+    def _track_error_toast_close_task(self, task: asyncio.Task) -> None:
+        """持有延迟关闭任务，避免任务被垃圾回收，并在结束后自动移除。"""
+        self._error_toast_close_tasks.add(task)
+        task.add_done_callback(self._error_toast_close_tasks.discard)
+
+    async def _close_error_toast_after_grace_period(
+        self,
+        page: Page,
+        toast_handle: ElementHandle,
+        worker_id: str,
+        message: str,
+    ) -> None:
+        """保留错误提示一段时间后，点击该提示节点自己的关闭按钮。"""
+        close_button: Optional[ElementHandle] = None
+        closed = False
+        try:
+            logger.warning(
+                f"Worker-{worker_id} 检测到红色错误提示 [{message}]，"
+                f"将在 {self.error_toast_grace_seconds} 秒后自动关闭。"
+            )
+            await asyncio.sleep(self.error_toast_grace_seconds)
+
+            if page.is_closed() or not await toast_handle.is_visible():
+                return
+
+            close_button = await toast_handle.query_selector(
+                "i.el-message__closeBtn.el-icon-close"
+            )
+            if close_button is None:
+                logger.warning(
+                    f"Worker-{worker_id} 红色错误提示 [{message}] 未找到专属关闭按钮，"
+                    "保留该提示供人工处理。"
+                )
+                return
+
+            # 保留 Playwright 的可点击性检查；关闭提示本身也不使用 JS 或 force 点击。
+            await close_button.click(timeout=5000)
+            try:
+                await toast_handle.wait_for_element_state("hidden", timeout=5000)
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    f"Worker-{worker_id} 已点击红色错误提示 [{message}] 的关闭按钮，"
+                    "但提示节点在 5 秒内仍未隐藏。"
+                )
+                return
+
+            closed = True
+            logger.info(f"Worker-{worker_id} 已自动关闭红色错误提示 [{message}]。")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if not page.is_closed():
+                logger.warning(
+                    f"Worker-{worker_id} 自动关闭红色错误提示 [{message}] 失败: {error}"
+                )
+        finally:
+            # 如果关闭失败，移除调度标记，让监控器下一轮能够重新发现并再次安排处理。
+            if not closed and not page.is_closed():
+                try:
+                    await toast_handle.evaluate(
+                        "node => node.removeAttribute('data-rpa-error-close-scheduled')"
+                    )
+                except Exception:
+                    pass
+            if close_button is not None:
+                try:
+                    await close_button.dispose()
+                except Exception:
+                    pass
+            try:
+                await toast_handle.dispose()
+            except Exception:
+                pass
+
+    async def _monitor_worker_error_toasts(self, page: Page, worker_id: str) -> None:
+        """监控单个 Worker 页面的红色错误提示，并为每个节点独立安排回收。"""
+        pending_selector = (
+            "div.el-message.el-message--error.is-closable"
+            ":visible:not([data-rpa-error-close-scheduled])"
+        )
+        logger.info(
+            f"Worker-{worker_id} 红色错误提示事件监控已启动；"
+            f"提示将保留 {self.error_toast_grace_seconds} 秒后自动关闭。"
+        )
+
+        while not page.is_closed():
+            try:
+                # 与商智 GC 相同：没有目标元素时长期挂起，不做固定频率的 DOM 扫描。
+                # 已安排处理的节点带有标记，因此新提示出现后才会重新满足选择器。
+                toast_handle = await page.wait_for_selector(
+                    pending_selector,
+                    state="visible",
+                    timeout=0,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if page.is_closed() or self._fatal_page_error_reason(error):
+                    break
+                logger.warning(
+                    f"Worker-{worker_id} 红色错误提示事件等待发生异常，将继续监控: {error}"
+                )
+                await asyncio.sleep(2)
+                continue
+
+            if toast_handle is None:
+                # visible 状态正常不会返回 None，仅作为接口返回值的防御性处理。
+                continue
+
+            content_handle: Optional[ElementHandle] = None
+            try:
+                # 标记当前具体节点；下一轮 wait_for_selector 将只等待其他未处理提示。
+                await toast_handle.evaluate(
+                    "node => node.setAttribute('data-rpa-error-close-scheduled', 'true')"
+                )
+                content_handle = await toast_handle.query_selector(
+                    ".el-message__content"
+                )
+                message = (
+                    (await content_handle.inner_text()).strip()
+                    if content_handle is not None
+                    else "未读取到错误内容"
+                )
+                close_task = asyncio.create_task(
+                    self._close_error_toast_after_grace_period(
+                        page,
+                        toast_handle,
+                        worker_id,
+                        message,
+                    )
+                )
+                self._track_error_toast_close_task(close_task)
+            except Exception as error:
+                try:
+                    await toast_handle.evaluate(
+                        "node => node.removeAttribute('data-rpa-error-close-scheduled')"
+                    )
+                except Exception:
+                    pass
+                try:
+                    await toast_handle.dispose()
+                except Exception:
+                    pass
+                if not page.is_closed():
+                    logger.warning(
+                        f"Worker-{worker_id} 注册红色错误提示回收任务失败: {error}"
+                    )
+                # 避免同一个异常节点在注册失败时形成无间隔重试。
+                await asyncio.sleep(1)
+            finally:
+                if content_handle is not None:
+                    try:
+                        await content_handle.dispose()
+                    except Exception:
+                        pass
+
+        logger.debug(f"Worker-{worker_id} 红色错误提示监控结束。")
+
+    async def _stop_error_toast_monitors(
+        self,
+        monitor_tasks: List[asyncio.Task],
+    ) -> None:
+        """停止 Worker 错误提示监控和仍在等待宽限期的关闭任务。"""
+        for task in monitor_tasks:
+            task.cancel()
+        if monitor_tasks:
+            await asyncio.gather(*monitor_tasks, return_exceptions=True)
+
+        close_tasks = list(self._error_toast_close_tasks)
+        for task in close_tasks:
+            task.cancel()
+        if close_tasks:
+            await asyncio.gather(*close_tasks, return_exceptions=True)
+        self._error_toast_close_tasks.clear()
 
     async def _monitor_and_gc_page(self, page: Page):
         """
@@ -791,32 +975,43 @@ class BackfillEngine:
                 f"本轮任务账本已重置: {ledger.path}；日志继续追加到: {log_path}"
             )
 
-            # 第一轮：所有页面从同一个共享任务池动态领取日期区块。
-            healthy_pages = await self._run_task_round(
-                initial_tasks,
-                worker_pages,
-                ledger,
-                "首次执行",
-            )
-
-            # 第二轮：必须从 JSONL 读取第一轮失败项，只进行一次总体重试。
-            retry_tasks = await ledger.failed_tasks(attempt=1)
-            if retry_tasks:
-                logger.warning(
-                    f"首次执行结束，从任务账本读取到 {len(retry_tasks)} 个失败任务，"
-                    "开始唯一一次总体重试。"
+            # 每个数据中心 Worker 都有独立的错误提示回收器，不与业务任务绑定。
+            error_toast_monitors = [
+                asyncio.create_task(
+                    self._monitor_worker_error_toasts(page, f"页面-{index + 1}")
                 )
-                await self._run_task_round(
-                    retry_tasks,
-                    healthy_pages,
+                for index, page in enumerate(worker_pages)
+            ]
+
+            try:
+                # 第一轮：所有页面从同一个共享任务池动态领取日期区块。
+                healthy_pages = await self._run_task_round(
+                    initial_tasks,
+                    worker_pages,
                     ledger,
-                    "总体重试",
+                    "首次执行",
                 )
-            else:
-                logger.info("首次执行没有失败任务，无需总体重试。")
 
-            summary = await ledger.summary(total_tasks=len(initial_tasks))
-            self._log_summary(summary)
+                # 第二轮：必须从 JSONL 读取第一轮失败项，只进行一次总体重试。
+                retry_tasks = await ledger.failed_tasks(attempt=1)
+                if retry_tasks:
+                    logger.warning(
+                        f"首次执行结束，从任务账本读取到 {len(retry_tasks)} 个失败任务，"
+                        "开始唯一一次总体重试。"
+                    )
+                    await self._run_task_round(
+                        retry_tasks,
+                        healthy_pages,
+                        ledger,
+                        "总体重试",
+                    )
+                else:
+                    logger.info("首次执行没有失败任务，无需总体重试。")
+
+                summary = await ledger.summary(total_tasks=len(initial_tasks))
+                self._log_summary(summary)
+            finally:
+                await self._stop_error_toast_monitors(error_toast_monitors)
 
 if __name__ == "__main__":
     bite_id = '4626a1f1fadb4ac4aab182d93469147f'

@@ -11,10 +11,12 @@ import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Any, Dict, Optional, List, Tuple
 
 import requests
 from playwright.async_api import async_playwright, Locator, Page, TimeoutError as PlaywrightTimeoutError
+
+from task_ledger import TaskLedger
 
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -346,10 +348,52 @@ class BackfillEngine:
             logger.info(f"Worker-{worker_id} 未检测到三级弹窗，正常采集完成。")
             return True
 
-    async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]], list_index: int) -> bool:
-        """Worker 协程：处理指定页面上的所有日期分块任务"""
-        worker_id = f"卡片-{task_card_index}[{list_index}]"
-        logger.info(f"Worker-{worker_id} 启动，绑定页面: {page.url[-25:]}")
+    def build_tasks(self, tasks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """把配置中的日期范围拆成共享任务池使用的唯一任务。"""
+        tasks: List[Dict[str, Any]] = []
+        seen_task_ids = set()
+
+        for config in tasks_list:
+            card = int(config.get("card", config.get("task_card_index", 1)))
+            date_chunks = self.generate_date_chunks(
+                config["start"],
+                config["end"],
+                config.get("chunk_days", 3),
+            )
+            for start_date, end_date in date_chunks:
+                task_id = f"card-{card}_{start_date}_{end_date}"
+                if task_id in seen_task_ids:
+                    logger.warning(f"检测到重复任务 {task_id}，已跳过重复配置。")
+                    continue
+
+                seen_task_ids.add(task_id)
+                tasks.append(
+                    {
+                        "task_id": task_id,
+                        "card": card,
+                        "start": start_date,
+                        "end": end_date,
+                        "attempt": 1,
+                    }
+                )
+
+        logger.info(f"✓ 共享任务池构建完成，共生成 {len(tasks)} 个唯一任务。")
+        return tasks
+
+    async def execute_task(
+        self,
+        page: Page,
+        task: Dict[str, Any],
+        list_index: int,
+    ) -> bool:
+        """执行一个独立日期区块；普通失败返回 False，致命页面异常向外抛出。"""
+        task_card_index = task["card"]
+        date_chunks = [(task["start"], task["end"])]
+        worker_id = f"页面-{list_index + 1}"
+        logger.info(
+            f"Worker-{worker_id} 开始处理任务 {task['task_id']} "
+            f"（第 {task['attempt']} 次尝试）"
+        )
         
         # --- 页面初始化清理 ---
         try:
@@ -373,13 +417,14 @@ class BackfillEngine:
             fatal_reason = self._fatal_page_error_reason(e)
             if fatal_reason:
                 logger.error(f"Worker-{worker_id} 初始化期间检测到致命页面异常（{fatal_reason}），停止该Worker: {e}")
+                raise
             else:
-                logger.error(f"Worker-{worker_id} 初始化失败，跳过该标签页: {e}")
-            return False # 初始化失败，退出当前任务
+                logger.error(f"Worker-{worker_id} 任务页面初始化失败: {e}")
+            await asyncio.sleep(5)
+            return False
             
-        # --- 循环处理日期分块任务 ---
-        worker_aborted = False
-        for chunk_index, (start_date, end_date) in enumerate(date_chunks):
+        # execute_task 每次只接收一个日期区块，保留单层循环以复用原业务流程。
+        for start_date, end_date in date_chunks:
             task_submitted = False
             logger.info(f"Worker-{worker_id} 开始处理任务: {start_date} 至 {end_date}")
             
@@ -518,8 +563,8 @@ class BackfillEngine:
                         if self._fatal_page_error_reason(cleanup_error):
                             raise
                         logger.warning(f"Worker-{worker_id} 提交失败后清理弹窗异常: {cleanup_error}")
-                    logger.warning(f"Worker-{worker_id} 跳过 {start_date} 至 {end_date}，继续下一个区间。")
-                    continue
+                    logger.warning(f"Worker-{worker_id} 当前任务 {start_date} 至 {end_date} 记为失败。")
+                    return False
 
                 task_submitted = True
                 
@@ -529,12 +574,11 @@ class BackfillEngine:
                     logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")
                 else:
                     logger.warning(f"Worker-{worker_id} 当前区间判定为卡死并已清理: {start_date} 至 {end_date}")
+                return completed_normally
                 
             except Exception as e:
                 fatal_reason = self._fatal_page_error_reason(e)
                 if fatal_reason:
-                    worker_aborted = True
-                    remaining_count = len(date_chunks) - chunk_index - 1
                     current_state = (
                         "已经提交【全店补齐】，但最终结果未知"
                         if task_submitted
@@ -545,26 +589,147 @@ class BackfillEngine:
                     )
                     logger.warning(
                         f"Worker-{worker_id} 当前区间 {start_date} 至 {end_date} {current_state}；"
-                        f"剩余 {remaining_count} 个任务区间未执行。"
+                        "当前页面不再领取新任务。"
                     )
-                    break
+                    raise
                     
                 logger.error(f"Worker-{worker_id} 在执行 {start_date} 至 {end_date} 期间发生错误: {e}")
-                logger.warning(f"Worker-{worker_id} 由于执行异常，将跳过 {start_date} 至 {end_date} 区间，继续尝试下一个。")
+                logger.warning(f"Worker-{worker_id} 当前任务记为失败。")
                 await asyncio.sleep(5)
+                return False
 
-        if worker_aborted:
-            logger.warning(f"Worker-{worker_id} 因致命页面异常提前终止，未遍历全部任务区间。")
-        else:
-            logger.info(f"Worker-{worker_id} 所有任务区间已遍历完毕。")
+        # 无缺失数据时会走到这里，视为任务正常完成。
+        logger.info(f"Worker-{worker_id} 任务 {task['task_id']} 无缺失数据，账本记为成功。")
+        return True
 
-        # --- 阶段三：收尾（保留现场） ---
-        if worker_aborted:
-            logger.warning(f"Worker-{worker_id} 调度已中止，当前页面不可用，无法保证保留现场。")
-        else:
-            logger.info(f"Worker-{worker_id} 调度结束，保留当前任务弹窗供人工复核。")
+    async def worker(
+        self,
+        page: Page,
+        task_queue: asyncio.Queue,
+        ledger: TaskLedger,
+        list_index: int,
+        round_name: str,
+    ) -> bool:
+        """持续消费共享队列；返回值表示当前页面能否继续用于下一轮。"""
+        worker_id = f"页面-{list_index + 1}"
+        logger.info(
+            f"Worker-{worker_id} 启动{round_name}，绑定页面: {page.url[-25:]}"
+        )
 
-        return not worker_aborted
+        while True:
+            try:
+                task = task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                logger.info(f"Worker-{worker_id} 已完成{round_name}的任务领取。")
+                return True
+
+            fatal_error = False
+            try:
+                success = await self.execute_task(page, task, list_index)
+            except Exception as error:
+                fatal_reason = self._fatal_page_error_reason(error)
+                success = False
+                if fatal_reason:
+                    fatal_error = True
+                    logger.error(f"Worker-{worker_id} 因{fatal_reason}停止领取新任务。")
+                else:
+                    logger.error(
+                        f"Worker-{worker_id} 执行任务时发生未分类异常，"
+                        f"当前任务记为失败: {error}"
+                    )
+
+            try:
+                await ledger.record(task, success)
+            finally:
+                task_queue.task_done()
+
+            if fatal_error:
+                return False
+
+    async def _run_task_round(
+        self,
+        tasks: List[Dict[str, Any]],
+        worker_pages: List[Page],
+        ledger: TaskLedger,
+        round_name: str,
+    ) -> List[Page]:
+        """让全部可用页面并发消费一轮预先装满的共享任务队列。"""
+        if not tasks:
+            logger.info(f"{round_name}没有需要执行的任务。")
+            return worker_pages
+
+        task_queue: asyncio.Queue = asyncio.Queue()
+        for task in tasks:
+            task_queue.put_nowait(task)
+
+        logger.info(
+            f"\n{'=' * 40}\n{round_name}开始：{len(tasks)} 个任务，"
+            f"{len(worker_pages)} 个可用Worker\n{'=' * 40}"
+        )
+
+        if not worker_pages:
+            logger.error(f"{round_name}没有可用Worker，本轮任务全部记为失败。")
+            while True:
+                try:
+                    task = task_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    await ledger.record(task, False)
+                finally:
+                    task_queue.task_done()
+            return []
+
+        worker_results = await asyncio.gather(
+            *[
+                self.worker(page, task_queue, ledger, index, round_name)
+                for index, page in enumerate(worker_pages)
+            ]
+        )
+        healthy_pages = [
+            page
+            for page, is_healthy in zip(worker_pages, worker_results)
+            if is_healthy
+        ]
+
+        # 正常情况下健康Worker会取完全部任务；这里只兜底处理全部页面都崩溃的情况。
+        unprocessed_count = 0
+        while True:
+            try:
+                task = task_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                await ledger.record(task, False)
+                unprocessed_count += 1
+            finally:
+                task_queue.task_done()
+
+        if unprocessed_count:
+            logger.warning(
+                f"{round_name}结束时已无可用Worker，剩余 {unprocessed_count} 个"
+                "未执行任务已记为失败。"
+            )
+
+        logger.info(
+            f"{round_name}结束：仍有 {len(healthy_pages)} 个Worker可用于后续调度。"
+        )
+        return healthy_pages
+
+    @staticmethod
+    def _log_summary(summary: Dict[str, int]) -> None:
+        """输出本轮首次执行、总体重试和最终完成情况。"""
+        logger.info(
+            "\n任务执行汇总：\n"
+            f"  本轮任务总数：{summary['total']}\n"
+            f"  首次执行成功：{summary['first_success']}\n"
+            f"  首次执行失败：{summary['first_failed']}\n"
+            f"  进入总体重试：{summary['retry_total']}\n"
+            f"  重试成功：{summary['retry_success']}\n"
+            f"  重试仍失败：{summary['retry_failed']}\n"
+            f"  最终完成：{summary['final_success']}\n"
+            f"  最终失败：{summary['final_failed']}"
+        )
 
     async def run(self, tasks_config: list = None):
         cdp_address = self.get_debugger_address()
@@ -604,49 +769,59 @@ class BackfillEngine:
                 logger.error("未传入任何任务配置 tasks_config，引擎停止运行。")
                 return
 
-            # 为了兼容老代码（如果用户传入的是 dict）
-            if isinstance(tasks_config, dict):
-                tasks_list = [{"card": k, **v} for k, v in tasks_config.items()]
-            else:
-                tasks_list = tasks_config
+            if not isinstance(tasks_config, list) or not all(
+                isinstance(config, dict) for config in tasks_config
+            ):
+                logger.error("tasks_config 必须是 list[dict]，引擎停止运行。")
+                return
 
-            # 并发处理：按配置列表从 worker_pages 池中取网页派发任务
-            worker_tasks = []
-            assigned_count = min(len(tasks_list), len(worker_pages))
-            
-            if len(tasks_list) > len(worker_pages):
-                logger.warning(f"⚠️ 你配置了 {len(tasks_list)} 个任务，但浏览器中只找到了 {len(worker_pages)} 个标签页，资源不足，多余的任务将被忽略！")
-                
-            for i in range(assigned_count):
-                config = tasks_list[i]
-                task_card_index = config.get("card", config.get("task_card_index", 1)) # 获取目标卡片
-                page = worker_pages[i] # 从浏览器池中获取对应的页面实例
-                
-                logger.info(f"已将大盘任务卡片 {task_card_index} 分配给后台标签页 {i+1}")
-                
-                # 动态生成该任务专属的 date_chunks
-                date_chunks = self.generate_date_chunks(config["start"], config["end"], config["chunk_days"])
-                
-                # 将协程任务加入列表，把 task_card_index 和当前的 list_index 传进去
-                worker_tasks.append(self.worker(task_card_index=task_card_index, page=page, date_chunks=date_chunks, list_index=i))
-            
-            if worker_tasks:
-                logger.info(f"\n{'='*40}\n开始并发执行 {len(worker_tasks)} 个标签页任务...\n{'='*40}")
-                # 并发执行所有组装好的协程任务
-                worker_results = await asyncio.gather(*worker_tasks)
-                if all(worker_results):
-                    logger.info("\n所有Worker均已完成任务区间遍历。")
-                else:
-                    failed_worker_count = sum(result is False for result in worker_results)
-                    logger.warning(
-                        f"\n本轮调度结束，但有 {failed_worker_count} 个Worker初始化失败或因致命页面异常提前终止；"
-                        "请根据各Worker日志确认未执行区间。"
-                    )
+            initial_tasks = self.build_tasks(tasks_config)
+            if not initial_tasks:
+                logger.warning("配置没有生成任何有效日期任务，调度结束。")
+                return
+
+            ledger = TaskLedger(runtime_dir / "backfill_results.jsonl")
+            try:
+                await ledger.reset()
+            except Exception as error:
+                logger.error(f"无法创建或覆盖任务账本，调度停止: {error}")
+                return
+
+            logger.info(
+                f"本轮任务账本已重置: {ledger.path}；日志继续追加到: {log_path}"
+            )
+
+            # 第一轮：所有页面从同一个共享任务池动态领取日期区块。
+            healthy_pages = await self._run_task_round(
+                initial_tasks,
+                worker_pages,
+                ledger,
+                "首次执行",
+            )
+
+            # 第二轮：必须从 JSONL 读取第一轮失败项，只进行一次总体重试。
+            retry_tasks = await ledger.failed_tasks(attempt=1)
+            if retry_tasks:
+                logger.warning(
+                    f"首次执行结束，从任务账本读取到 {len(retry_tasks)} 个失败任务，"
+                    "开始唯一一次总体重试。"
+                )
+                await self._run_task_round(
+                    retry_tasks,
+                    healthy_pages,
+                    ledger,
+                    "总体重试",
+                )
+            else:
+                logger.info("首次执行没有失败任务，无需总体重试。")
+
+            summary = await ledger.summary(total_tasks=len(initial_tasks))
+            self._log_summary(summary)
 
 if __name__ == "__main__":
     bite_id = '4626a1f1fadb4ac4aab182d93469147f'
-    # 任务配置列表：每个字典代表分配给一个标签页的采集任务
-    # 注意：支持多个标签页同时采集同一个卡片（比如 4 个标签页同时跑卡片 5，但日期不同）
+    # 任务配置列表：每个字典描述一个待拆分的卡片日期范围。
+    # 所有拆分后的日期区块进入共享任务池，由可用标签页动态领取。
     tasks_config = [
         {"card": 3, "start": "2025-07-01", "end": "2025-12-31", "chunk_days": 1},
         {"card": 5, "start": "2025-09-01", "end": "2025-09-30", "chunk_days": 1},

@@ -51,6 +51,24 @@ class BackfillEngine:
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = 120
 
+    @staticmethod
+    def _fatal_page_error_reason(error: Exception) -> Optional[str]:
+        """识别页面崩溃、关闭或浏览器断连等无法继续执行的致命异常。"""
+        error_msg = str(error).lower()
+
+        if "page crashed" in error_msg or "target crashed" in error_msg:
+            return "页面或其渲染目标已崩溃"
+
+        connection_markers = (
+            "closed",
+            "disconnected",
+            "target page",
+        )
+        if any(marker in error_msg for marker in connection_markers):
+            return "页面、Context或浏览器已关闭或连接断开"
+
+        return None
+
     def get_debugger_address(self) -> Optional[str]:
         """
         【复用说明】
@@ -299,7 +317,7 @@ class BackfillEngine:
             logger.info(f"Worker-{worker_id} 未检测到三级弹窗，正常采集完成。")
             return True
 
-    async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]], list_index: int):
+    async def worker(self, task_card_index: int, page: Page, date_chunks: List[Tuple[str, str]], list_index: int) -> bool:
         """Worker 协程：处理指定页面上的所有日期分块任务"""
         worker_id = f"卡片-{task_card_index}[{list_index}]"
         logger.info(f"Worker-{worker_id} 启动，绑定页面: {page.url[-25:]}")
@@ -323,11 +341,17 @@ class BackfillEngine:
             
             # 不需要记录基准线，依靠锚点即可
         except Exception as e:
-            logger.error(f"Worker-{worker_id} 初始化失败，跳过该标签页: {e}")
-            return # 初始化失败，退出当前任务
+            fatal_reason = self._fatal_page_error_reason(e)
+            if fatal_reason:
+                logger.error(f"Worker-{worker_id} 初始化期间检测到致命页面异常（{fatal_reason}），停止该Worker: {e}")
+            else:
+                logger.error(f"Worker-{worker_id} 初始化失败，跳过该标签页: {e}")
+            return False # 初始化失败，退出当前任务
             
         # --- 循环处理日期分块任务 ---
-        for start_date, end_date in date_chunks:
+        worker_aborted = False
+        for chunk_index, (start_date, end_date) in enumerate(date_chunks):
+            task_submitted = False
             logger.info(f"Worker-{worker_id} 开始处理任务: {start_date} 至 {end_date}")
             
             try:
@@ -400,6 +424,8 @@ class BackfillEngine:
                                 logger.warning(f"Worker-{worker_id} 重试 3 次后统计文本仍显示 0 或 负数，放弃重试，强制触发补齐流程兜底！")
                                 is_missing_data = True
                 except Exception as e:
+                    if self._fatal_page_error_reason(e):
+                        raise
                     logger.warning(f"Worker-{worker_id} 读取统计文本发生异常: {e}，将强制走补齐流程防错...")
 
                 if not is_missing_data:
@@ -433,6 +459,8 @@ class BackfillEngine:
                             click_success = True
                             break
                         except Exception as e:
+                            if self._fatal_page_error_reason(e):
+                                raise
                             logger.warning(f"Worker-{worker_id} 第 {click_retry+1} 次点击全店补齐失败(可能遭遇subtree遮挡): {str(e)[:100]}...")
                             if click_retry < 2:
                                 logger.info(f"Worker-{worker_id} 启动恢复流程：关闭二级弹窗并重新打开...")
@@ -449,6 +477,8 @@ class BackfillEngine:
                 except PlaywrightTimeoutError:
                     logger.error(f"Worker-{worker_id} 二级弹窗打开、按钮点击或恢复流程发生超时。")
                 except Exception as e:
+                    if self._fatal_page_error_reason(e):
+                        raise
                     logger.error(f"Worker-{worker_id} 二级弹窗处理阶段发生未知异常: {e}")
 
                 if not click_success:
@@ -456,9 +486,13 @@ class BackfillEngine:
                     try:
                         await self._restore_primary_state(page, worker_id)
                     except Exception as cleanup_error:
+                        if self._fatal_page_error_reason(cleanup_error):
+                            raise
                         logger.warning(f"Worker-{worker_id} 提交失败后清理弹窗异常: {cleanup_error}")
                     logger.warning(f"Worker-{worker_id} 跳过 {start_date} 至 {end_date}，继续下一个区间。")
                     continue
+
+                task_submitted = True
                 
                 # 4. 开始完工判定（交由 GC 守护进程管理蓝页，此处只需判定本页弹窗状态）
                 completed_normally = await self.wait_for_completion_or_heartbeat(page, worker_id)
@@ -468,20 +502,41 @@ class BackfillEngine:
                     logger.warning(f"Worker-{worker_id} 当前区间判定为卡死并已清理: {start_date} 至 {end_date}")
                 
             except Exception as e:
-                error_msg = str(e).lower()
-                # 死亡检测：如果浏览器被外部程序（如主管的定时脚本）物理关闭，直接跳出大循环，停止无意义的报错刷屏
-                if "closed" in error_msg or "disconnected" in error_msg or "target page" in error_msg:
-                    logger.error(f"Worker-{worker_id} 检测到浏览器连接已断开，停止任务执行并退出。")
+                fatal_reason = self._fatal_page_error_reason(e)
+                if fatal_reason:
+                    worker_aborted = True
+                    remaining_count = len(date_chunks) - chunk_index - 1
+                    current_state = (
+                        "已经提交【全店补齐】，但最终结果未知"
+                        if task_submitted
+                        else "尚未完成【全店补齐】提交"
+                    )
+                    logger.error(
+                        f"Worker-{worker_id} 检测到致命页面异常（{fatal_reason}），停止该Worker: {e}"
+                    )
+                    logger.warning(
+                        f"Worker-{worker_id} 当前区间 {start_date} 至 {end_date} {current_state}；"
+                        f"剩余 {remaining_count} 个任务区间未执行。"
+                    )
                     break
                     
                 logger.error(f"Worker-{worker_id} 在执行 {start_date} 至 {end_date} 期间发生错误: {e}")
                 logger.warning(f"Worker-{worker_id} 由于执行异常，将跳过 {start_date} 至 {end_date} 区间，继续尝试下一个。")
                 await asyncio.sleep(5)
 
-        logger.info(f"Worker-{worker_id} 所有任务区间已遍历完毕。")
+        if worker_aborted:
+            logger.warning(f"Worker-{worker_id} 因致命页面异常提前终止，未遍历全部任务区间。")
+        else:
+            logger.info(f"Worker-{worker_id} 所有任务区间已遍历完毕。")
 
         # --- 阶段三：收尾（保留现场） ---
-        logger.info(f"Worker-{worker_id} 调度结束，保留当前任务弹窗供人工复核。")
+        if worker_aborted:
+            logger.warning(f"Worker-{worker_id} 调度已中止，当前页面不可用，无法保证保留现场。")
+        else:
+            logger.info(f"Worker-{worker_id} 调度结束，保留当前任务弹窗供人工复核。")
+
+        return not worker_aborted
+
     async def run(self, tasks_config: list = None):
         cdp_address = self.get_debugger_address()
         if not cdp_address:
@@ -549,9 +604,15 @@ class BackfillEngine:
             if worker_tasks:
                 logger.info(f"\n{'='*40}\n开始并发执行 {len(worker_tasks)} 个标签页任务...\n{'='*40}")
                 # 并发执行所有组装好的协程任务
-                await asyncio.gather(*worker_tasks)
-
-            logger.info("\n所有并发定向补采任务执行完毕。")
+                worker_results = await asyncio.gather(*worker_tasks)
+                if all(worker_results):
+                    logger.info("\n所有Worker均已完成任务区间遍历。")
+                else:
+                    failed_worker_count = sum(result is False for result in worker_results)
+                    logger.warning(
+                        f"\n本轮调度结束，但有 {failed_worker_count} 个Worker初始化失败或因致命页面异常提前终止；"
+                        "请根据各Worker日志确认未执行区间。"
+                    )
 
 if __name__ == "__main__":
     bite_id = '4626a1f1fadb4ac4aab182d93469147f'

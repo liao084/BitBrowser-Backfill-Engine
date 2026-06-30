@@ -126,8 +126,12 @@ class BackfillEngine:
         
         while not page.is_closed():
             try:
-                # 等待心跳弹窗，超时时间为 180 秒
-                await page.wait_for_selector(toast_selector, state="attached", timeout=180000)
+                # 保存当前这一个心跳节点，避免连续出现的同类提示让 detached 永远无法成立。
+                toast_handle = await page.wait_for_selector(
+                    toast_selector,
+                    state="attached",
+                    timeout=180000,
+                )
             except PlaywrightTimeoutError:
                 # 180 秒内无任何心跳，判定为残留僵尸网页
                 if not page.is_closed():
@@ -141,12 +145,16 @@ class BackfillEngine:
                 # 网页可能在这期间被正常关闭了
                 break
 
+            if toast_handle is None:
+                # attached 状态正常不会返回 None，仅作为接口返回值的防御性处理。
+                continue
+
             try:
-                # 等待弹窗消失，防止重复触发
-                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
+                # 只等待当前节点隐藏或移除；后续成功提示不会替换本次等待目标。
+                await toast_handle.wait_for_element_state("hidden", timeout=15000)
             except PlaywrightTimeoutError:
                 if not page.is_closed():
-                    logger.warning(f"[GC Daemon] 商智网页 {url_suffix} 心跳弹窗超过 15 秒未消失，判定页面状态异常，执行强制关闭。")
+                    logger.warning(f"[GC Daemon] 商智网页 {url_suffix} 当前心跳弹窗节点超过 15 秒仍未隐藏，判定页面状态异常，执行强制关闭。")
                     try:
                         await page.close()
                     except Exception as e:
@@ -154,6 +162,12 @@ class BackfillEngine:
                 break
             except Exception:
                 break
+            finally:
+                try:
+                    await toast_handle.dispose()
+                except Exception:
+                    # 页面正常关闭或崩溃时，释放句柄失败不影响GC协程退出。
+                    pass
         
         logger.debug(f"[GC Daemon] 网页 {url_suffix} 监控任务结束。")
 
@@ -285,24 +299,39 @@ class BackfillEngine:
         
         while True:
             try:
-                # 等待绿色弹窗出现
-                await page.wait_for_selector(toast_selector, state="attached", timeout=silent_timeout_ms)
+                # 保存当前这一个心跳节点。后续只跟踪它，不让新出现的同类提示替换等待目标。
+                toast_handle = await page.wait_for_selector(
+                    toast_selector,
+                    state="attached",
+                    timeout=silent_timeout_ms,
+                )
             except PlaywrightTimeoutError:
                 logger.info(f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} 秒无新心跳，判定当前区间补采结束或卡死。")
                 break
             except Exception as e:
                 logger.error(f"Worker-{worker_id} 监听过程中发生未知异常: {e}")
-                raise e
+                raise
+
+            if toast_handle is None:
+                # attached 状态正常不会返回 None，仅作为接口返回值的防御性处理。
+                continue
 
             try:
-                # 等待该弹窗消失，准备迎接下一次弹窗
-                await page.wait_for_selector(toast_selector, state="detached", timeout=15000)
+                # ElementHandle 固定指向当前节点；其他成功提示即使同时出现，也不会影响本次等待。
+                # hidden 同时兼容节点隐藏和从 DOM 中移除。
+                await toast_handle.wait_for_element_state("hidden", timeout=15000)
             except PlaywrightTimeoutError:
-                logger.warning(f"Worker-{worker_id} 心跳弹窗超过 15 秒未消失，停止心跳监听并进入终态检查。")
+                logger.warning(f"Worker-{worker_id} 当前心跳弹窗节点超过 15 秒仍未隐藏，停止心跳监听并进入终态检查。")
                 break
             except Exception as e:
                 logger.error(f"Worker-{worker_id} 等待心跳弹窗消失时发生异常: {e}")
                 raise
+            finally:
+                try:
+                    await toast_handle.dispose()
+                except Exception:
+                    # 页面关闭或崩溃时，释放句柄本身也可能失败，不覆盖原始异常。
+                    pass
                 
         # 心跳停止后，通过精确绑定的三级弹窗判定是否卡死。
         logger.info(f"Worker-{worker_id} 心跳停止，开始探测卡死状态...")

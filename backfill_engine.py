@@ -142,7 +142,6 @@ class BackfillEngine:
     ) -> None:
         """保留错误提示一段时间后，点击该提示节点自己的关闭按钮。"""
         close_button: Optional[ElementHandle] = None
-        closed = False
         try:
             logger.warning(
                 f"Worker-{worker_id} 检测到红色错误提示 [{message}]，"
@@ -163,8 +162,17 @@ class BackfillEngine:
                 )
                 return
 
-            # 保留 Playwright 的可点击性检查；关闭提示本身也不使用 JS 或 force 点击。
-            await close_button.click(timeout=5000)
+            # 优先保留 Playwright 的可点击性检查。提示被业务弹窗、loading mask
+            # 等页面层遮挡时，仅对这个已经精确绑定的专属叉号降级为 DOM 点击。
+            try:
+                await close_button.click(timeout=5000)
+            except PlaywrightTimeoutError:
+                logger.info(
+                    f"Worker-{worker_id} 红色错误提示 [{message}] 的关闭按钮被页面层遮挡，"
+                    "改用精准 DOM 点击。"
+                )
+                await close_button.evaluate("node => node.click()")
+
             try:
                 await toast_handle.wait_for_element_state("hidden", timeout=5000)
             except PlaywrightTimeoutError:
@@ -174,24 +182,19 @@ class BackfillEngine:
                 )
                 return
 
-            closed = True
             logger.info(f"Worker-{worker_id} 已自动关闭红色错误提示 [{message}]。")
         except asyncio.CancelledError:
             raise
         except Exception as error:
             if not page.is_closed():
+                error_summary = str(error).splitlines()[0]
                 logger.warning(
-                    f"Worker-{worker_id} 自动关闭红色错误提示 [{message}] 失败: {error}"
+                    f"Worker-{worker_id} 自动关闭红色错误提示 [{message}] 失败: "
+                    f"{error_summary}；该节点本轮不再重复调度。"
                 )
         finally:
-            # 如果关闭失败，移除调度标记，让监控器下一轮能够重新发现并再次安排处理。
-            if not closed and not page.is_closed():
-                try:
-                    await toast_handle.evaluate(
-                        "node => node.removeAttribute('data-rpa-error-close-scheduled')"
-                    )
-                except Exception:
-                    pass
+            # 节点一旦进入本流程就保留已调度标记；即使关闭失败，也不再每隔
+            # 30 秒重复处理同一个节点。新产生的错误提示仍会被监控器独立捕获。
             if close_button is not None:
                 try:
                     await close_button.dispose()

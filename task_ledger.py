@@ -84,16 +84,19 @@ class TaskLedger:
             if record.get("success") is False
         ]
 
-    async def summary(self, total_tasks: int) -> Dict[str, int]:
-        """按 task_id 的最新尝试结果生成首次、重试和最终统计。"""
+    async def summary(self, total_tasks: int) -> Dict[str, Any]:
+        """按 task_id 的最新尝试结果生成逐轮及最终统计。"""
         records = await self.load()
         first_results: Dict[str, Dict[str, Any]] = {}
         retry_results: Dict[str, Dict[str, Any]] = {}
         latest_results: Dict[str, Dict[str, Any]] = {}
+        results_by_attempt: Dict[int, Dict[str, Dict[str, Any]]] = {}
 
         for record in records:
             task_id = record["task_id"]
             attempt = record.get("attempt", 0)
+            if isinstance(attempt, int) and attempt > 0:
+                results_by_attempt.setdefault(attempt, {})[task_id] = record
             if attempt == 1:
                 first_results[task_id] = record
             elif attempt == 2:
@@ -112,6 +115,21 @@ class TaskLedger:
         final_success = sum(
             record.get("success") is True for record in latest_results.values()
         )
+        rounds = []
+        for attempt in sorted(results_by_attempt):
+            attempt_results = results_by_attempt[attempt]
+            success_count = sum(
+                record.get("success") is True
+                for record in attempt_results.values()
+            )
+            rounds.append(
+                {
+                    "attempt": attempt,
+                    "total": len(attempt_results),
+                    "success": success_count,
+                    "failed": len(attempt_results) - success_count,
+                }
+            )
 
         return {
             "total": total_tasks,
@@ -122,4 +140,6 @@ class TaskLedger:
             "retry_failed": len(retry_results) - retry_success,
             "final_success": final_success,
             "final_failed": total_tasks - final_success,
+            "rounds": rounds,
+            "attempts_run": len(rounds),
         }

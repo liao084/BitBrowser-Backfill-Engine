@@ -7,6 +7,7 @@ RPA 历史数据自动化补采调度引擎 (Playwright Async 版)
 
 import asyncio
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta
@@ -29,10 +30,16 @@ log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', dat
 logger = logging.getLogger("BackfillEngine")
 logger.setLevel(logging.INFO)
 
-# 1. 输出到控制台
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-logger.addHandler(console_handler)
+# 1. 默认输出到控制台；daily-mode 可在导入本模块前通过环境变量关闭。
+console_logging_enabled = os.environ.get("RPA_CONSOLE_LOGGING", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+if console_logging_enabled and sys.stderr is not None:
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_formatter)
+    logger.addHandler(console_handler)
 
 # 2. 输出到本地文件：打包后位于 exe 同目录，源码运行时位于脚本同目录。
 runtime_dir = (
@@ -40,7 +47,7 @@ runtime_dir = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
-log_path = runtime_dir / "backfill_run.log"
+log_path = runtime_dir / os.environ.get("RPA_LOG_FILENAME", "backfill_run.log")
 try:
     file_handler = logging.FileHandler(log_path, encoding='utf-8')
     file_handler.setFormatter(log_formatter)

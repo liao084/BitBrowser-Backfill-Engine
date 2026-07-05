@@ -6,15 +6,19 @@ RPA 历史数据自动化补采调度引擎 (Playwright Async 版)
 """
 
 import asyncio
+import json
 import logging
+import os
 import re
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Optional, List, Tuple
+from typing import Any, Awaitable, Dict, Optional, List, Tuple, TypeVar
 
 import requests
+from dotenv import load_dotenv
 from playwright.async_api import (
+    BrowserContext,
     ElementHandle,
     Locator,
     Page,
@@ -23,6 +27,17 @@ from playwright.async_api import (
 )
 
 from task_ledger import TaskLedger
+
+
+T = TypeVar("T")
+
+
+class WorkerUnresponsiveError(RuntimeError):
+    """页面仍连接但已无法在限定时间内响应，当前Worker必须退出。"""
+
+
+class TaskPageInitializationError(RuntimeError):
+    """单次任务页面初始化失败；连续发生时触发Worker熔断。"""
 
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -53,18 +68,45 @@ except Exception as e:
 class BackfillEngine:
     """历史数据补采引擎"""
 
-    def __init__(self, bite_id: str):
+    def __init__(
+        self,
+        bite_id: str,
+        gc_page_url_markers: List[str],
+    ):
         self.bt_url = 'http://127.0.0.1:54345'
         self.bite_id = bite_id
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = 120
+        # Context 级业务执行页 GC 比 Worker 多保留 60 秒观察窗口。
+        self.gc_silent_timeout_seconds = 180
+        # 程序收尾时覆盖 120/180 秒判定之间的窗口，并额外预留 5 秒调度余量。
+        self.gc_shutdown_grace_seconds = (
+            self.gc_silent_timeout_seconds - self.silent_timeout_seconds + 5
+        )
+        # 纳入 Context 级 GC 的业务执行页 URL 标记。其他平台只有在使用
+        # 相同心跳 DOM 协议时，才可以直接追加到这个元组。
+        if not gc_page_url_markers or not all(
+            isinstance(marker, str) and marker.strip()
+            for marker in gc_page_url_markers
+        ):
+            raise ValueError("gc_page_url_markers 必须是非空字符串列表")
+        self.gc_page_url_markers = tuple(
+            marker.strip() for marker in gc_page_url_markers
+        )
         # 红色错误提示保留时间：既给人工观察留出窗口，也避免长期堆积遮挡页面。
         self.error_toast_grace_seconds = 30
+        # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。
+        self.page_probe_timeout_seconds = 10
+        # 普通初始化异常允许短暂恢复，连续达到阈值后隔离当前Worker。
+        self.max_consecutive_initialization_failures = 3
         self._error_toast_close_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _fatal_page_error_reason(error: Exception) -> Optional[str]:
         """识别页面崩溃、关闭或浏览器断连等无法继续执行的致命异常。"""
+        if isinstance(error, WorkerUnresponsiveError):
+            return str(error)
+
         error_msg = str(error).lower()
 
         if "page crashed" in error_msg or "target crashed" in error_msg:
@@ -79,6 +121,57 @@ class BackfillEngine:
             return "页面、Context或浏览器已关闭或连接断开"
 
         return None
+
+    async def _await_page_operation(
+        self,
+        operation: Awaitable[T],
+        worker_id: str,
+        operation_name: str,
+        timeout_seconds: Optional[float] = None,
+    ) -> T:
+        """给可能缺少协议级超时的短页面操作增加asyncio硬超时。"""
+        timeout = timeout_seconds or self.page_probe_timeout_seconds
+        try:
+            return await asyncio.wait_for(operation, timeout=timeout)
+        except asyncio.TimeoutError as error:
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} {operation_name}超过 {timeout:g} 秒无响应"
+            ) from error
+
+    async def _locator_is_visible(
+        self,
+        locator: Locator,
+        worker_id: str,
+        locator_name: str,
+    ) -> bool:
+        """在硬超时保护下判断Locator是否存在且可见。"""
+        count = await self._await_page_operation(
+            locator.count(),
+            worker_id,
+            f"查询{locator_name}数量",
+        )
+        if count == 0:
+            return False
+        return await self._await_page_operation(
+            locator.is_visible(),
+            worker_id,
+            f"查询{locator_name}可见性",
+        )
+
+    async def _assert_page_healthy(self, page: Page, worker_id: str) -> None:
+        """通过一次受硬超时保护的JS往返确认页面渲染事件循环仍能响应。"""
+        if page.is_closed():
+            raise WorkerUnresponsiveError(f"Worker-{worker_id} 页面已经关闭")
+
+        ready_state = await self._await_page_operation(
+            page.evaluate("() => document.readyState"),
+            worker_id,
+            "页面健康探测",
+        )
+        if ready_state not in {"loading", "interactive", "complete"}:
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} 页面健康探测返回异常状态: {ready_state!r}"
+            )
 
     def get_debugger_address(self) -> Optional[str]:
         """
@@ -114,10 +207,10 @@ class BackfillEngine:
             for _ in range(10):
                 if page.is_closed():
                     return
-                if "ppzh.jd.com" in page.url:
-                    # 确认为商智网页，部署监控协程
+                if self._is_gc_managed_page_url(page.url):
+                    # 确认为受 GC 管理的业务执行页，部署监控协程。
                     url_suffix = page.url[-25:] if len(page.url) > 25 else page.url
-                    logger.info(f"[GC Daemon] 发现商智网页，开始后台监控: {url_suffix}")
+                    logger.info(f"[GC Daemon] 发现业务执行网页，开始后台监控: {url_suffix}")
                     asyncio.create_task(self._monitor_and_gc_page(page))
                     return
                 await asyncio.sleep(1)
@@ -127,6 +220,58 @@ class BackfillEngine:
     def _on_new_page(self, page: Page):
         """拦截浏览器新建标签页的事件"""
         asyncio.create_task(self._delayed_check(page))
+
+    def _is_gc_managed_page_url(self, url: str) -> bool:
+        """判断 URL 是否属于应由 Context 级 GC 管理的业务执行页面。"""
+        normalized_url = url.lower()
+        return any(
+            marker.lower() in normalized_url
+            for marker in self.gc_page_url_markers
+        )
+
+    def _remaining_gc_pages(self, context: BrowserContext) -> List[Page]:
+        """返回 Context 中尚未关闭、且符合 GC URL 规则的业务执行页面。"""
+        return [
+            page
+            for page in context.pages
+            if not page.is_closed() and self._is_gc_managed_page_url(page.url)
+        ]
+
+    async def _cleanup_remaining_gc_pages(
+        self,
+        context: BrowserContext,
+    ) -> None:
+        """在主调度结束后给 GC 留出窗口，并兜底关闭仍残留的业务执行页。"""
+        remaining_pages = self._remaining_gc_pages(context)
+        if not remaining_pages:
+            return
+
+        logger.info(
+            f"程序收尾时仍有 {len(remaining_pages)} 个业务执行页面；"
+            f"等待 {self.gc_shutdown_grace_seconds} 秒交由 GC 自然回收。"
+        )
+        await asyncio.sleep(self.gc_shutdown_grace_seconds)
+
+        remaining_pages = self._remaining_gc_pages(context)
+        if not remaining_pages:
+            logger.info("程序收尾宽限期内，残留业务执行页面已全部自然关闭。")
+            return
+
+        logger.warning(
+            f"程序收尾宽限期结束后仍有 {len(remaining_pages)} 个业务执行页面，"
+            "执行兜底关闭。"
+        )
+        close_results = await asyncio.gather(
+            *(page.close() for page in remaining_pages),
+            return_exceptions=True,
+        )
+        failed_count = sum(
+            isinstance(result, BaseException) for result in close_results
+        )
+        if failed_count:
+            logger.warning(f"程序收尾时有 {failed_count} 个业务执行页面关闭失败。")
+        else:
+            logger.info("程序收尾时的残留业务执行页面已全部关闭。")
 
     def _track_error_toast_close_task(self, task: asyncio.Task) -> None:
         """持有延迟关闭任务，避免任务被垃圾回收，并在结束后自动移除。"""
@@ -319,12 +464,16 @@ class BackfillEngine:
                 toast_handle = await page.wait_for_selector(
                     toast_selector,
                     state="attached",
-                    timeout=180000,
+                    timeout=self.gc_silent_timeout_seconds * 1000,
                 )
             except PlaywrightTimeoutError:
                 # 180 秒内无任何心跳，判定为残留僵尸网页
                 if not page.is_closed():
-                    logger.warning(f"[GC Daemon] 商智网页 {url_suffix} 超过 180 秒无心跳，判定为残留任务，执行强制关闭。")
+                    logger.warning(
+                        f"[GC Daemon] 业务执行网页 {url_suffix} 超过 "
+                        f"{self.gc_silent_timeout_seconds} 秒无心跳，"
+                        "判定为残留任务，执行强制关闭。"
+                    )
                     try:
                         await page.close()
                     except Exception as e:
@@ -343,7 +492,7 @@ class BackfillEngine:
                 await toast_handle.wait_for_element_state("hidden", timeout=15000)
             except PlaywrightTimeoutError:
                 if not page.is_closed():
-                    logger.warning(f"[GC Daemon] 商智网页 {url_suffix} 当前心跳弹窗节点超过 15 秒仍未隐藏，判定页面状态异常，执行强制关闭。")
+                    logger.warning(f"[GC Daemon] 业务执行网页 {url_suffix} 当前心跳弹窗节点超过 15 秒仍未隐藏，判定页面状态异常，执行强制关闭。")
                     try:
                         await page.close()
                     except Exception as e:
@@ -404,20 +553,52 @@ class BackfillEngine:
         timeout_ms: int = 8000,
     ) -> bool:
         """关闭指定容器内唯一的叉号，并等待该容器真正隐藏。"""
-        if await container.count() == 0 or not await container.is_visible():
+        if not await self._locator_is_visible(
+            container, worker_id, layer_name
+        ):
             return False
 
         close_button = container.locator("i.el-icon-close")
-        close_count = await close_button.count()
+        close_count = await self._await_page_operation(
+            close_button.count(),
+            worker_id,
+            f"查询{layer_name}关闭按钮数量",
+        )
         if close_count != 1:
             raise RuntimeError(
                 f"Worker-{worker_id} {layer_name}内部预期 1 个关闭按钮，实际找到 {close_count} 个"
             )
 
         logger.info(f"Worker-{worker_id} 正在关闭{layer_name}...")
-        await close_button.click(timeout=5000)
+        try:
+            await close_button.click(timeout=5000)
+        except PlaywrightTimeoutError:
+            # 仅对已经精确限定在弹窗内部的关闭按钮使用 DOM 点击，避免遮挡层
+            # 导致 Playwright 命中测试永久失败；业务按钮仍保留真实点击保护。
+            logger.warning(
+                f"Worker-{worker_id} {layer_name}关闭按钮无法完成常规点击，"
+                "改用精准 DOM 点击。"
+            )
+            await self._await_page_operation(
+                close_button.evaluate("node => node.click()"),
+                worker_id,
+                f"精准点击{layer_name}关闭按钮",
+            )
+
         # ElementUI Drawer 关闭后会保留在 DOM 中并变成零尺寸，hidden 可同时兼容隐藏和移除。
-        await container.wait_for(state="hidden", timeout=timeout_ms)
+        try:
+            await container.wait_for(state="hidden", timeout=timeout_ms)
+        except PlaywrightTimeoutError as error:
+            # 区分“页面彻底不响应”和“页面仍响应但关闭事件未生效”。后一种情况
+            # 同样无法安全复用当前 Worker，因此也应退出任务池。
+            await self._assert_page_healthy(container.page, worker_id)
+            if not await self._locator_is_visible(container, worker_id, layer_name):
+                logger.info(f"Worker-{worker_id} {layer_name}已在超时边界完成关闭。")
+                return True
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} {layer_name}关闭指令已发出，但弹窗仍未隐藏"
+            ) from error
+
         logger.info(f"Worker-{worker_id} {layer_name}已关闭。")
         return True
 
@@ -433,7 +614,13 @@ class BackfillEngine:
         primary_drawer = self._primary_drawer(page)
         await primary_drawer.wait_for(state="visible", timeout=10000)
         # trial 只做完整可点击性检查，不触发实际检测。
-        await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+        try:
+            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+        except PlaywrightTimeoutError as error:
+            await self._assert_page_healthy(page, worker_id)
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} 恢复一级弹窗后【启动检测】按钮仍不可点击"
+            ) from error
 
     async def _close_all_task_layers(self, page: Page, worker_id: str):
         """Worker 初始化时按层级关闭三级、二级和一级弹窗。"""
@@ -456,7 +643,11 @@ class BackfillEngine:
             primary_drawer = self._primary_drawer(page)
             inputs = primary_drawer.locator("input.el-range-input")
 
-            input_count = await inputs.count()
+            input_count = await self._await_page_operation(
+                inputs.count(),
+                worker_id,
+                "查询日期输入框数量",
+            )
             if input_count < 2:
                 raise RuntimeError(f"一级弹窗内预期至少 2 个日期输入框，实际找到 {input_count} 个")
             
@@ -526,7 +717,9 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} 心跳停止，开始探测卡死状态...")
         progress_dialog = self._progress_dialog(page)
 
-        if await progress_dialog.count() > 0 and await progress_dialog.is_visible():
+        if await self._locator_is_visible(
+            progress_dialog, worker_id, "三级进度弹窗"
+        ):
             logger.warning(f"Worker-{worker_id} 检测到三级弹窗依然存在，判定为卡死，准备按层级清理...")
             await self._restore_primary_state(page, worker_id)
             logger.info(f"Worker-{worker_id} 卡死弹窗清理完毕，退回主页面。")
@@ -605,10 +798,11 @@ class BackfillEngine:
             if fatal_reason:
                 logger.error(f"Worker-{worker_id} 初始化期间检测到致命页面异常（{fatal_reason}），停止该Worker: {e}")
                 raise
-            else:
-                logger.error(f"Worker-{worker_id} 任务页面初始化失败: {e}")
+            logger.error(f"Worker-{worker_id} 任务页面初始化失败: {e}")
             await asyncio.sleep(5)
-            return False
+            raise TaskPageInitializationError(
+                f"Worker-{worker_id} 任务页面初始化失败"
+            ) from e
             
         # execute_task 每次只接收一个日期区块，保留单层循环以复用原业务流程。
         for start_date, end_date in date_chunks:
@@ -802,6 +996,7 @@ class BackfillEngine:
         logger.info(
             f"Worker-{worker_id} 启动{round_name}，绑定页面: {page.url[-25:]}"
         )
+        consecutive_initialization_failures = 0
 
         while True:
             try:
@@ -813,6 +1008,25 @@ class BackfillEngine:
             fatal_error = False
             try:
                 success = await self.execute_task(page, task, list_index)
+                # execute_task 能进入业务流程（无论业务最终成功与否），说明页面初始化正常。
+                consecutive_initialization_failures = 0
+            except TaskPageInitializationError as error:
+                success = False
+                consecutive_initialization_failures += 1
+                logger.warning(
+                    f"Worker-{worker_id} 连续初始化失败 "
+                    f"{consecutive_initialization_failures}/"
+                    f"{self.max_consecutive_initialization_failures}: {error}"
+                )
+                if (
+                    consecutive_initialization_failures
+                    >= self.max_consecutive_initialization_failures
+                ):
+                    fatal_error = True
+                    logger.error(
+                        f"Worker-{worker_id} 已达到连续初始化失败阈值，"
+                        "触发熔断并停止领取新任务。"
+                    )
             except Exception as error:
                 fatal_reason = self._fatal_page_error_reason(error)
                 success = False
@@ -871,13 +1085,17 @@ class BackfillEngine:
             *[
                 self.worker(page, task_queue, ledger, index, round_name)
                 for index, page in enumerate(worker_pages)
-            ]
+            ],
+            return_exceptions=True,
         )
-        healthy_pages = [
-            page
-            for page, is_healthy in zip(worker_pages, worker_results)
-            if is_healthy
-        ]
+        healthy_pages = []
+        for index, (page, result) in enumerate(zip(worker_pages, worker_results)):
+            if result is True:
+                healthy_pages.append(page)
+            elif isinstance(result, BaseException):
+                logger.error(
+                    f"Worker-页面-{index + 1} 协程异常退出，已从后续轮次隔离: {result}"
+                )
 
         # 正常情况下健康Worker会取完全部任务；这里只兜底处理全部页面都崩溃的情况。
         unprocessed_count = 0
@@ -1015,18 +1233,62 @@ class BackfillEngine:
                 self._log_summary(summary)
             finally:
                 await self._stop_error_toast_monitors(error_toast_monitors)
+                await self._cleanup_remaining_gc_pages(context)
+
+
+def _load_json_list_env(name: str) -> List[Any]:
+    """读取值为 JSON 数组的环境变量，并给出可定位的配置错误。"""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        raise ValueError(f".env 缺少必填配置 {name}")
+
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f".env 中的 {name} 不是有效 JSON 数组: {error}") from error
+
+    if not isinstance(value, list):
+        raise ValueError(f".env 中的 {name} 必须是 JSON 数组")
+    return value
+
+
+def load_runtime_config() -> Tuple[str, List[Dict[str, Any]], List[str]]:
+    """从源码或 exe 同目录的 .env 加载本次运行配置。"""
+    env_path = runtime_dir / ".env"
+    if not env_path.exists():
+        raise FileNotFoundError(
+            f"未找到运行配置 {env_path}；请复制 .env.example 为 .env 后填写。"
+        )
+
+    load_dotenv(env_path)
+    bite_id = (os.getenv("BITE_ID") or "").strip()
+    if not bite_id:
+        raise ValueError(".env 缺少必填配置 BITE_ID")
+
+    tasks_config_raw = _load_json_list_env("TASKS_CONFIG")
+    if not tasks_config_raw or not all(
+        isinstance(config, dict) for config in tasks_config_raw
+    ):
+        raise ValueError("TASKS_CONFIG 必须是非空的 JSON 对象数组")
+
+    markers_raw = _load_json_list_env("GC_PAGE_URL_MARKERS")
+    if not markers_raw or not all(
+        isinstance(marker, str) and marker.strip() for marker in markers_raw
+    ):
+        raise ValueError("GC_PAGE_URL_MARKERS 必须是非空字符串数组")
+
+    return bite_id, tasks_config_raw, markers_raw
+
 
 if __name__ == "__main__":
-    bite_id = '4626a1f1fadb4ac4aab182d93469147f'
-    # 任务配置列表：每个字典描述一个待拆分的卡片日期范围。
-    # 所有拆分后的日期区块进入共享任务池，由可用标签页动态领取。
-    tasks_config = [
-        {"card": 3, "start": "2025-07-01", "end": "2025-12-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-09-01", "end": "2025-09-30", "chunk_days": 1},
-        {"card": 5, "start": "2025-10-01", "end": "2025-10-31", "chunk_days": 1},
-        {"card": 5, "start": "2025-11-01", "end": "2025-11-30", "chunk_days": 1},
-        {"card": 5, "start": "2025-12-01", "end": "2025-12-31", "chunk_days": 1},
-    ]
-    
-    engine = BackfillEngine(bite_id)
+    try:
+        bite_id, tasks_config, gc_page_url_markers = load_runtime_config()
+    except (OSError, ValueError) as error:
+        logger.error(f"运行配置加载失败: {error}")
+        sys.exit(1)
+
+    engine = BackfillEngine(
+        bite_id,
+        gc_page_url_markers=gc_page_url_markers,
+    )
     asyncio.run(engine.run(tasks_config))

@@ -28,6 +28,7 @@ class DailyEngine(BackfillEngine):
     def __init__(
         self,
         bite_id: str,
+        gc_page_url_markers: Sequence[str],
         worker_count: int = 4,
         max_attempts: int = 5,
         target_date_offset_days: int = 1,
@@ -37,7 +38,10 @@ class DailyEngine(BackfillEngine):
             "activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
         ),
     ):
-        super().__init__(bite_id)
+        super().__init__(
+            bite_id,
+            gc_page_url_markers=list(gc_page_url_markers),
+        )
         if worker_count <= 0:
             raise ValueError("worker_count 必须大于 0")
         if max_attempts <= 0:
@@ -329,6 +333,7 @@ if __name__ == "__main__":
     MAX_ATTEMPTS = 5
     TARGET_DATE_OFFSET_DAYS = 1
     COOKIE_DIR = Path(r"C:\Users\Administrator\Desktop\COOKIE")
+    GC_PAGE_URL_MARKERS = ["ppzh.jd.com"]
 
     DAILY_TASKS = [
         {"card": 2},
@@ -351,6 +356,7 @@ if __name__ == "__main__":
 
     engine = DailyEngine(
         bite_id=BITE_ID,
+        gc_page_url_markers=GC_PAGE_URL_MARKERS,
         worker_count=WORKER_COUNT,
         max_attempts=MAX_ATTEMPTS,
         target_date_offset_days=TARGET_DATE_OFFSET_DAYS,

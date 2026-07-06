@@ -3,8 +3,10 @@
 """RPA 每日任务调度入口：登录预检、固定 Worker、共享任务池和多轮重试。"""
 
 import asyncio
+import json
 import os
 import sys
+from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -14,12 +16,143 @@ os.environ.setdefault("RPA_LOG_FILENAME", "daily_run.log")
 # daily-mode 默认只写日志文件；即使源码从终端运行也不输出控制台日志。
 os.environ.setdefault("RPA_CONSOLE_LOGGING", "0")
 
+from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from auth_manager import AuthReport, CookieAuthManager
 from backfill_engine import BackfillEngine, logger, log_path, runtime_dir
 from browser_manager import BitBrowserManager
 from task_ledger import TaskLedger
+
+
+DEFAULT_TASK_URL = (
+    "https://datatoolcenter.com/web/dateCenter.html?"
+    "activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
+)
+
+
+@dataclass(frozen=True)
+class DailyRuntimeConfig:
+    """从 EXE 同目录 .env 解析出的 daily-mode 运行配置。"""
+
+    bite_id: str
+    worker_count: int
+    max_attempts: int
+    target_date_offset_days: int
+    target_date: Optional[str]
+    cookie_dir: Path
+    task_url: str
+    daily_tasks: List[Dict[str, Any]]
+    platforms: List[Dict[str, Any]]
+    gc_page_url_markers: List[str]
+
+
+def _require_env(name: str) -> str:
+    value = (os.getenv(name) or "").strip()
+    if not value:
+        raise ValueError(f".env 缺少必填配置 {name}")
+    return value
+
+
+def _load_json_list_env(name: str) -> List[Any]:
+    raw_value = _require_env(name)
+    try:
+        value = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise ValueError(f".env 中的 {name} 不是有效 JSON 数组: {error}") from error
+    if not isinstance(value, list):
+        raise ValueError(f".env 中的 {name} 必须是 JSON 数组")
+    return value
+
+
+def _load_int_env(name: str, minimum: int) -> int:
+    raw_value = _require_env(name)
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是整数") from error
+    if value < minimum:
+        raise ValueError(f".env 中的 {name} 不能小于 {minimum}")
+    return value
+
+
+def _validate_date(value: str, name: str) -> str:
+    try:
+        date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是 YYYY-MM-DD 日期") from error
+    return value
+
+
+def load_daily_runtime_config(
+    env_path: Optional[Path] = None,
+) -> DailyRuntimeConfig:
+    """从源码或 EXE 同目录读取并严格校验 daily-mode 配置。"""
+    config_path = Path(env_path) if env_path else runtime_dir / ".env"
+    if not config_path.exists():
+        raise FileNotFoundError(
+            f"未找到运行配置 {config_path}；请复制 .env.example 为 .env 后填写。"
+        )
+
+    # 部署时以 EXE 同目录文件为准，避免机器上遗留的同名系统环境变量覆盖客户配置。
+    load_dotenv(config_path, override=True)
+
+    daily_tasks_raw = _load_json_list_env("DAILY_TASKS")
+    if not daily_tasks_raw or not all(
+        isinstance(task, dict) for task in daily_tasks_raw
+    ):
+        raise ValueError("DAILY_TASKS 必须是非空的 JSON 对象数组")
+    for index, task in enumerate(daily_tasks_raw, start=1):
+        try:
+            card = int(task.get("card", task.get("task_card_index")))
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"DAILY_TASKS 第 {index} 项缺少有效的 card"
+            ) from error
+        if card <= 0:
+            raise ValueError(f"DAILY_TASKS 第 {index} 项的 card 必须大于 0")
+        if task.get("date"):
+            _validate_date(str(task["date"]), f"DAILY_TASKS[{index}].date")
+
+    platforms_raw = _load_json_list_env("PLATFORMS")
+    if not platforms_raw or not all(
+        isinstance(platform, dict) for platform in platforms_raw
+    ):
+        raise ValueError("PLATFORMS 必须是非空的 JSON 对象数组")
+    for index, platform in enumerate(platforms_raw, start=1):
+        if not str(platform.get("name", "")).strip():
+            raise ValueError(f"PLATFORMS 第 {index} 项缺少 name")
+        if not str(platform.get("home_url", "")).strip():
+            raise ValueError(f"PLATFORMS 第 {index} 项缺少 home_url")
+
+    markers_raw = _load_json_list_env("GC_PAGE_URL_MARKERS")
+    if not markers_raw or not all(
+        isinstance(marker, str) and marker.strip() for marker in markers_raw
+    ):
+        raise ValueError("GC_PAGE_URL_MARKERS 必须是非空字符串数组")
+
+    target_date_raw = (os.getenv("TARGET_DATE") or "").strip()
+    target_date = (
+        _validate_date(target_date_raw, "TARGET_DATE")
+        if target_date_raw
+        else None
+    )
+    task_url = (os.getenv("TASK_URL") or DEFAULT_TASK_URL).strip()
+    if not task_url:
+        raise ValueError("TASK_URL 不能为空")
+
+    return DailyRuntimeConfig(
+        bite_id=_require_env("BITE_ID"),
+        worker_count=_load_int_env("WORKER_COUNT", 1),
+        max_attempts=_load_int_env("MAX_ATTEMPTS", 1),
+        target_date_offset_days=_load_int_env("TARGET_DATE_OFFSET_DAYS", 0),
+        target_date=target_date,
+        cookie_dir=Path(_require_env("COOKIE_DIR")),
+        task_url=task_url,
+        daily_tasks=daily_tasks_raw,
+        platforms=platforms_raw,
+        gc_page_url_markers=[marker.strip() for marker in markers_raw],
+    )
 
 
 class DailyEngine(BackfillEngine):
@@ -33,10 +166,7 @@ class DailyEngine(BackfillEngine):
         max_attempts: int = 5,
         target_date_offset_days: int = 1,
         cookie_dir: Optional[Path] = None,
-        task_url: str = (
-            "https://datatoolcenter.com/web/dateCenter.html?"
-            "activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
-        ),
+        task_url: str = DEFAULT_TASK_URL,
     ):
         super().__init__(
             bite_id,
@@ -327,40 +457,26 @@ class DailyEngine(BackfillEngine):
 
 
 if __name__ == "__main__":
-    # 当前 backfill 项目的 daily-mode 配置；部署其他客户时只修改本区域。
-    BITE_ID = "4626a1f1fadb4ac4aab182d93469147f"
-    WORKER_COUNT = 4
-    MAX_ATTEMPTS = 5
-    TARGET_DATE_OFFSET_DAYS = 1
-    COOKIE_DIR = Path(r"C:\Users\Administrator\Desktop\COOKIE")
-    GC_PAGE_URL_MARKERS = ["ppzh.jd.com"]
-
-    DAILY_TASKS = [
-        {"card": 2},
-        {"card": 3},
-        {"card": 4},
-        {"card": 5},
-        {"card": 6}
-    ]
-
-    PLATFORMS = [
-        {
-            "name": "京东品牌主页（商智）",
-            "home_url": "https://ppzh.jd.com/brand/homePage/index.html",
-            "login_url_markers": ["login"],
-            "cookie_key": "京东品牌主页",
-            "file_prefix": "jd_cookies",
-            "cookie_enabled": True,
-        },
-    ]
+    try:
+        config = load_daily_runtime_config()
+    except (OSError, ValueError) as error:
+        logger.error(f"daily-mode 运行配置加载失败: {error}")
+        sys.exit(1)
 
     engine = DailyEngine(
-        bite_id=BITE_ID,
-        gc_page_url_markers=GC_PAGE_URL_MARKERS,
-        worker_count=WORKER_COUNT,
-        max_attempts=MAX_ATTEMPTS,
-        target_date_offset_days=TARGET_DATE_OFFSET_DAYS,
-        cookie_dir=COOKIE_DIR,
+        bite_id=config.bite_id,
+        gc_page_url_markers=config.gc_page_url_markers,
+        worker_count=config.worker_count,
+        max_attempts=config.max_attempts,
+        target_date_offset_days=config.target_date_offset_days,
+        cookie_dir=config.cookie_dir,
+        task_url=config.task_url,
     )
-    success = asyncio.run(engine.run_daily(DAILY_TASKS, PLATFORMS))
+    success = asyncio.run(
+        engine.run_daily(
+            config.daily_tasks,
+            config.platforms,
+            target_date=config.target_date,
+        )
+    )
     sys.exit(0 if success else 1)

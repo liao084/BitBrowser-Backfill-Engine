@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""daily-mode 登录预检：加载 pkl Cookie，并保留失败平台的诊断页面。"""
+"""daily-mode 登录态重建预检：统一清理后注入 pkl Cookie，并保留失败诊断页。"""
 
 import logging
 import pickle
@@ -47,7 +47,7 @@ class AuthReport:
 
 
 class CookieAuthManager:
-    """在创建 datatoolcenter Worker 前检查各真实工作平台登录状态。"""
+    """在创建 datatoolcenter Worker 前重建并验证各业务平台的登录态。"""
 
     def __init__(self, bite_id: str, cookie_dir: Path):
         self.bite_id = bite_id
@@ -188,21 +188,33 @@ class CookieAuthManager:
         context: BrowserContext,
         platform: Dict[str, Any],
     ) -> bool:
-        """检查一个平台；成功时关闭预检页，失败时保留页面供人工巡检。"""
+        """为一个平台注入 pkl Cookie 并验证；失败时保留页面供人工巡检。"""
         platform_name = platform["name"]
         home_url = platform["home_url"]
         page = await context.new_page()
         succeeded = False
 
         try:
-            logger.info(f"开始检查 {platform_name} 登录状态: {home_url}")
+            logger.info(f"开始重建 {platform_name} 登录态: {home_url}")
             await self._goto_home(page, home_url)
-            if not self._is_login_page(page.url, platform):
-                logger.info(f"✓ {platform_name} 当前登录状态正常。")
+            initial_url = page.url
+            is_login_page = self._is_login_page(initial_url, platform)
+
+            if not is_login_page and not platform.get("cookie_enabled", True):
+                logger.info(
+                    f"✓ {platform_name} 当前登录状态正常，最终 URL: {initial_url}"
+                )
                 succeeded = True
                 return True
 
-            logger.warning(f"{platform_name} 已进入登录页面: {page.url}")
+            if is_login_page:
+                logger.info(f"{platform_name} 已进入登录页面，准备注入 pkl Cookie: {initial_url}")
+            else:
+                logger.info(
+                    f"{platform_name} 当前未进入登录页，仍将按 pkl Cookie "
+                    f"重建登录态，当前 URL: {initial_url}"
+                )
+
             if not platform.get("cookie_enabled", True):
                 logger.warning(
                     f"{platform_name} 未启用 pkl Cookie 恢复；登录页将保留供人工处理。"
@@ -224,11 +236,14 @@ class CookieAuthManager:
             await self._goto_home(page, home_url)
             if self._is_login_page(page.url, platform):
                 logger.error(
-                    f"{platform_name} 注入 Cookie 后仍处于登录页面，保留页面供人工处理。"
+                    f"{platform_name} 注入 Cookie 后仍处于登录页面，"
+                    f"最终 URL: {page.url}；保留页面供人工处理。"
                 )
                 return False
 
-            logger.info(f"✓ {platform_name} Cookie 恢复并验证成功。")
+            logger.info(
+                f"✓ {platform_name} Cookie 重建并验证成功，最终 URL: {page.url}"
+            )
             succeeded = True
             return True
         except Exception as error:
@@ -248,7 +263,13 @@ class CookieAuthManager:
         context: BrowserContext,
         platforms: Sequence[Dict[str, Any]],
     ) -> AuthReport:
-        """顺序检查平台，避免多个登录页面并发跳转带来额外风控。"""
+        """清空旧登录态后，顺序重建全部平台的 pkl Cookie 登录态。"""
+        # Playwright 的 context.clear_cookies() 会清理整个 BrowserContext。
+        # 因此只能在预检开始时执行一次，后续平台的 Cookie 才能共同保留。
+        logger.info("登录预检开始：清理浏览器上下文全部旧 Cookie。")
+        await context.clear_cookies()
+        logger.info("旧 Cookie 已清理，将按 PLATFORMS 顺序注入并验证各平台 pkl Cookie。")
+
         results: Dict[str, bool] = {}
         for platform in platforms:
             platform_name = platform["name"]

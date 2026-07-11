@@ -297,7 +297,7 @@ class DailyEngine(BackfillEngine):
         failed = "、".join(report.failed_platforms) or "无"
         log_method = logger.info if report.mode == "NORMAL" else logger.warning
         log_method(
-            "登录预检汇总：\n"
+            "登录态重建预检汇总：\n"
             f"  运行状态：{report.mode}\n"
             f"  已登录平台：{succeeded}\n"
             f"  未登录平台：{failed}"
@@ -371,7 +371,7 @@ class DailyEngine(BackfillEngine):
                     return False
                 context = browser.contexts[0]
 
-                # 登录预检早于 GC 挂载；失败平台的诊断页因此可以一直保留。
+                # 登录态重建预检早于 GC 挂载；失败平台的诊断页因此可以一直保留。
                 auth_report = await self.auth_manager.ensure_platforms(
                     context,
                     platforms,
@@ -379,7 +379,7 @@ class DailyEngine(BackfillEngine):
                 self._log_auth_report(auth_report)
                 if not auth_report.any_succeeded:
                     logger.error(
-                        "全部平台登录预检失败，daily-mode 不创建任务池；"
+                        "全部平台登录态重建失败，daily-mode 不创建任务池；"
                         "浏览器和失败登录页将保留供人工处理。"
                     )
                     return False

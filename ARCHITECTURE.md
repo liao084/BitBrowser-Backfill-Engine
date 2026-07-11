@@ -632,3 +632,44 @@ flowchart TD
 17. 停止红色提示监控器，并取消尚未完成的30秒延迟关闭协程；
 18. 如果仍有业务执行页面，等待65秒交给 GC 自然收尾，再兜底关闭残留页面；
 19. 退出 Playwright 连接，程序结束。
+
+## 十八、Daily Mode：登录态重建、动态 Worker 与旁路通知
+
+`daily_engine.py` 复用历史补采的 Worker、弹窗、GC、账本和失败重试能力，但外围生命周期不同：它先关闭并重启指定 Bit 浏览器，再为本次单日任务创建 Worker 页面。
+
+```mermaid
+flowchart TD
+    Start["读取 EXE 同目录 .env"] --> Bit["关闭并启动指定 Bit 浏览器"]
+    Bit --> CDP["Playwright connect_over_cdp"]
+    CDP --> Clear["预检开始时全局清理一次旧 Cookie"]
+    Clear --> Auth["按 PLATFORMS 顺序\n访问主页、注入 pkl、再次访问验证"]
+    Auth --> Result{"至少一个平台重建成功?"}
+    Result -->|"否"| Keep["不创建任务池\n保留失败登录页供人工处理"]
+    Result -->|"是"| Worker["并行创建 min(WORKER_COUNT, 任务数) 个 Worker"]
+    Worker --> Pool["共享单日任务池 + 最多 MAX_ATTEMPTS 轮"]
+    Pool --> Ledger["daily_results.jsonl 覆盖写入本次结果"]
+    Ledger --> Finish["停止守护协程\n保留浏览器和页面现场"]
+```
+
+### 登录态重建预检
+
+日常模式不能假定 Bit 浏览器中已有 Cookie 可靠可用。预检因此不是“当前 URL 没有出现 login 就通过”，而是一次确定性的登录态重建：
+
+1. 对整个 `BrowserContext` 执行一次 `clear_cookies()`；
+2. 对 `.env` 的每个 `PLATFORMS` 项访问 `home_url`，加载该平台 pkl 中 `cookie_key` 对应的 Cookie 并注入；
+3. 再次访问 `home_url`；仍进入 `login_url_markers` 指定的登录页则判定失败；
+4. 成功预检页关闭，失败预检页保留给人工巡检或登录。
+
+`BrowserContext` 的 Cookie 覆盖全部站点，所以清理动作必须只执行一次。若在“注入抖音 Cookie”后又为京东执行全局清理，抖音 Cookie 会被删除，最终抖音业务页仍会失效。
+
+### 单机飞书巡检器
+
+`daily_notify_agent.py` 不接入浏览器，也不读取内存中的任务池。它以文件为边界，递归扫描本机 `dailyfill` 下每个客户目录的 `.env`：
+
+1. `REPORT_READY_TIME` 未到的客户不纳入本次通知；
+2. 用 `DAILY_TASKS`、`TARGET_DATE` 或日期偏移量还原当天应有的 `task_id`；
+3. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量；
+4. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
+5. 将全部客户状态合并为一条飞书文本消息。
+
+这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器读取上一次账本和日志；通知器异常也不会影响采集任务。

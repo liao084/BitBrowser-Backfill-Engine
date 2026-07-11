@@ -10,6 +10,7 @@
 !*.md
 !.gitignore
 !.env.example
+!notify_agent.env.example
 !pyproject.toml
 !uv.lock
 !.python-version

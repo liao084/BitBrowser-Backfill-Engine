@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""RPA 每日任务调度入口：登录预检、固定 Worker、共享任务池和多轮重试。"""
+"""RPA 每日任务调度入口：登录态重建、固定 Worker 和单任务即时重试。"""
 
 import asyncio
 import json
@@ -20,7 +20,13 @@ from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Page, async_playwright
 
 from auth_manager import AuthReport, CookieAuthManager
-from backfill_engine import BackfillEngine, logger, log_path, runtime_dir
+from backfill_engine import (
+    BackfillEngine,
+    TaskPageInitializationError,
+    logger,
+    log_path,
+    runtime_dir,
+)
 from browser_manager import BitBrowserManager
 from task_ledger import TaskLedger
 
@@ -291,6 +297,157 @@ class DailyEngine(BackfillEngine):
         )
         return worker_pages
 
+    async def _daily_worker(
+        self,
+        page: Page,
+        task_queue: asyncio.Queue,
+        ledger: TaskLedger,
+        list_index: int,
+    ) -> bool:
+        """持续消费 daily 队列；失败任务未达上限时立即放回队尾。"""
+        worker_id = f"页面-{list_index + 1}"
+        consecutive_initialization_failures = 0
+        logger.info(
+            f"Worker-{worker_id} 启动 Daily 持续任务池，绑定页面: {page.url[-25:]}"
+        )
+
+        while True:
+            task = await task_queue.get()
+            if task is None:
+                task_queue.task_done()
+                logger.info(f"Worker-{worker_id} Daily 任务池已收敛，停止领取。")
+                return True
+
+            fatal_error = False
+            try:
+                success = await self.execute_task(page, task, list_index)
+                consecutive_initialization_failures = 0
+            except TaskPageInitializationError as error:
+                success = False
+                consecutive_initialization_failures += 1
+                logger.warning(
+                    f"Worker-{worker_id} 连续初始化失败 "
+                    f"{consecutive_initialization_failures}/"
+                    f"{self.max_consecutive_initialization_failures}: {error}"
+                )
+                if (
+                    consecutive_initialization_failures
+                    >= self.max_consecutive_initialization_failures
+                ):
+                    fatal_error = True
+                    logger.error(
+                        f"Worker-{worker_id} 已达到连续初始化失败阈值，"
+                        "触发熔断并停止领取新任务。"
+                    )
+            except Exception as error:
+                success = False
+                fatal_reason = self._fatal_page_error_reason(error)
+                if fatal_reason:
+                    fatal_error = True
+                    logger.error(
+                        f"Worker-{worker_id} 因{fatal_reason}停止领取新任务。"
+                    )
+                else:
+                    logger.error(
+                        f"Worker-{worker_id} 执行任务时发生未分类异常，"
+                        f"当前尝试记为失败: {error}"
+                    )
+
+            try:
+                await ledger.record(task, success)
+                if not success and task["attempt"] < self.max_attempts:
+                    retry_task = {**task, "attempt": task["attempt"] + 1}
+                    task_queue.put_nowait(retry_task)
+                    logger.warning(
+                        f"任务 {task['task_id']} 第 {task['attempt']}/"
+                        f"{self.max_attempts} 次执行失败，已放回共享队列尾部。"
+                    )
+                elif not success:
+                    logger.error(
+                        f"任务 {task['task_id']} 已达到最大执行次数 "
+                        f"{self.max_attempts}，最终记为失败。"
+                    )
+            finally:
+                # 重试任务必须先入队再完成当前项，避免 queue.join() 提前返回。
+                task_queue.task_done()
+
+            if fatal_error:
+                return False
+
+    async def _run_daily_task_pool(
+        self,
+        tasks: List[Dict[str, Any]],
+        worker_pages: List[Page],
+        ledger: TaskLedger,
+    ) -> None:
+        """运行持续任务池，直到每个任务成功或达到各自的尝试上限。"""
+        task_queue: asyncio.Queue = asyncio.Queue()
+        for task in tasks:
+            task_queue.put_nowait(task)
+
+        logger.info(
+            f"Daily 持续任务池开始：{len(tasks)} 个任务，"
+            f"{len(worker_pages)} 个 Worker，每个任务最多 {self.max_attempts} 次。"
+        )
+        worker_tasks = [
+            asyncio.create_task(
+                self._daily_worker(page, task_queue, ledger, index)
+            )
+            for index, page in enumerate(worker_pages)
+        ]
+        join_task = asyncio.create_task(task_queue.join())
+
+        while not join_task.done():
+            active_workers = [task for task in worker_tasks if not task.done()]
+            if not active_workers:
+                unprocessed_count = 0
+                while True:
+                    try:
+                        task = task_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    try:
+                        if task is not None:
+                            await ledger.record(task, False)
+                            unprocessed_count += 1
+                    finally:
+                        task_queue.task_done()
+                if unprocessed_count:
+                    logger.error(
+                        f"所有 Worker 均已熔断，剩余 {unprocessed_count} 个"
+                        "队列任务无法继续执行，已记为失败。"
+                    )
+                break
+
+            await asyncio.wait(
+                [join_task, *active_workers],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+        await join_task
+
+        # 任务全部到达终态后，用哨兵唤醒仍在等待 queue.get() 的健康 Worker。
+        active_workers = [task for task in worker_tasks if not task.done()]
+        for _ in active_workers:
+            task_queue.put_nowait(None)
+        if active_workers:
+            await task_queue.join()
+
+        worker_results = await asyncio.gather(
+            *worker_tasks,
+            return_exceptions=True,
+        )
+        healthy_count = sum(result is True for result in worker_results)
+        for index, result in enumerate(worker_results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    f"Worker-页面-{index + 1} 协程异常退出: {result}"
+                )
+        logger.info(
+            f"Daily 持续任务池结束：{healthy_count}/{len(worker_pages)} 个 Worker "
+            "保持健康。"
+        )
+
     @staticmethod
     def _log_auth_report(report: AuthReport) -> None:
         succeeded = "、".join(report.succeeded_platforms) or "无"
@@ -305,20 +462,20 @@ class DailyEngine(BackfillEngine):
 
     @staticmethod
     def _log_daily_summary(summary: Dict[str, Any], report: AuthReport) -> None:
-        round_lines = [
+        attempt_lines = [
             (
-                f"  第 {round_result['attempt']} 轮："
-                f"总计 {round_result['total']}，"
-                f"成功 {round_result['success']}，"
-                f"失败 {round_result['failed']}"
+                f"  第 {attempt_result['attempt']} 次尝试统计："
+                f"总计 {attempt_result['total']}，"
+                f"成功 {attempt_result['success']}，"
+                f"失败 {attempt_result['failed']}"
             )
-            for round_result in summary.get("rounds", [])
+            for attempt_result in summary.get("attempt_stats", [])
         ]
         logger.info(
             "\nDaily-mode 运行汇总：\n"
             f"  登录状态：{report.mode}\n"
             f"  每日任务总数：{summary['total']}\n"
-            + ("\n".join(round_lines) + "\n" if round_lines else "")
+            + ("\n".join(attempt_lines) + "\n" if attempt_lines else "")
             + f"  最终完成：{summary['final_success']}\n"
             f"  最终失败：{summary['final_failed']}\n"
             "  浏览器处理：保留现场，不自动关闭"
@@ -404,40 +561,12 @@ class DailyEngine(BackfillEngine):
                     for index, page in enumerate(worker_pages)
                 ]
 
-                healthy_pages = worker_pages
-                current_tasks = initial_tasks
                 try:
-                    for attempt in range(1, self.max_attempts + 1):
-                        round_name = (
-                            "首次执行" if attempt == 1 else f"第 {attempt} 轮重试"
-                        )
-                        healthy_pages = await self._run_task_round(
-                            current_tasks,
-                            healthy_pages,
-                            ledger,
-                            round_name,
-                        )
-
-                        if attempt >= self.max_attempts:
-                            break
-
-                        failed_tasks = await ledger.failed_tasks(attempt=attempt)
-                        if not failed_tasks:
-                            logger.info(
-                                f"第 {attempt} 轮后已无失败任务，提前结束重试。"
-                            )
-                            break
-                        if not healthy_pages:
-                            logger.error(
-                                "所有 Worker 均已失效，无法继续执行后续重试轮次。"
-                            )
-                            break
-
-                        logger.warning(
-                            f"第 {attempt} 轮结束后仍有 {len(failed_tasks)} 个失败任务，"
-                            f"准备进入第 {attempt + 1} 轮。"
-                        )
-                        current_tasks = failed_tasks
+                    await self._run_daily_task_pool(
+                        initial_tasks,
+                        worker_pages,
+                        ledger,
+                    )
 
                     summary = await ledger.summary(total_tasks=len(initial_tasks))
                     self._log_daily_summary(summary, auth_report)

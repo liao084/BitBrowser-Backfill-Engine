@@ -123,7 +123,7 @@ flowchart TD
     C --> D["4. _run_task_round<br/>建立共享队列"]
     D --> E["5. worker<br/>循环领取任务与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
-    F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成与卡死判断"]
+    F --> G["7. wait_for_completion_or_heartbeat<br/>理解静默触发与后端终态复检"]
     G --> H["8. _monitor_and_gc_page<br/>理解商智页面旁路 GC"]
     H --> I["9. _monitor_worker_error_toasts<br/>理解红色提示回收"]
     I --> J["10. TaskLedger<br/>理解重试与最终汇总"]
@@ -135,7 +135,7 @@ flowchart TD
 | 调度 | `_run_task_round()` | 如何建立共享队列，如何筛选健康 Worker？ |
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
-| 状态判断 | `wait_for_completion_or_heartbeat()` | 120 秒静默后如何区分完成和卡死？ |
+| 状态判断 | `wait_for_completion_or_heartbeat()` | 120 秒静默后如何恢复页面并用后端缺失量确认终态？ |
 | 页面 GC | `_monitor_and_gc_page()` | 商智页面为什么独立于 Worker，何时关闭？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
 | 持久化 | `TaskLedger` | 首轮失败项如何变成第二轮任务？ |
@@ -304,10 +304,10 @@ flowchart TD
     ClickOK -->|"最终失败"| SubmitFail["清理弹窗并返回 False"]
     ClickOK -->|"成功"| Submitted["task_submitted = True"]
     Submitted --> Heartbeat["进入 120 秒 Worker 心跳监听"]
-    Heartbeat --> Final{"终态判断"}
-    Final -->|"三级弹窗不存在"| Success
-    Final -->|"三级弹窗仍存在"| Stuck["判定卡死<br/>按层级关闭弹窗"]
-    Stuck --> Failed["返回 False"]
+    Heartbeat --> FinalRestore["恢复一级弹窗<br/>重新注入当前日期"]
+    FinalRestore --> FinalDetect["再次点击启动检测<br/>读取后端缺失量"]
+    FinalDetect -->|"无缺失"| Success
+    FinalDetect -->|"仍有缺失或结果不确定"| Failed["返回 False"]
 ```
 
 ### 缺失量判断的业务兜底
@@ -362,7 +362,7 @@ sequenceDiagram
     autonumber
     participant W as datatoolcenter Worker
     participant Toast as 同步成功提示节点
-    participant Dialog as 三级进度弹窗
+    participant Primary as 一级任务弹窗
 
     W->>W: 提交全店补齐
     loop 每一次同步成功事件
@@ -379,19 +379,22 @@ sequenceDiagram
             W->>W: 静默期结束，进入终态检查
         end
     end
-    W->>Dialog: 硬超时查询三级弹窗是否可见
-    alt 三级弹窗不存在
-        W-->>W: 判定正常完成，返回 True
-    else 三级弹窗仍存在
-        W->>Dialog: 精确关闭三级，再关闭二级
-        W-->>W: 判定任务卡死，返回 False
+    W->>Primary: 恢复一级状态并重新注入当前日期
+    W->>Primary: 点击启动检测，重新请求后端缺失量
+    alt 返回可信的无缺失结果
+        W-->>W: 后端复检通过，返回 True
+    else 仍有缺失或结果不确定
+        W-->>W: 后端复检未通过，返回 False
     end
 ```
 
-120 秒静默本身不等于成功。它只表示“已经没有新心跳”，最终必须结合三级弹窗：
+120 秒静默本身不等于成功，也不再用三级弹窗存在性作为成功证据。三级、二级弹窗只在 `_restore_primary_state()` 中负责清理页面层级；最终结果来自重新点击“启动检测”后的后端缺失量：
 
-- 三级弹窗消失：正常采集完成；
-- 三级弹窗仍存在：数仓任务卡死。
+- 统计文本不含数字，按现有页面协议表示无缺失：任务成功；
+- 缺失数量大于 0：任务失败并进入对应模式的重试流程；
+- 连续 3 次得到 0、负数或读取异常：结果不确定，保守记为失败。
+
+复检点击前会保存旧结果容器的具体 `ElementHandle`，点击后先等待该旧节点隐藏或销毁，再等待新的结果容器出现。这避免了旧容器仍为 `visible` 时立即读到补齐前缺失量，保证终态证据来自本次后端请求。
 
 ## 十一、Context 级业务执行页面 GC
 
@@ -593,7 +596,7 @@ flowchart TD
 
 ### 8. Worker 心跳模块
 
-`wait_for_completion_or_heartbeat()` 在数仓 Worker 页监听“同步成功”节点。120 秒没有新心跳后，脚本检查三级弹窗：三级弹窗消失表示正常完成，仍存在表示卡死并需要清理。
+`wait_for_completion_or_heartbeat()` 在数仓 Worker 页监听“同步成功”节点。120 秒没有新心跳后，脚本恢复一级弹窗、重新注入当前日期并再次点击启动检测；只有后端复检确认无缺失时才返回成功。
 
 ### 9. 业务执行页面 GC 模块
 
@@ -622,7 +625,7 @@ flowchart TD
 7. 把首轮任务全部放入共享任务池，由多个 Worker 动态领取；
 8. 每个 Worker 清理遗留弹窗，打开任务卡片并注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
-10. 提交后监听 120 秒心跳，并结合三级弹窗区分正常完成和卡死；
+10. 提交后监听 120 秒心跳；静默后恢复一级弹窗并重新请求后端缺失量，只有复检无缺失才成功；
 11. 业务执行页 GC 独立使用 180 秒心跳回收没有正常关闭的页面；
 12. 每个任务结束后立即把本次尝试结果追加到 JSONL；
 13. Worker 发生普通任务失败时继续领取，发生致命页面异常时退出任务池；
@@ -646,7 +649,7 @@ flowchart TD
     Auth --> Result{"至少一个平台重建成功?"}
     Result -->|"否"| Keep["不创建任务池\n保留失败登录页供人工处理"]
     Result -->|"是"| Worker["并行创建 min(WORKER_COUNT, 任务数) 个 Worker"]
-    Worker --> Pool["共享单日任务池 + 最多 MAX_ATTEMPTS 轮"]
+    Worker --> Pool["持续共享任务池\n失败任务立即回队"]
     Pool --> Ledger["daily_results.jsonl 覆盖写入本次结果"]
     Ledger --> Finish["停止守护协程\n保留浏览器和页面现场"]
 ```
@@ -673,3 +676,29 @@ flowchart TD
 5. 将全部客户状态合并为一条飞书文本消息。
 
 这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器读取上一次账本和日志；通知器异常也不会影响采集任务。
+
+### Daily 专属即时重试
+
+历史补采保留“首轮全部完成后，从账本重建失败项并统一重试”的轮次模型。Daily 的任务只有少量卡片，若继续等待整轮结束，会让提前完成或失败的 Worker 长时间空闲，因此使用独立的持续任务池：
+
+1. Worker 使用 `await queue.get()` 持续等待任务，不因队列暂时为空立即退出；
+2. 每次尝试都先把结果追加到 `daily_results.jsonl`；
+3. 失败且未达到 `MAX_ATTEMPTS` 时，将任务的 `attempt` 加一并立即放回队尾；
+4. 成功或达到最大次数后不再回队；
+5. `queue.join()` 只会在所有任务到达终态后返回，调度器随后用哨兵统一停止健康 Worker；
+6. 页面无响应、崩溃或断连仍会使当前 Worker 熔断，但其失败任务可以由其他健康 Worker 继续领取。
+
+该分叉只存在于 `DailyEngine`。`BackfillEngine` 的历史区块调度和唯一一次总体重试保持不变。
+
+### 统一的业务 UI 超时
+
+Backfill 与 Daily 共用的任务卡片弹窗、检测按钮、缺失数量节点、补齐按钮等普通业务元素，其等待和点击统一放宽到 30 秒，用于承受多脚本并存时的短暂资源竞争。代码不再维护模式专属的 timeout 覆盖字段。
+
+以下时间没有被统一放宽，因为它们承担不同语义：
+
+- 一级弹窗恢复后的 5 秒 `trial=True` 可操作性检查；
+- `page.goto()` 与 datatoolcenter 自动登录后的稳定等待；
+- 10 秒页面健康探针；
+- 120 秒 Worker 心跳静默判断；
+- 180 秒业务执行页 GC 静默判断；
+- 红色提示和弹窗关闭器的旁路回收超时。

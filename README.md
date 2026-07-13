@@ -5,7 +5,7 @@
 | 模式 | 入口 | 用途 |
 | --- | --- | --- |
 | 历史补采 | `backfill_engine.py` | 将日期范围切分为区块，由多个既有 Worker 通过共享任务池补采历史数据。 |
-| 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按 pkl Cookie 重建业务平台登录态、创建 Worker，并对单日任务进行多轮重试。 |
+| 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按 pkl Cookie 重建业务平台登录态、创建 Worker，并让失败的单日任务立即回队重试。 |
 
 `daily_notify_agent.py` 是日常采集的旁路巡检器：它读取各客户目录中的 `.env`、`daily_results.jsonl` 和 `daily_run.log`，定时发送一条本机汇总飞书消息，不参与任何浏览器操作。
 

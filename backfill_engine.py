@@ -618,7 +618,10 @@ class BackfillEngine:
         )
 
         primary_drawer = self._primary_drawer(page)
-        await primary_drawer.wait_for(state="visible", timeout=10000)
+        await primary_drawer.wait_for(
+            state="visible",
+            timeout=30000,
+        )
         # trial 只做完整可点击性检查，不触发实际检测。
         try:
             await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
@@ -672,16 +675,95 @@ class BackfillEngine:
             logger.error(f"Worker-{worker_id} 日期注入失败: {e}")
             raise
 
-    async def wait_for_completion_or_heartbeat(self, page: Page, worker_id: str) -> bool:
+    async def _detect_missing_data(
+        self,
+        page: Page,
+        primary_drawer: Locator,
+        worker_id: str,
+        start_date: str,
+        end_date: str,
+        phase: str,
+    ) -> Optional[bool]:
+        """重新请求后端检测缺失量；True=有缺失，False=无缺失，None=结果不确定。"""
+        start_btn = primary_drawer.locator("#checkbutn")
+        result_list = primary_drawer.locator(".testContent_list")
+        missing_span = primary_drawer.locator(
+            "div.testContent > div:nth-child(2) > span:nth-child(1)"
+        )
+
+        for detection_attempt in range(1, 4):
+            try:
+                logger.info(
+                    f"Worker-{worker_id} {phase}第 {detection_attempt}/3 次请求后端检测："
+                    f"{start_date} 至 {end_date}。"
+                )
+                await start_btn.click(timeout=30000)
+
+                try:
+                    await result_list.wait_for(state="visible", timeout=45000)
+                except PlaywrightTimeoutError:
+                    logger.warning(
+                        f"Worker-{worker_id} {phase}等待查询结果容器超时，"
+                        "继续读取缺失统计。"
+                    )
+
+                # 检测结果区可见后，给顶部缺失统计文本一个短暂渲染缓冲。
+                await page.wait_for_timeout(1000)
+                await missing_span.wait_for(state="attached", timeout=30000)
+                missing_text = await missing_span.inner_text()
+            except Exception as error:
+                if self._fatal_page_error_reason(error):
+                    raise
+                logger.warning(
+                    f"Worker-{worker_id} {phase}第 {detection_attempt}/3 次检测异常: "
+                    f"{error}"
+                )
+                continue
+
+            match = re.search(r"-?\d+", missing_text)
+            if not match:
+                logger.info(
+                    f"Worker-{worker_id} {phase}统计文本 [{missing_text}] 不含数字，"
+                    "确认当前日期无缺失数据。"
+                )
+                return False
+
+            missing_count = int(match.group())
+            if missing_count > 0:
+                log_method = logger.warning if phase == "终态复检" else logger.info
+                log_method(
+                    f"Worker-{worker_id} {phase}统计文本 [{missing_text}]，"
+                    f"确认仍有 {missing_count} 条缺失数据。"
+                )
+                return True
+
+            logger.warning(
+                f"Worker-{worker_id} {phase}统计文本 [{missing_text}] 显示 0 或负数，"
+                "视为前端渲染异常并重新检测。"
+            )
+
+        logger.error(
+            f"Worker-{worker_id} {phase}连续 3 次仍无法获得可信缺失量。"
+        )
+        return None
+
+    async def wait_for_completion_or_heartbeat(
+        self,
+        page: Page,
+        worker_id: str,
+        start_date: str,
+        end_date: str,
+    ) -> bool:
         """
-        基于心跳静默的完工判定机制与弹窗清理。
-        如果在指定的静默期内没有再出现新的心跳弹窗，则认为能够补采的数据已经全部下发完毕（或已卡死）。
-        结束后关闭多余残留弹窗。
+        心跳静默只触发终态复检；最终以重新请求后端得到的缺失量判定成功。
         """
         toast_selector = ".el-message__content:has-text('同步成功')"
         silent_timeout_ms = self.silent_timeout_seconds * 1000 
         
-        logger.info(f"Worker-{worker_id} 开始静默监听（超过 {self.silent_timeout_seconds} 秒无心跳则判定完工/卡死）...")
+        logger.info(
+            f"Worker-{worker_id} 开始静默监听（超过 "
+            f"{self.silent_timeout_seconds} 秒无心跳则进入后端终态复检）..."
+        )
         
         while True:
             try:
@@ -692,7 +774,10 @@ class BackfillEngine:
                     timeout=silent_timeout_ms,
                 )
             except PlaywrightTimeoutError:
-                logger.info(f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} 秒无新心跳，判定当前区间补采结束或卡死。")
+                logger.info(
+                    f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} 秒无新心跳，"
+                    "开始终态复检。"
+                )
                 break
             except Exception as e:
                 logger.error(f"Worker-{worker_id} 监听过程中发生未知异常: {e}")
@@ -719,20 +804,35 @@ class BackfillEngine:
                     # 页面关闭或崩溃时，释放句柄本身也可能失败，不覆盖原始异常。
                     pass
                 
-        # 心跳停止后，通过精确绑定的三级弹窗判定是否卡死。
-        logger.info(f"Worker-{worker_id} 心跳停止，开始探测卡死状态...")
-        progress_dialog = self._progress_dialog(page)
+        logger.info(
+            f"Worker-{worker_id} 心跳停止，恢复一级弹窗并重新请求后端确认缺失量。"
+        )
+        await self._restore_primary_state(page, worker_id)
+        await self.inject_dates(page, start_date, end_date, worker_id)
+        terminal_missing = await self._detect_missing_data(
+            page,
+            self._primary_drawer(page),
+            worker_id,
+            start_date,
+            end_date,
+            "终态复检",
+        )
 
-        if await self._locator_is_visible(
-            progress_dialog, worker_id, "三级进度弹窗"
-        ):
-            logger.warning(f"Worker-{worker_id} 检测到三级弹窗依然存在，判定为卡死，准备按层级清理...")
-            await self._restore_primary_state(page, worker_id)
-            logger.info(f"Worker-{worker_id} 卡死弹窗清理完毕，退回主页面。")
-            return False
-        else:
-            logger.info(f"Worker-{worker_id} 未检测到三级弹窗，正常采集完成。")
+        if terminal_missing is False:
+            logger.info(
+                f"Worker-{worker_id} 终态复检确认无缺失数据，当前任务成功。"
+            )
             return True
+        if terminal_missing is True:
+            logger.warning(
+                f"Worker-{worker_id} 终态复检仍有缺失数据，当前任务失败。"
+            )
+            return False
+
+        logger.warning(
+            f"Worker-{worker_id} 终态复检结果不确定，不写入成功结果。"
+        )
+        return False
 
     def build_tasks(self, tasks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把配置中的日期范围拆成共享任务池使用的唯一任务。"""
@@ -794,7 +894,10 @@ class BackfillEngine:
             
             # 等待包含启动按钮的一级弹窗真正展开。
             primary_drawer = self._primary_drawer(page)
-            await primary_drawer.wait_for(state="visible", timeout=15000)
+            await primary_drawer.wait_for(
+                state="visible",
+                timeout=30000,
+            )
             await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
             logger.info(f"Worker-{worker_id} 初始化完成，已成功进入补采专属弹窗！")
             
@@ -822,81 +925,35 @@ class BackfillEngine:
 
                 # 1. 注入时间
                 await self.inject_dates(page, start_date, end_date, worker_id)
-                
 
+                # 2. 请求后端检测缺失量；不确定时仍进入补齐流程兜底。
+                detection_result = await self._detect_missing_data(
+                    page,
+                    primary_drawer,
+                    worker_id,
+                    start_date,
+                    end_date,
+                    "首次检测",
+                )
 
-                # 2. 启动检测
-                start_btn = primary_drawer.locator("#checkbutn")
-                # 保留 Playwright 的遮挡检查；被二级弹窗覆盖时不再强制点击底层按钮。
-                await start_btn.click(timeout=10000)
-                
-                # --- 等待查询结果容器渲染 ---
-                # 给系统一点时间销毁旧容器（如果存在）
-                await page.wait_for_timeout(500)
-                
-                logger.info(f"Worker-{worker_id} 等待查询结果容器渲染 (最多45秒)...")
-                result_list = primary_drawer.locator('.testContent_list')
-                try:
-                    await result_list.wait_for(state='visible', timeout=45000)
-                    logger.info(f"Worker-{worker_id} 查询结果已渲染完成！")
-                except PlaywrightTimeoutError:
-                    logger.warning(f"Worker-{worker_id} 等待查询结果超时(45s)，仍继续尝试下一步。")
-                
-                # 缓冲 1000ms 让顶部的统计状态栏渲染完全
-                await page.wait_for_timeout(1000)
-                
-                # --- 防抖读取统计文本判定缺失状态 ---
-                is_missing_data = True # 默认兜底为存在缺失数据
-                try:
-                    for retry_idx in range(3):
-                        missing_span = primary_drawer.locator('div.testContent > div:nth-child(2) > span:nth-child(1)')
-                        await missing_span.wait_for(state='attached', timeout=10000)
-                        missing_text = await missing_span.inner_text()
-                        
-                        # 兼容负数情况，支持提取前置的负号
-                        match = re.search(r'-?\d+', missing_text)
-                        
-                        if not match:
-                            # 彻底没有提取到数字，说明真的是无缺失数据（纯文本 "[ 有条 缺失数据 ]"）
-                            logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，未检测到数字标识 [{missing_text}]，确认为无缺失数据，跳过！")
-                            is_missing_data = False
-                            break
-                        
-                        missing_count = int(match.group())
-                        if missing_count > 0:
-                            logger.info(f"Worker-{worker_id} 当前区间: {start_date} 至 {end_date}，识别到统计文本 [{missing_text}]，确认缺失 {missing_count} 条数据。")
-                            is_missing_data = True
-                            break
-                        else:
-                            # 提取到了 0 或 负数，前端渲染假象 Bug
-                            if retry_idx < 2:
-                                logger.warning(f"Worker-{worker_id} 提取到异常缺失量 0 或 负数 (前端渲染假象)，第 {retry_idx+1} 次重新点击【启动检测】...")
-                                await start_btn.click(timeout=10000)
-                                
-                                # 重新点击启动检测后，等待数据容器重新渲染
-                                await page.wait_for_timeout(500) # 缓冲系统销毁旧 DOM 的时间
-                                try:
-                                    await result_list.wait_for(state='visible', timeout=45000)
-                                    logger.info(f"Worker-{worker_id} 第 {retry_idx+1} 次重试：检测容器已重新渲染成功！")
-                                except PlaywrightTimeoutError:
-                                    pass
-                                await page.wait_for_timeout(500) # 缓冲统计状态栏渲染完全
-                            else:
-                                logger.warning(f"Worker-{worker_id} 重试 3 次后统计文本仍显示 0 或 负数，放弃重试，强制触发补齐流程兜底！")
-                                is_missing_data = True
-                except Exception as e:
-                    if self._fatal_page_error_reason(e):
-                        raise
-                    logger.warning(f"Worker-{worker_id} 读取统计文本发生异常: {e}，将强制走补齐流程防错...")
-
-                if not is_missing_data:
+                if detection_result is False:
                     continue
+                if detection_result is None:
+                    logger.warning(
+                        f"Worker-{worker_id} 首次检测结果不确定，"
+                        "将进入补齐流程兜底。"
+                    )
 
                 # --- 既然有缺失数据（或探测异常兜底），则走后续补齐流程 ---
                 logger.info(f"Worker-{worker_id} 准备点击一级补齐数据按钮...")
                 backfill_btn = primary_drawer.locator("span.lostDataBtn")
-                await backfill_btn.wait_for(state="visible", timeout=5000)
-                await backfill_btn.click(timeout=10000)
+                await backfill_btn.wait_for(
+                    state="visible",
+                    timeout=30000,
+                )
+                await backfill_btn.click(
+                    timeout=30000
+                )
                 
                 # --- 二级弹窗处理与全店补齐 ---
                 secondary_drawer = self._secondary_drawer(page)
@@ -913,9 +970,14 @@ class BackfillEngine:
                     for click_retry in range(3):
                         try:
                             # 按钮只从已确认的二级容器内定位。
-                            await whole_store_btn.wait_for(state="visible", timeout=5000)
+                            await whole_store_btn.wait_for(
+                                state="visible",
+                                timeout=30000,
+                            )
                             # 依赖 Playwright 原生拦截检测机制，若有遮挡则主动抛出异常进入恢复流
-                            await whole_store_btn.click(timeout=10000)
+                            await whole_store_btn.click(
+                                timeout=30000
+                            )
                             logger.info(f"Worker-{worker_id} 点击【全店补齐】指令发送成功！")
                             click_success = True
                             break
@@ -930,10 +992,15 @@ class BackfillEngine:
                                 
                                 # 2. 重新点击一级弹窗的补齐按钮
                                 logger.info(f"Worker-{worker_id} 重新点击一级补齐数据按钮...")
-                                await backfill_btn.click(timeout=10000)
+                                await backfill_btn.click(
+                                    timeout=30000
+                                )
                                 
                                 # 3. 等待二级弹窗重新渲染
-                                await secondary_drawer.wait_for(state="visible", timeout=15000)
+                                await secondary_drawer.wait_for(
+                                    state="visible",
+                                    timeout=30000,
+                                )
                         
                 except PlaywrightTimeoutError:
                     logger.error(f"Worker-{worker_id} 二级弹窗打开、按钮点击或恢复流程发生超时。")
@@ -955,12 +1022,20 @@ class BackfillEngine:
 
                 task_submitted = True
                 
-                # 4. 开始完工判定（交由 GC 守护进程管理蓝页，此处只需判定本页弹窗状态）
-                completed_normally = await self.wait_for_completion_or_heartbeat(page, worker_id)
+                # 4. 心跳静默后重新请求后端检测，以真实缺失量决定账本结果。
+                completed_normally = await self.wait_for_completion_or_heartbeat(
+                    page,
+                    worker_id,
+                    start_date,
+                    end_date,
+                )
                 if completed_normally:
                     logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")
                 else:
-                    logger.warning(f"Worker-{worker_id} 当前区间判定为卡死并已清理: {start_date} 至 {end_date}")
+                    logger.warning(
+                        f"Worker-{worker_id} 当前区间终态复检未通过: "
+                        f"{start_date} 至 {end_date}"
+                    )
                 return completed_normally
                 
             except Exception as e:

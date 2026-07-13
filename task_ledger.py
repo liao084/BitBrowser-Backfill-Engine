@@ -85,7 +85,7 @@ class TaskLedger:
         ]
 
     async def summary(self, total_tasks: int) -> Dict[str, Any]:
-        """按 task_id 的最新尝试结果生成逐轮及最终统计。"""
+        """按 task_id 的最新尝试结果生成逐次尝试及最终统计。"""
         records = await self.load()
         first_results: Dict[str, Dict[str, Any]] = {}
         retry_results: Dict[str, Dict[str, Any]] = {}
@@ -115,14 +115,14 @@ class TaskLedger:
         final_success = sum(
             record.get("success") is True for record in latest_results.values()
         )
-        rounds = []
+        attempt_stats = []
         for attempt in sorted(results_by_attempt):
             attempt_results = results_by_attempt[attempt]
             success_count = sum(
                 record.get("success") is True
                 for record in attempt_results.values()
             )
-            rounds.append(
+            attempt_stats.append(
                 {
                     "attempt": attempt,
                     "total": len(attempt_results),
@@ -140,6 +140,6 @@ class TaskLedger:
             "retry_failed": len(retry_results) - retry_success,
             "final_success": final_success,
             "final_failed": total_tasks - final_success,
-            "rounds": rounds,
-            "attempts_run": len(rounds),
+            "attempt_stats": attempt_stats,
+            "attempts_run": len(attempt_stats),
         }

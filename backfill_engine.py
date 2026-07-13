@@ -39,6 +39,10 @@ class WorkerUnresponsiveError(RuntimeError):
 class TaskPageInitializationError(RuntimeError):
     """单次任务页面初始化失败；连续发生时触发Worker熔断。"""
 
+
+class MissingDataRenderError(RuntimeError):
+    """后端检测已触发，但顶部缺失统计文本始终未完成渲染。"""
+
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("BackfillEngine")
@@ -709,8 +713,26 @@ class BackfillEngine:
 
                 # 检测结果区可见后，给顶部缺失统计文本一个短暂渲染缓冲。
                 await page.wait_for_timeout(1000)
-                await missing_span.wait_for(state="attached", timeout=30000)
-                missing_text = await missing_span.inner_text()
+                for read_attempt, retry_delay_ms in enumerate(
+                    (0, 2000, 4000), start=1
+                ):
+                    if retry_delay_ms:
+                        logger.warning(
+                            f"Worker-{worker_id} {phase}统计文本仍为渲染占位符，"
+                            f"等待 {retry_delay_ms // 1000} 秒后进行第 {read_attempt}/3 次读取。"
+                        )
+                        await page.wait_for_timeout(retry_delay_ms)
+
+                    await missing_span.wait_for(state="attached", timeout=30000)
+                    missing_text = (await missing_span.inner_text()).strip()
+                    if missing_text != "：表示缺失数据":
+                        break
+                else:
+                    raise MissingDataRenderError(
+                        f"Worker-{worker_id} {phase}连续 3 次读取均为统计文本渲染占位符。"
+                    )
+            except MissingDataRenderError:
+                raise
             except Exception as error:
                 if self._fatal_page_error_reason(error):
                     raise

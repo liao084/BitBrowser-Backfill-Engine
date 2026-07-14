@@ -499,10 +499,10 @@ class BackfillEngine:
 
             try:
                 # 只等待当前节点隐藏或移除；后续成功提示不会替换本次等待目标。
-                await toast_handle.wait_for_element_state("hidden", timeout=15000)
+                await toast_handle.wait_for_element_state("hidden", timeout=30000)
             except PlaywrightTimeoutError:
                 if not page.is_closed():
-                    logger.warning(f"[GC Daemon] 业务执行网页 {url_suffix} 当前心跳弹窗节点超过 15 秒仍未隐藏，判定页面状态异常，执行强制关闭。")
+                    logger.warning(f"[GC Daemon] 业务执行网页 {url_suffix} 当前心跳弹窗节点超过 30 秒仍未隐藏，判定页面状态异常，执行强制关闭。")
                     try:
                         await page.close()
                     except Exception as e:
@@ -812,9 +812,9 @@ class BackfillEngine:
             try:
                 # ElementHandle 固定指向当前节点；其他成功提示即使同时出现，也不会影响本次等待。
                 # hidden 同时兼容节点隐藏和从 DOM 中移除。
-                await toast_handle.wait_for_element_state("hidden", timeout=15000)
+                await toast_handle.wait_for_element_state("hidden", timeout=30000)
             except PlaywrightTimeoutError:
-                logger.warning(f"Worker-{worker_id} 当前心跳弹窗节点超过 15 秒仍未隐藏，停止心跳监听并进入终态检查。")
+                logger.warning(f"Worker-{worker_id} 当前心跳弹窗节点超过 30 秒仍未隐藏，停止心跳监听并进入终态检查。")
                 break
             except Exception as e:
                 logger.error(f"Worker-{worker_id} 等待心跳弹窗消失时发生异常: {e}")

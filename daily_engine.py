@@ -51,6 +51,7 @@ class DailyRuntimeConfig:
     daily_tasks: List[Dict[str, Any]]
     platforms: List[Dict[str, Any]]
     gc_page_url_markers: List[str]
+    keep_browser_after_run: bool
 
 
 def _require_env(name: str) -> str:
@@ -80,6 +81,20 @@ def _load_int_env(name: str, minimum: int) -> int:
     if value < minimum:
         raise ValueError(f".env 中的 {name} 不能小于 {minimum}")
     return value
+
+
+def _load_bool_env(name: str, default: bool) -> bool:
+    """读取简单布尔配置，避免拼写错误被静默当成 false。"""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f".env 中的 {name} 必须是 true 或 false")
 
 
 def _validate_date(value: str, name: str) -> str:
@@ -158,6 +173,7 @@ def load_daily_runtime_config(
         daily_tasks=daily_tasks_raw,
         platforms=platforms_raw,
         gc_page_url_markers=[marker.strip() for marker in markers_raw],
+        keep_browser_after_run=_load_bool_env("KEEP_BROWSER_AFTER_RUN", True),
     )
 
 
@@ -173,6 +189,7 @@ class DailyEngine(BackfillEngine):
         target_date_offset_days: int = 1,
         cookie_dir: Optional[Path] = None,
         task_url: str = DEFAULT_TASK_URL,
+        keep_browser_after_run: bool = True,
     ):
         super().__init__(
             bite_id,
@@ -190,6 +207,7 @@ class DailyEngine(BackfillEngine):
         self.target_date_offset_days = target_date_offset_days
         self.cookie_dir = Path(cookie_dir) if cookie_dir else runtime_dir / "COOKIE"
         self.task_url = task_url
+        self.keep_browser_after_run = keep_browser_after_run
         self.browser_manager = BitBrowserManager(bite_id, self.bt_url)
         self.auth_manager = CookieAuthManager(bite_id, self.cookie_dir)
 
@@ -501,18 +519,10 @@ class DailyEngine(BackfillEngine):
             return False
 
         ledger = TaskLedger(runtime_dir / "daily_results.jsonl")
-        try:
-            await ledger.reset()
-        except Exception as error:
-            logger.error(f"无法创建或覆盖 daily 任务账本: {error}")
-            return False
-
-        logger.info(
-            f"Daily 任务账本已重置: {ledger.path}；"
-            f"日志继续追加到: {log_path}"
+        await self.browser_manager.close_browser(
+            settle_seconds=2.0,
+            reason="正在关闭可能遗留的比特浏览器",
         )
-
-        await self.browser_manager.close_before_start()
         cdp_address = await self.browser_manager.open_browser()
         if not cdp_address:
             return False
@@ -551,6 +561,20 @@ class DailyEngine(BackfillEngine):
                     logger.error("没有成功创建任何 Worker 页面，daily-mode 停止。")
                     return False
 
+                # 只有登录预检和 Worker 稳定性检查通过后，才正式开启本轮账本。
+                # 这样重复启动关闭旧浏览器时，旧进程写入的失败结果会先完成，
+                # 再由真正具备执行条件的新进程统一清空。
+                try:
+                    await ledger.reset()
+                except Exception as error:
+                    logger.error(f"无法创建或覆盖 daily 任务账本: {error}")
+                    return False
+
+                logger.info(
+                    f"Worker 已稳定，本轮 Daily 任务账本已重置: {ledger.path}；"
+                    f"日志继续追加到: {log_path}"
+                )
+
                 error_toast_monitors = [
                     asyncio.create_task(
                         self._monitor_worker_error_toasts(
@@ -577,10 +601,20 @@ class DailyEngine(BackfillEngine):
             logger.exception(f"daily-mode 主流程发生异常: {error}")
             return False
         finally:
-            logger.info(
-                "daily-mode 已结束；按照当前策略保留比特浏览器和页面现场，"
-                "不会执行结束关闭。"
-            )
+            if run_succeeded and not self.keep_browser_after_run:
+                await self.browser_manager.close_browser(
+                    reason="Daily 全部任务成功，正在按配置关闭比特浏览器",
+                )
+            elif run_succeeded:
+                logger.info(
+                    "Daily 全部任务成功；KEEP_BROWSER_AFTER_RUN=true，"
+                    "保留比特浏览器和页面现场。"
+                )
+            else:
+                logger.info(
+                    "daily-mode 未全部成功或未进入有效任务阶段，"
+                    "保留比特浏览器和页面现场供人工检查。"
+                )
 
         return run_succeeded
 
@@ -600,6 +634,7 @@ if __name__ == "__main__":
         target_date_offset_days=config.target_date_offset_days,
         cookie_dir=config.cookie_dir,
         task_url=config.task_url,
+        keep_browser_after_run=config.keep_browser_after_run,
     )
     success = asyncio.run(
         engine.run_daily(

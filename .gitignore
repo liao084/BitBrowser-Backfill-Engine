@@ -8,6 +8,7 @@
 # 2. 将需要在多端（公司/家里）同步的源码、文档和依赖配置加入白名单
 !*.py
 !*.md
+!*.bat
 !.gitignore
 !.env.example
 !notify_agent.env.example

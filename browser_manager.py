@@ -31,22 +31,27 @@ class BitBrowserManager:
         response.raise_for_status()
         return response.json()
 
-    async def close_before_start(self, settle_seconds: float = 2.0) -> None:
-        """尽力关闭旧实例；关闭失败不阻止后续 open 接口自行判断。"""
-        logger.info(f"正在关闭可能遗留的比特浏览器 (ID: {self.bite_id})...")
+    async def close_browser(
+        self,
+        settle_seconds: float = 0.0,
+        reason: str = "关闭比特浏览器",
+    ) -> None:
+        """尽力关闭当前实例；关闭失败由调用方根据业务阶段决定后续流程。"""
+        logger.info(f"{reason} (ID: {self.bite_id})...")
         try:
             result = await asyncio.to_thread(self._post, "/browser/close")
             if result.get("success"):
-                logger.info("✓ 旧比特浏览器已关闭。")
+                logger.info("✓ 比特浏览器已关闭。")
             else:
                 logger.warning(
-                    "比特浏览器关闭接口未返回成功，仍将继续尝试启动: "
+                    "比特浏览器关闭接口未返回成功: "
                     f"{result.get('msg', result)}"
                 )
         except Exception as error:
-            logger.warning(f"关闭旧比特浏览器时发生异常，仍将继续尝试启动: {error}")
+            logger.warning(f"关闭比特浏览器时发生异常: {error}")
 
-        await asyncio.sleep(settle_seconds)
+        if settle_seconds > 0:
+            await asyncio.sleep(settle_seconds)
 
     async def open_browser(
         self,

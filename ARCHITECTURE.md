@@ -1,6 +1,6 @@
 # BitBrowser Backfill Engine 架构与执行流程
 
-本文档基于 2026-07-05 工作区中的 `backfill_engine.py` 与 `task_ledger.py`，用于：
+本文档已按 2026-07-16 的 `backfill_engine.py` 与 `task_ledger.py` 校正，用于：
 
 - 按调用顺序通读代码；
 - 在遗忘实现细节后快速恢复对脚本的理解；
@@ -123,7 +123,7 @@ flowchart TD
     C --> D["4. _run_task_round<br/>建立共享队列"]
     D --> E["5. worker<br/>循环领取任务与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
-    F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成与卡死判断"]
+    F --> G["7. wait_for_completion_or_heartbeat<br/>理解静默触发与后端终态复检"]
     G --> H["8. _monitor_and_gc_page<br/>理解商智页面旁路 GC"]
     H --> I["9. _monitor_worker_error_toasts<br/>理解红色提示回收"]
     I --> J["10. TaskLedger<br/>理解重试与最终汇总"]
@@ -135,7 +135,7 @@ flowchart TD
 | 调度 | `_run_task_round()` | 如何建立共享队列，如何筛选健康 Worker？ |
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
-| 状态判断 | `wait_for_completion_or_heartbeat()` | 120 秒静默后如何区分完成和卡死？ |
+| 状态判断 | `wait_for_completion_or_heartbeat()` | 120 秒静默后如何恢复页面并用后端缺失量确认终态？ |
 | 页面 GC | `_monitor_and_gc_page()` | 商智页面为什么独立于 Worker，何时关闭？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
 | 持久化 | `TaskLedger` | 首轮失败项如何变成第二轮任务？ |
@@ -285,15 +285,16 @@ flowchart TD
     InitOK -->|"是"| Restore["恢复一级弹窗状态"]
     Restore --> Dates["填入开始和结束日期<br/>每次按 Enter 触发 Vue 绑定"]
     Dates --> Detect["点击启动检测"]
-    Detect --> Result["等待结果列表最多 45 秒"]
-    Result --> Read["最多 3 次读取缺失数量"]
+    Detect --> Result["等待结果项标题渲染最多 45 秒"]
+    Result --> Buffer["等待 1 秒统计文本渲染"]
+    Buffer --> Read["遇到固定占位文本时<br/>按 0/2/4 秒最多读取 3 次"]
     Read --> Missing{"解析结果"}
     Missing -->|"无数字"| NoMissing["判定无缺失数据"]
     Missing -->|"> 0"| NeedFill["确认存在缺失数据"]
     Missing -->|"0 或负数"| RetryDetect{"检测重试少于 3 次?"}
     RetryDetect -->|"是"| Detect
     RetryDetect -->|"否"| NeedFill
-    Missing -->|"读取异常"| NeedFill
+    Missing -->|"连续检测异常"| NeedFill
     NoMissing --> Success["返回 True"]
     NeedFill --> Backfill["点击一级补齐数据"]
     Backfill --> Secondary["等待二级 Drawer"]
@@ -304,10 +305,10 @@ flowchart TD
     ClickOK -->|"最终失败"| SubmitFail["清理弹窗并返回 False"]
     ClickOK -->|"成功"| Submitted["task_submitted = True"]
     Submitted --> Heartbeat["进入 120 秒 Worker 心跳监听"]
-    Heartbeat --> Final{"终态判断"}
-    Final -->|"三级弹窗不存在"| Success
-    Final -->|"三级弹窗仍存在"| Stuck["判定卡死<br/>按层级关闭弹窗"]
-    Stuck --> Failed["返回 False"]
+    Heartbeat --> FinalRestore["恢复一级弹窗<br/>重新注入当前日期"]
+    FinalRestore --> FinalDetect["再次点击启动检测<br/>读取后端缺失量"]
+    FinalDetect -->|"无缺失"| Success
+    FinalDetect -->|"仍有缺失或结果不确定"| Failed["返回 False"]
 ```
 
 ### 缺失量判断的业务兜底
@@ -317,7 +318,8 @@ flowchart TD
 | 找不到任何数字 | 无缺失 | 当前任务成功结束 |
 | 数字大于 0 | 有缺失 | 进入补齐流程 |
 | 数字等于 0 或为负数 | 前端渲染假象 | 重新启动检测，最多 3 次 |
-| 读取文本发生普通异常 | 保守认为有缺失 | 强制进入补齐流程 |
+| 固定文本 `：表示缺失数据` | 统计文本仍在渲染 | 按 0/2/4 秒等待后重读，连续 3 次仍未完成则当前任务失败 |
+| 普通检测异常 | 本次后端检测不可信 | 重新点击启动检测，最多 3 次；首次检测最终不确定时进入补齐兜底，终态复检最终不确定时记为失败 |
 
 ## 九、三级弹窗层级与精准关闭
 
@@ -362,36 +364,39 @@ sequenceDiagram
     autonumber
     participant W as datatoolcenter Worker
     participant Toast as 同步成功提示节点
-    participant Dialog as 三级进度弹窗
+    participant Primary as 一级任务弹窗
 
     W->>W: 提交全店补齐
     loop 每一次同步成功事件
         W->>Toast: wait_for_selector(attached, 120s)
         alt 120 秒内捕获到新节点
             Toast-->>W: 返回固定 ElementHandle
-            W->>Toast: 等待这个具体节点 hidden，最多 15 秒
+            W->>Toast: 等待这个具体节点 hidden，最多 30 秒
             alt 节点按时隐藏
                 W->>W: 释放句柄并重新等待下一次心跳
-            else 节点 15 秒仍未隐藏
+            else 节点 30 秒仍未隐藏
                 W->>W: 停止心跳循环并进入终态检查
             end
         else 120 秒没有新节点
             W->>W: 静默期结束，进入终态检查
         end
     end
-    W->>Dialog: 硬超时查询三级弹窗是否可见
-    alt 三级弹窗不存在
-        W-->>W: 判定正常完成，返回 True
-    else 三级弹窗仍存在
-        W->>Dialog: 精确关闭三级，再关闭二级
-        W-->>W: 判定任务卡死，返回 False
+    W->>Primary: 恢复一级状态并重新注入当前日期
+    W->>Primary: 点击启动检测，重新请求后端缺失量
+    alt 返回可信的无缺失结果
+        W-->>W: 后端复检通过，返回 True
+    else 仍有缺失或结果不确定
+        W-->>W: 后端复检未通过，返回 False
     end
 ```
 
-120 秒静默本身不等于成功。它只表示“已经没有新心跳”，最终必须结合三级弹窗：
+120 秒静默本身不等于成功，也不再用三级弹窗存在性作为成功证据。三级、二级弹窗只在 `_restore_primary_state()` 中负责清理页面层级；最终结果来自重新点击“启动检测”后的后端缺失量：
 
-- 三级弹窗消失：正常采集完成；
-- 三级弹窗仍存在：数仓任务卡死。
+- 统计文本不含数字，按现有页面协议表示无缺失：任务成功；
+- 缺失数量大于 0：任务失败并进入总体重试；
+- 连续 3 次得到 0、负数或检测异常：结果不确定，保守记为失败。
+
+每次检测会先等待结果列表内部的 `div.testContent_list_title_dayType` 标题渲染，再等待 1 秒读取顶部缺失统计。若读到固定占位文本 `：表示缺失数据`，不会重新请求后端，而是按 0、2、4 秒的退避节奏读取同一轮结果；连续 3 次仍为占位文本时，本次任务直接失败。
 
 ## 十一、Context 级业务执行页面 GC
 
@@ -418,7 +423,7 @@ sequenceDiagram
         GC->>Toast: 等待新心跳 attached，最多 180 秒
         alt 捕获心跳
             Toast-->>GC: 固定当前 ElementHandle
-            GC->>Toast: 等待当前节点 hidden，最多 15 秒
+            GC->>Toast: 等待当前节点 hidden，最多 30 秒
             alt 正常隐藏
                 GC->>GC: 释放句柄，重新开始 180 秒等待
             else 节点异常滞留
@@ -593,7 +598,7 @@ flowchart TD
 
 ### 8. Worker 心跳模块
 
-`wait_for_completion_or_heartbeat()` 在数仓 Worker 页监听“同步成功”节点。120 秒没有新心跳后，脚本检查三级弹窗：三级弹窗消失表示正常完成，仍存在表示卡死并需要清理。
+`wait_for_completion_or_heartbeat()` 在数仓 Worker 页监听“同步成功”节点。120 秒没有新心跳后，脚本恢复一级弹窗、重新注入当前日期并再次点击启动检测；只有后端复检确认无缺失时才返回成功。
 
 ### 9. 业务执行页面 GC 模块
 
@@ -622,7 +627,7 @@ flowchart TD
 7. 把首轮任务全部放入共享任务池，由多个 Worker 动态领取；
 8. 每个 Worker 清理遗留弹窗，打开任务卡片并注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
-10. 提交后监听 120 秒心跳，并结合三级弹窗区分正常完成和卡死；
+10. 提交后监听 120 秒心跳；静默后恢复一级弹窗并重新请求后端缺失量，只有复检无缺失才成功；
 11. 业务执行页 GC 独立使用 180 秒心跳回收没有正常关闭的页面；
 12. 每个任务结束后立即把本次尝试结果追加到 JSONL；
 13. Worker 发生普通任务失败时继续领取，发生致命页面异常时退出任务池；

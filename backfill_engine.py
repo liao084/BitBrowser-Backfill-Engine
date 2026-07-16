@@ -690,7 +690,9 @@ class BackfillEngine:
     ) -> Optional[bool]:
         """重新请求后端检测缺失量；True=有缺失，False=无缺失，None=结果不确定。"""
         start_btn = primary_drawer.locator("#checkbutn")
-        result_list = primary_drawer.locator(".testContent_list")
+        result_title = primary_drawer.locator(
+            "div.testContent_list_title_dayType"
+        ).first
         missing_span = primary_drawer.locator(
             "div.testContent > div:nth-child(2) > span:nth-child(1)"
         )
@@ -704,14 +706,14 @@ class BackfillEngine:
                 await start_btn.click(timeout=30000)
 
                 try:
-                    await result_list.wait_for(state="visible", timeout=45000)
+                    await result_title.wait_for(state="visible", timeout=45000)
                 except PlaywrightTimeoutError:
                     logger.warning(
-                        f"Worker-{worker_id} {phase}等待查询结果容器超时，"
+                        f"Worker-{worker_id} {phase}等待查询结果标题渲染超时，"
                         "继续读取缺失统计。"
                     )
 
-                # 检测结果区可见后，给顶部缺失统计文本一个短暂渲染缓冲。
+                # 结果项标题可见后，再给顶部缺失统计文本一个短暂渲染缓冲。
                 await page.wait_for_timeout(1000)
                 for read_attempt, retry_delay_ms in enumerate(
                     (0, 2000, 4000), start=1

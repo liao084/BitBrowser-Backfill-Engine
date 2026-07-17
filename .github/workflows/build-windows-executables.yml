@@ -1,0 +1,97 @@
+name: Build Windows Executables
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - main
+    paths:
+      - "backfill_engine.py"
+      - "daily_engine.py"
+      - "daily_notify_agent.py"
+      - "auth_manager.py"
+      - "browser_manager.py"
+      - "task_ledger.py"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/build-windows-executables.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check Python syntax
+        run: >
+          uv run python -m py_compile
+          backfill_engine.py
+          daily_engine.py
+          daily_notify_agent.py
+          auth_manager.py
+          browser_manager.py
+          task_ledger.py
+
+      - name: Build Backfill EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --name backfill_engine
+          backfill_engine.py
+
+      - name: Build Daily EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --noconsole
+          --name daily_engine
+          daily_engine.py
+
+      - name: Build Daily Notify Agent EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --name daily_notify_agent
+          daily_notify_agent.py
+
+      - name: Upload Backfill EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: backfill-engine-windows
+          path: dist/backfill_engine.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Daily EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-engine-windows
+          path: dist/daily_engine.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Daily Notify Agent EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-notify-agent-windows
+          path: dist/daily_notify_agent.exe
+          if-no-files-found: error
+          retention-days: 30

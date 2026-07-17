@@ -38,11 +38,16 @@ backfill-daily-mode/
 ```powershell
 uv sync
 
+# 历史补采
+uv run pyinstaller --onefile --name backfill_engine backfill_engine.py
+
 # 日常采集
 uv run pyinstaller --onefile --noconsole --name daily_engine daily_engine.py
 
 # 飞书巡检通知器
 uv run pyinstaller --onefile --noconsole --name daily_notify_agent daily_notify_agent.py
 ```
+
+当前项目使用命令行参数打包，不要求仓库预先存在 `.spec`。PyInstaller 首次执行上述命令时会在构建目录生成同名 `.spec`、`build/` 和 `dist/`；真正需要部署的是 `dist/` 中的 EXE。只有后续需要固定图标、版本资源、额外数据文件或隐藏导入时，才有必要把整理后的 `.spec` 提交到仓库并改用 `pyinstaller xxx.spec`。
 
 部署时将对应 EXE 与其配置文件放在同一目录：`daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。

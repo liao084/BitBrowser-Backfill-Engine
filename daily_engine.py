@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
@@ -35,6 +36,22 @@ DEFAULT_TASK_URL = (
     "https://datatoolcenter.com/web/dateCenter.html?"
     "activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
 )
+
+
+def _format_duration(seconds: float) -> str:
+    """把 perf_counter 产生的秒数格式化为便于阅读的运行耗时。"""
+    total_seconds = max(0, int(round(seconds)))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
+    parts = []
+    if hours:
+        parts.append(f"{hours}小时")
+    if minutes:
+        parts.append(f"{minutes}分")
+    if seconds or not parts:
+        parts.append(f"{seconds}秒")
+    return "".join(parts)
 
 
 @dataclass(frozen=True)
@@ -479,7 +496,29 @@ class DailyEngine(BackfillEngine):
         )
 
     @staticmethod
-    def _log_daily_summary(summary: Dict[str, Any], report: AuthReport) -> None:
+    def _timing_lines(timings: Dict[str, float]) -> List[str]:
+        """按固定顺序输出已经完成的运行阶段耗时。"""
+        labels = (
+            ("browser_startup", "浏览器启动耗时"),
+            ("auth_precheck", "登录预检耗时"),
+            ("worker_initialization", "Worker 初始化耗时"),
+            ("task_pool", "任务池执行耗时"),
+            ("total", "总运行时间"),
+        )
+        return [
+            f"  {label}：{_format_duration(timings[key])}"
+            for key, label in labels
+            if key in timings
+        ]
+
+    @classmethod
+    def _log_daily_summary(
+        cls,
+        summary: Dict[str, Any],
+        report: AuthReport,
+        timings: Dict[str, float],
+        browser_action: str,
+    ) -> None:
         attempt_lines = [
             (
                 f"  第 {attempt_result['attempt']} 次尝试统计："
@@ -489,6 +528,7 @@ class DailyEngine(BackfillEngine):
             )
             for attempt_result in summary.get("attempt_stats", [])
         ]
+        timing_lines = cls._timing_lines(timings)
         logger.info(
             "\nDaily-mode 运行汇总：\n"
             f"  登录状态：{report.mode}\n"
@@ -496,7 +536,8 @@ class DailyEngine(BackfillEngine):
             + ("\n".join(attempt_lines) + "\n" if attempt_lines else "")
             + f"  最终完成：{summary['final_success']}\n"
             f"  最终失败：{summary['final_failed']}\n"
-            "  浏览器处理：保留现场，不自动关闭"
+            + ("\n".join(timing_lines) + "\n" if timing_lines else "")
+            + f"  浏览器处理：{browser_action}"
         )
 
     async def run_daily(
@@ -505,118 +546,166 @@ class DailyEngine(BackfillEngine):
         platforms: Sequence[Dict[str, Any]],
         target_date: Optional[str] = None,
     ) -> bool:
-        """执行 daily-mode；无论结果如何，结束时均保留比特浏览器。"""
-        if not tasks_config or not all(isinstance(item, dict) for item in tasks_config):
-            logger.error("tasks_config 必须是非空的 list[dict]。")
-            return False
-        if not platforms or not all(isinstance(item, dict) for item in platforms):
-            logger.error("platforms 必须是非空的 list[dict]。")
-            return False
-
-        initial_tasks = self.build_daily_tasks(tasks_config, target_date)
-        if not initial_tasks:
-            logger.error("配置没有生成任何每日任务。")
-            return False
-
-        ledger = TaskLedger(runtime_dir / "daily_results.jsonl")
-        await self.browser_manager.close_browser(
-            settle_seconds=2.0,
-            reason="正在关闭可能遗留的比特浏览器",
-        )
-        cdp_address = await self.browser_manager.open_browser()
-        if not cdp_address:
-            return False
-
+        """执行 daily-mode，并在所有退出路径记录总耗时和浏览器处理结果。"""
+        total_started = time.perf_counter()
+        timings: Dict[str, float] = {}
+        summary: Optional[Dict[str, Any]] = None
+        auth_report: Optional[AuthReport] = None
         run_succeeded = False
+        browser_opened = False
+        browser_action = "未启动浏览器"
+
         try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.connect_over_cdp(
-                    f"http://{cdp_address}"
-                )
-                if not browser.contexts:
-                    logger.error("比特浏览器中没有可用的 BrowserContext。")
-                    return False
-                context = browser.contexts[0]
+            if not tasks_config or not all(
+                isinstance(item, dict) for item in tasks_config
+            ):
+                logger.error("tasks_config 必须是非空的 list[dict]。")
+                return False
+            if not platforms or not all(
+                isinstance(item, dict) for item in platforms
+            ):
+                logger.error("platforms 必须是非空的 list[dict]。")
+                return False
 
-                # 登录态重建预检早于 GC 挂载；失败平台的诊断页因此可以一直保留。
-                auth_report = await self.auth_manager.ensure_platforms(
-                    context,
-                    platforms,
-                )
-                self._log_auth_report(auth_report)
-                if not auth_report.any_succeeded:
-                    logger.error(
-                        "全部平台登录态重建失败，daily-mode 不创建任务池；"
-                        "浏览器和失败登录页将保留供人工处理。"
+            initial_tasks = self.build_daily_tasks(tasks_config, target_date)
+            if not initial_tasks:
+                logger.error("配置没有生成任何每日任务。")
+                return False
+
+            ledger = TaskLedger(runtime_dir / "daily_results.jsonl")
+            browser_started = time.perf_counter()
+            await self.browser_manager.close_browser(
+                settle_seconds=2.0,
+                reason="正在关闭可能遗留的比特浏览器",
+            )
+            cdp_address = await self.browser_manager.open_browser()
+            timings["browser_startup"] = time.perf_counter() - browser_started
+            if not cdp_address:
+                browser_action = "浏览器启动失败，无可用运行现场"
+                return False
+            browser_opened = True
+            browser_action = "任务未全部成功，保留浏览器和页面现场"
+
+            try:
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.connect_over_cdp(
+                        f"http://{cdp_address}"
                     )
-                    return False
+                    if not browser.contexts:
+                        logger.error("比特浏览器中没有可用的 BrowserContext。")
+                        return False
+                    context = browser.contexts[0]
 
-                # 从此刻起只监控任务执行期间新产生的商智页面，不扫描登录诊断页。
-                context.on("page", self._on_new_page)
-                worker_pages = await self.create_worker_pages(
-                    context,
-                    task_count=len(initial_tasks),
-                )
-                if not worker_pages:
-                    logger.error("没有成功创建任何 Worker 页面，daily-mode 停止。")
-                    return False
-
-                # 只有登录预检和 Worker 稳定性检查通过后，才正式开启本轮账本。
-                # 这样重复启动关闭旧浏览器时，旧进程写入的失败结果会先完成，
-                # 再由真正具备执行条件的新进程统一清空。
-                try:
-                    await ledger.reset()
-                except Exception as error:
-                    logger.error(f"无法创建或覆盖 daily 任务账本: {error}")
-                    return False
-
-                logger.info(
-                    f"Worker 已稳定，本轮 Daily 任务账本已重置: {ledger.path}；"
-                    f"日志继续追加到: {log_path}"
-                )
-
-                error_toast_monitors = [
-                    asyncio.create_task(
-                        self._monitor_worker_error_toasts(
-                            page,
-                            f"页面-{index + 1}",
+                    # 登录态重建预检早于 GC 挂载；失败平台的诊断页因此可以一直保留。
+                    auth_started = time.perf_counter()
+                    try:
+                        auth_report = await self.auth_manager.ensure_platforms(
+                            context,
+                            platforms,
                         )
-                    )
-                    for index, page in enumerate(worker_pages)
-                ]
+                    finally:
+                        timings["auth_precheck"] = (
+                            time.perf_counter() - auth_started
+                        )
+                    self._log_auth_report(auth_report)
+                    if not auth_report.any_succeeded:
+                        logger.error(
+                            "全部平台登录态重建失败，daily-mode 不创建任务池；"
+                            "浏览器和失败登录页将保留供人工处理。"
+                        )
+                        return False
 
-                try:
-                    await self._run_daily_task_pool(
-                        initial_tasks,
-                        worker_pages,
-                        ledger,
+                    # 从此刻起只监控任务执行期间新产生的业务执行页面，
+                    # 不扫描登录预检阶段保留下来的诊断页面。
+                    context.on("page", self._on_new_page)
+                    worker_started = time.perf_counter()
+                    try:
+                        worker_pages = await self.create_worker_pages(
+                            context,
+                            task_count=len(initial_tasks),
+                        )
+                    finally:
+                        timings["worker_initialization"] = (
+                            time.perf_counter() - worker_started
+                        )
+                    if not worker_pages:
+                        logger.error("没有成功创建任何 Worker 页面，daily-mode 停止。")
+                        return False
+
+                    # 只有登录预检和 Worker 稳定性检查通过后，才正式开启本轮账本。
+                    # 这样重复启动关闭旧浏览器时，旧进程写入的失败结果会先完成，
+                    # 再由真正具备执行条件的新进程统一清空。
+                    try:
+                        await ledger.reset()
+                    except Exception as error:
+                        logger.error(f"无法创建或覆盖 daily 任务账本: {error}")
+                        return False
+
+                    logger.info(
+                        f"Worker 已稳定，本轮 Daily 任务账本已重置: {ledger.path}；"
+                        f"日志继续追加到: {log_path}"
                     )
 
-                    summary = await ledger.summary(total_tasks=len(initial_tasks))
-                    self._log_daily_summary(summary, auth_report)
-                    run_succeeded = summary["final_failed"] == 0
-                finally:
-                    await self._stop_error_toast_monitors(error_toast_monitors)
-        except Exception as error:
-            logger.exception(f"daily-mode 主流程发生异常: {error}")
-            return False
+                    error_toast_monitors = [
+                        asyncio.create_task(
+                            self._monitor_worker_error_toasts(
+                                page,
+                                f"页面-{index + 1}",
+                            )
+                        )
+                        for index, page in enumerate(worker_pages)
+                    ]
+
+                    task_pool_started = time.perf_counter()
+                    try:
+                        await self._run_daily_task_pool(
+                            initial_tasks,
+                            worker_pages,
+                            ledger,
+                        )
+
+                        summary = await ledger.summary(
+                            total_tasks=len(initial_tasks)
+                        )
+                        run_succeeded = summary["final_failed"] == 0
+                    finally:
+                        timings["task_pool"] = (
+                            time.perf_counter() - task_pool_started
+                        )
+                        await self._stop_error_toast_monitors(
+                            error_toast_monitors
+                        )
+            except Exception as error:
+                logger.exception(f"daily-mode 主流程发生异常: {error}")
+                return False
+
+            return run_succeeded
         finally:
-            if run_succeeded and not self.keep_browser_after_run:
+            if browser_opened and run_succeeded and not self.keep_browser_after_run:
                 await self.browser_manager.close_browser(
                     reason="Daily 全部任务成功，正在按配置关闭比特浏览器",
                 )
-            elif run_succeeded:
-                logger.info(
-                    "Daily 全部任务成功；KEEP_BROWSER_AFTER_RUN=true，"
-                    "保留比特浏览器和页面现场。"
-                )
-            else:
-                logger.info(
-                    "daily-mode 未全部成功或未进入有效任务阶段，"
-                    "保留比特浏览器和页面现场供人工检查。"
+                browser_action = "已按 KEEP_BROWSER_AFTER_RUN=false 执行关闭"
+            elif browser_opened and run_succeeded:
+                browser_action = (
+                    "已按 KEEP_BROWSER_AFTER_RUN=true 保留浏览器和页面现场"
                 )
 
-        return run_succeeded
+            timings["total"] = time.perf_counter() - total_started
+            if summary is not None and auth_report is not None:
+                self._log_daily_summary(
+                    summary,
+                    auth_report,
+                    timings,
+                    browser_action,
+                )
+            else:
+                timing_lines = self._timing_lines(timings)
+                logger.info(
+                    "\nDaily-mode 运行结束（未生成完整任务汇总）：\n"
+                    + ("\n".join(timing_lines) + "\n" if timing_lines else "")
+                    + f"  浏览器处理：{browser_action}"
+                )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # BitBrowser Backfill Engine 架构与执行流程
 
-本文档已按 2026-07-16 的 `backfill_engine.py` 与 `task_ledger.py` 校正，用于：
+本文档已按 2026-07-16 的 Backfill 与 Daily 代码校正，用于：
 
 - 按调用顺序通读代码；
 - 在遗忘实现细节后快速恢复对脚本的理解；
@@ -393,8 +393,8 @@ sequenceDiagram
 120 秒静默本身不等于成功，也不再用三级弹窗存在性作为成功证据。三级、二级弹窗只在 `_restore_primary_state()` 中负责清理页面层级；最终结果来自重新点击“启动检测”后的后端缺失量：
 
 - 统计文本不含数字，按现有页面协议表示无缺失：任务成功；
-- 缺失数量大于 0：任务失败并进入总体重试；
-- 连续 3 次得到 0、负数或检测异常：结果不确定，保守记为失败。
+- 缺失数量大于 0：任务失败并进入对应模式的重试流程；
+- 连续 3 次得到 0、负数或读取异常：结果不确定，保守记为失败。
 
 每次检测会先等待结果列表内部的 `div.testContent_list_title_dayType` 标题渲染，再等待 1 秒读取顶部缺失统计。若读到固定占位文本 `：表示缺失数据`，不会重新请求后端，而是按 0、2、4 秒的退避节奏读取同一轮结果；连续 3 次仍为占位文本时，本次任务直接失败。
 
@@ -637,3 +637,77 @@ flowchart TD
 17. 停止红色提示监控器，并取消尚未完成的30秒延迟关闭协程；
 18. 如果仍有业务执行页面，等待65秒交给 GC 自然收尾，再兜底关闭残留页面；
 19. 退出 Playwright 连接，程序结束。
+
+## 十八、Daily Mode：登录态重建、动态 Worker 与旁路通知
+
+`daily_engine.py` 复用历史补采的 Worker、弹窗、GC、账本和失败重试能力，但外围生命周期不同：它先关闭并重启指定 Bit 浏览器，再为本次单日任务创建 Worker 页面。
+
+```mermaid
+flowchart TD
+    Start["读取 EXE 同目录 .env"] --> Bit["关闭并启动指定 Bit 浏览器"]
+    Bit --> CDP["Playwright connect_over_cdp"]
+    CDP --> Clear["预检开始时全局清理一次旧 Cookie"]
+    Clear --> Auth["按 PLATFORMS 顺序\n访问主页、注入 pkl、再次访问验证"]
+    Auth --> Result{"至少一个平台重建成功?"}
+    Result -->|"否"| Keep["不创建任务池\n保留失败登录页供人工处理"]
+    Result -->|"是"| Worker["并行创建 min(WORKER_COUNT, 任务数) 个 Worker"]
+    Worker --> Pool["持续共享任务池\n失败任务立即回队"]
+    Pool --> Ledger["daily_results.jsonl 覆盖写入本次结果"]
+    Ledger --> Finish{"全部任务成功且\nKEEP_BROWSER_AFTER_RUN=false?"}
+    Finish -->|"是"| Close["关闭比特浏览器"]
+    Finish -->|"否"| KeepFinal["保留浏览器和页面现场"]
+    Close --> Summary["输出各阶段耗时、总耗时和实际浏览器处理结果"]
+    KeepFinal --> Summary
+```
+
+Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重启、登录预检、Worker 初始化和持续任务池；外层 `finally` 统一补充总运行时间。因此参数错误、浏览器启动失败或登录预检失败等提前退出路径，也会留下总耗时和实际浏览器处理结果，而不会再固定打印“保留现场”。
+
+### 登录态重建预检
+
+日常模式不能假定 Bit 浏览器中已有 Cookie 可靠可用。预检因此不是“当前 URL 没有出现 login 就通过”，而是一次确定性的登录态重建：
+
+1. 对整个 `BrowserContext` 执行一次 `clear_cookies()`；
+2. 对 `.env` 的每个 `PLATFORMS` 项访问 `home_url`，加载该平台 pkl 中 `cookie_key` 对应的 Cookie 并注入；
+3. 再次访问 `home_url`；仍进入 `login_url_markers` 指定的登录页则判定失败；
+4. 成功预检页关闭，失败预检页保留给人工巡检或登录。
+
+`BrowserContext` 的 Cookie 覆盖全部站点，所以清理动作必须只执行一次。若在“注入抖音 Cookie”后又为京东执行全局清理，抖音 Cookie 会被删除，最终抖音业务页仍会失效。
+
+### 单机飞书巡检器
+
+`daily_notify_agent.py` 不接入浏览器，也不读取内存中的任务池。它以文件为边界，递归扫描本机 `dailyfill` 下每个客户目录的 `.env`：
+
+1. `REPORT_READY_TIME` 未到的客户不纳入本次通知；
+2. 用 `DAILY_TASKS`、`TARGET_DATE` 或日期偏移量还原当天应有的 `task_id`；
+3. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量；
+4. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
+5. 将全部客户状态合并为一条飞书文本消息。
+
+这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器读取上一次账本和日志；通知器异常也不会影响采集任务。
+
+### Daily 专属即时重试
+
+历史补采保留“首轮全部完成后，从账本重建失败项并统一重试”的轮次模型。Daily 的任务只有少量卡片，若继续等待整轮结束，会让提前完成或失败的 Worker 长时间空闲，因此使用独立的持续任务池：
+
+1. Worker 使用 `await queue.get()` 持续等待任务，不因队列暂时为空立即退出；
+2. 每次尝试都先把结果追加到 `daily_results.jsonl`；
+3. 失败且未达到 `MAX_ATTEMPTS` 时，将任务的 `attempt` 加一并立即放回队尾；
+4. 成功或达到最大次数后不再回队；
+5. `queue.join()` 只会在所有任务到达终态后返回，调度器随后用哨兵统一停止健康 Worker；
+6. 页面无响应、崩溃或断连仍会使当前 Worker 熔断，但其失败任务可以由其他健康 Worker 继续领取。
+
+该分叉只存在于 `DailyEngine`。`BackfillEngine` 的历史区块调度和唯一一次总体重试保持不变。
+
+### 统一的业务 UI 超时
+
+Backfill 与 Daily 共用的任务卡片弹窗、检测按钮、缺失数量节点、补齐按钮等普通业务元素，其等待和点击统一放宽到 30 秒，用于承受多脚本并存时的短暂资源竞争。代码不再维护模式专属的 timeout 覆盖字段。
+
+以下时间没有被统一放宽，因为它们承担不同语义：
+
+- 一级弹窗恢复后的 5 秒 `trial=True` 可操作性检查；
+- `page.goto()` 与 datatoolcenter 自动登录后的稳定等待；
+- 10 秒页面健康探针；
+- 120 秒 Worker 心跳静默判断；
+- 180 秒业务执行页 GC 静默判断；
+- 单个 Worker/GC 心跳节点 30 秒隐藏等待；
+- 红色提示和弹窗关闭器的旁路回收超时。

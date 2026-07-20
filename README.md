@@ -1,11 +1,10 @@
 # Backfill & Daily Collection Engine
 
-基于 Playwright CDP 的数仓采集 RPA。项目围绕同一套稳定的 Worker、任务账本、异常隔离和页面回收能力，支持 BitBrowser 与本机 Edge。
+基于 Playwright CDP 的数仓采集 RPA。项目围绕同一套稳定的 Worker、任务账本、异常隔离和页面回收能力，历史补采可连接 BitBrowser，也可接管已开启远程调试的 Edge、Chrome 等 Chromium 浏览器。
 
 | 模式 | 入口 | 用途 |
 | --- | --- | --- |
-| 历史补采 | `backfill_engine.py` | 将日期范围切分为区块，由多个既有 Worker 通过共享任务池补采历史数据。 |
-| Edge 历史补采 | `edgebackfill_engine.py` | 直接连接已开启 CDP 的本机 Edge，复用历史补采与账本流程，无需 BITE_ID；默认 Worker/GC 静默超时为 200/240 秒。 |
+| 历史补采 | `backfill_engine.py` | 通过 `.env` 选择 BitBrowser 或外部 Chromium CDP，将日期范围切分为区块并由多个既有 Worker 动态补采。 |
 | 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按 pkl Cookie 重建业务平台登录态、创建 Worker，并让失败的单日任务立即回队重试。 |
 
 `daily_notify_agent.py` 是日常采集的旁路巡检器：它读取各客户目录中的 `.env`、`daily_results.jsonl` 和 `daily_run.log`，定时发送一条本机汇总飞书消息，不参与任何浏览器操作。
@@ -21,9 +20,9 @@
 ## 目录结构
 
 ```text
-backfill-daily-mode/
-  backfill_engine.py       # 历史补采核心与通用 Worker 能力
-  edgebackfill_engine.py   # 连接现有 Edge 的历史补采入口
+backfill/
+  backfill_engine.py       # 历史补采入口与通用 Worker 能力
+  browser_connector.py     # BitBrowser / 外部 Chromium CDP 连接器
   daily_engine.py          # 日常采集入口
   auth_manager.py          # pkl Cookie 登录态重建预检
   browser_manager.py       # Bit 浏览器启动、关闭与 CDP 地址获取
@@ -43,16 +42,20 @@ uv sync
 # 历史补采
 uv run pyinstaller --onefile --name backfill_engine backfill_engine.py
 
-# Edge 历史补采
-uv run pyinstaller --onefile --name edgebackfill_engine edgebackfill_engine.py
-
 # 日常采集
 uv run pyinstaller --onefile --noconsole --name daily_engine daily_engine.py
 
 # 飞书巡检通知器
-uv run pyinstaller --onefile --noconsole --name daily_notify_agent daily_notify_agent.py
+uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 ```
 
 当前项目使用命令行参数打包，不要求仓库预先存在 `.spec`。PyInstaller 首次执行上述命令时会在构建目录生成同名 `.spec`、`build/` 和 `dist/`；真正需要部署的是 `dist/` 中的 EXE。只有后续需要固定图标、版本资源、额外数据文件或隐藏导入时，才有必要把整理后的 `.spec` 提交到仓库并改用 `pyinstaller xxx.spec`。
 
-部署时将对应 EXE 与其配置文件放在同一目录：`backfill_engine.exe`、`edgebackfill_engine.exe` 和 `daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。Edge 模式还要求先以 `--remote-debugging-port=9222` 启动 Edge，并在运行补采程序前人工准备好 Worker 标签页。
+部署时将对应 EXE 与其配置文件放在同一目录：`backfill_engine.exe` 和 `daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。
+
+历史补采的浏览器连接方式由 `.env` 决定：
+
+- `BROWSER_TYPE=bitbrowser`：读取 `BITE_ID`，通过比特浏览器本地 API 获取 CDP 地址；
+- `BROWSER_TYPE=external_cdp`：读取 `CDP_ADDRESS`，连接已经通过 `--remote-debugging-port` 开启远程调试的 Edge、Chrome 等 Chromium 浏览器。
+
+两种方式都要求浏览器中已经准备好并登录 `datatoolcenter` Worker 页面。历史模式还可通过 `WORKER_HEARTBEAT_SILENCE_SECONDS` 和 `BUSINESS_HEARTBEAT_SILENCE_SECONDS` 调整不同业务速度下的静默阈值；后者必须大于前者。

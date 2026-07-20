@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 RPA 历史数据自动化补采调度引擎 (Playwright Async 版)
-基于比特浏览器架构，支持多标签页并发任务分配与心跳防卡死监控。
+支持连接比特浏览器或已开启远程调试的 Chromium 浏览器，
+并提供多标签页并发任务分配与心跳防卡死监控。
 """
 
 import asyncio
@@ -11,11 +12,11 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional, List, Tuple, TypeVar
 
-import requests
 from dotenv import load_dotenv
 from playwright.async_api import (
     BrowserContext,
@@ -26,6 +27,12 @@ from playwright.async_api import (
     async_playwright,
 )
 
+from browser_connector import (
+    BitBrowserConnector,
+    BrowserConnector,
+    ExternalCdpConnector,
+    normalize_cdp_address,
+)
 from task_ledger import TaskLedger
 
 
@@ -80,16 +87,33 @@ class BackfillEngine:
 
     def __init__(
         self,
-        bite_id: str,
+        bite_id: Optional[str],
         gc_page_url_markers: List[str],
+        *,
+        browser_connector: Optional[BrowserConnector] = None,
+        worker_heartbeat_silence_seconds: int = 120,
+        business_heartbeat_silence_seconds: int = 180,
     ):
         self.bt_url = 'http://127.0.0.1:54345'
         self.bite_id = bite_id
+        if browser_connector is None:
+            if not bite_id:
+                raise ValueError("使用比特浏览器连接器时 bite_id 不能为空")
+            browser_connector = BitBrowserConnector(bite_id, self.bt_url)
+        self.browser_connector = browser_connector
+
+        if worker_heartbeat_silence_seconds <= 0:
+            raise ValueError("worker_heartbeat_silence_seconds 必须大于 0")
+        if business_heartbeat_silence_seconds <= worker_heartbeat_silence_seconds:
+            raise ValueError(
+                "business_heartbeat_silence_seconds 必须大于 "
+                "worker_heartbeat_silence_seconds"
+            )
         # 心跳静默判定机制超时时间（秒）
-        self.silent_timeout_seconds = 120
-        # Context 级业务执行页 GC 比 Worker 多保留 60 秒观察窗口。
-        self.gc_silent_timeout_seconds = 180
-        # 程序收尾时覆盖 120/180 秒判定之间的窗口，并额外预留 5 秒调度余量。
+        self.silent_timeout_seconds = worker_heartbeat_silence_seconds
+        # Context 级业务执行页 GC 必须比 Worker 保留更长的观察窗口。
+        self.gc_silent_timeout_seconds = business_heartbeat_silence_seconds
+        # 程序收尾时覆盖 Worker/GC 判定之间的窗口，并额外预留 5 秒调度余量。
         self.gc_shutdown_grace_seconds = (
             self.gc_silent_timeout_seconds - self.silent_timeout_seconds + 5
         )
@@ -182,33 +206,6 @@ class BackfillEngine:
             raise WorkerUnresponsiveError(
                 f"Worker-{worker_id} 页面健康探测返回异常状态: {ready_state!r}"
             )
-
-    def get_debugger_address(self) -> Optional[str]:
-        """
-        【复用说明】
-        复用了原 `131_pdd_lpjy.py` 中的 `open_browser` 核心逻辑。
-        修改点：
-        1. 剥离了直接启动 Selenium WebDriver 的逻辑。
-        2. 仅保留通过 HTTP 接口唤醒比特浏览器，并获取 CDP 调试地址（如 127.0.0.1:xxxx）的逻辑。
-        """
-        logger.info(f"正在尝试连接比特浏览器 (ID: {self.bite_id})...")
-        url = f'{self.bt_url}/browser/open'
-        headers = {'Content-Type': 'application/json'}
-        try:
-            response = requests.post(url, headers=headers, json={"id": self.bite_id}, timeout=15)
-            if response.status_code == 200:
-                result = response.json()
-                if result.get('success') and 'data' in result:
-                    cdp_address = result['data'].get('http')
-                    logger.info(f"✓ 获取浏览器 CDP 调试地址成功: {cdp_address}")
-                    return cdp_address
-                else:
-                    logger.error(f"✗ 浏览器启动响应错误: {result.get('msg')}")
-            else:
-                logger.error(f"✗ API 请求失败 HTTP {response.status_code}")
-        except Exception as e:
-            logger.error(f"✗ 浏览器连接异常: {str(e)}")
-        return None
 
     async def _delayed_check(self, page: Page):
         """延迟检测新网页 URL 并部署后台监控任务"""
@@ -1242,13 +1239,19 @@ class BackfillEngine:
         )
 
     async def run(self, tasks_config: list = None):
-        cdp_address = self.get_debugger_address()
+        logger.info(
+            "历史补采启动："
+            f"浏览器连接器={type(self.browser_connector).__name__}，"
+            f"Worker心跳静默阈值={self.silent_timeout_seconds}秒，"
+            f"业务页心跳静默阈值={self.gc_silent_timeout_seconds}秒"
+        )
+        cdp_address = self.browser_connector.get_cdp_address()
         if not cdp_address:
             logger.error("无法获取浏览器 CDP 地址，程序退出")
             return
 
         async with async_playwright() as p:
-            # 连接现有比特浏览器
+            # CDP 地址的来源由浏览器连接器决定；后续业务逻辑完全共用。
             browser = await p.chromium.connect_over_cdp(f"http://{cdp_address}")
             contexts = browser.contexts
             
@@ -1357,7 +1360,33 @@ def _load_json_list_env(name: str) -> List[Any]:
     return value
 
 
-def load_runtime_config() -> Tuple[str, List[Dict[str, Any]], List[str]]:
+@dataclass(frozen=True)
+class BackfillRuntimeConfig:
+    """历史补采从 .env 解析出的浏览器、任务和心跳配置。"""
+
+    browser_type: str
+    bite_id: Optional[str]
+    cdp_address: Optional[str]
+    tasks_config: List[Dict[str, Any]]
+    gc_page_url_markers: List[str]
+    worker_heartbeat_silence_seconds: int
+    business_heartbeat_silence_seconds: int
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是整数") from error
+    if value <= 0:
+        raise ValueError(f".env 中的 {name} 必须大于 0")
+    return value
+
+
+def load_runtime_config() -> BackfillRuntimeConfig:
     """从源码或 exe 同目录的 .env 加载本次运行配置。"""
     env_path = runtime_dir / ".env"
     if not env_path.exists():
@@ -1366,9 +1395,30 @@ def load_runtime_config() -> Tuple[str, List[Dict[str, Any]], List[str]]:
         )
 
     load_dotenv(env_path)
-    bite_id = (os.getenv("BITE_ID") or "").strip()
-    if not bite_id:
-        raise ValueError(".env 缺少必填配置 BITE_ID")
+    browser_type = (os.getenv("BROWSER_TYPE") or "bitbrowser").strip().lower()
+    if browser_type not in {"bitbrowser", "external_cdp"}:
+        raise ValueError(
+            ".env 中的 BROWSER_TYPE 只能是 bitbrowser 或 external_cdp"
+        )
+
+    bite_id = (os.getenv("BITE_ID") or "").strip() or None
+    cdp_address = (os.getenv("CDP_ADDRESS") or "").strip() or None
+    if browser_type == "bitbrowser" and not bite_id:
+        raise ValueError("BROWSER_TYPE=bitbrowser 时必须配置 BITE_ID")
+    if browser_type == "external_cdp":
+        if not cdp_address:
+            # 兼容周末 Edge 试验版本；新配置统一使用 CDP_ADDRESS。
+            legacy_address = (os.getenv("EDGE_CDP_ADDRESS") or "").strip()
+            if legacy_address:
+                cdp_address = legacy_address
+                logger.warning(
+                    "EDGE_CDP_ADDRESS 已兼容读取，后续请改用 CDP_ADDRESS"
+                )
+            else:
+                raise ValueError(
+                    "BROWSER_TYPE=external_cdp 时必须配置 CDP_ADDRESS"
+                )
+        cdp_address = normalize_cdp_address(cdp_address)
 
     tasks_config_raw = _load_json_list_env("TASKS_CONFIG")
     if not tasks_config_raw or not all(
@@ -1382,18 +1432,54 @@ def load_runtime_config() -> Tuple[str, List[Dict[str, Any]], List[str]]:
     ):
         raise ValueError("GC_PAGE_URL_MARKERS 必须是非空字符串数组")
 
-    return bite_id, tasks_config_raw, markers_raw
+    worker_silence = _load_positive_int_env(
+        "WORKER_HEARTBEAT_SILENCE_SECONDS",
+        120,
+    )
+    business_silence = _load_positive_int_env(
+        "BUSINESS_HEARTBEAT_SILENCE_SECONDS",
+        180,
+    )
+    if business_silence <= worker_silence:
+        raise ValueError(
+            "BUSINESS_HEARTBEAT_SILENCE_SECONDS 必须大于 "
+            "WORKER_HEARTBEAT_SILENCE_SECONDS"
+        )
+
+    return BackfillRuntimeConfig(
+        browser_type=browser_type,
+        bite_id=bite_id,
+        cdp_address=cdp_address,
+        tasks_config=tasks_config_raw,
+        gc_page_url_markers=markers_raw,
+        worker_heartbeat_silence_seconds=worker_silence,
+        business_heartbeat_silence_seconds=business_silence,
+    )
 
 
 if __name__ == "__main__":
     try:
-        bite_id, tasks_config, gc_page_url_markers = load_runtime_config()
+        config = load_runtime_config()
     except (OSError, ValueError) as error:
         logger.error(f"运行配置加载失败: {error}")
         sys.exit(1)
 
+    if config.browser_type == "bitbrowser":
+        browser_connector: BrowserConnector = BitBrowserConnector(
+            config.bite_id or ""
+        )
+    else:
+        browser_connector = ExternalCdpConnector(config.cdp_address or "")
+
     engine = BackfillEngine(
-        bite_id,
-        gc_page_url_markers=gc_page_url_markers,
+        config.bite_id,
+        gc_page_url_markers=config.gc_page_url_markers,
+        browser_connector=browser_connector,
+        worker_heartbeat_silence_seconds=(
+            config.worker_heartbeat_silence_seconds
+        ),
+        business_heartbeat_silence_seconds=(
+            config.business_heartbeat_silence_seconds
+        ),
     )
-    asyncio.run(engine.run(tasks_config))
+    asyncio.run(engine.run(config.tasks_config))

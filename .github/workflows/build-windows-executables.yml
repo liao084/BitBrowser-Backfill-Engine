@@ -8,7 +8,7 @@ on:
       - main
     paths:
       - "backfill_engine.py"
-      - "edgebackfill_engine.py"
+      - "browser_connector.py"
       - "daily_engine.py"
       - "daily_notify_agent.py"
       - "auth_manager.py"
@@ -42,7 +42,7 @@ jobs:
         run: >
           uv run python -m py_compile
           backfill_engine.py
-          edgebackfill_engine.py
+          browser_connector.py
           daily_engine.py
           daily_notify_agent.py
           auth_manager.py
@@ -56,14 +56,6 @@ jobs:
           --onefile
           --name backfill_engine
           backfill_engine.py
-
-      - name: Build Edge Backfill EXE
-        run: >
-          uv run pyinstaller
-          --clean
-          --onefile
-          --name edgebackfill_engine
-          edgebackfill_engine.py
 
       - name: Build Daily EXE
         run: >
@@ -87,14 +79,6 @@ jobs:
         with:
           name: backfill-engine-windows
           path: dist/backfill_engine.exe
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Upload Edge Backfill EXE
-        uses: actions/upload-artifact@v7
-        with:
-          name: edge-backfill-engine-windows
-          path: dist/edgebackfill_engine.exe
           if-no-files-found: error
           retention-days: 30
 

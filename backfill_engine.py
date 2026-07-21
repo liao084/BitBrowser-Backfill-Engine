@@ -768,6 +768,123 @@ class BackfillEngine:
         )
         return None
 
+    async def _wait_for_auto_detection_rendered(
+        self,
+        page: Page,
+        worker_id: str,
+    ) -> None:
+        """完成信号出现后，等待网页自动检测的结果文字完成渲染。"""
+        # 完成弹窗会立即触发自动检测；短暂缓冲用于避开上一轮结果尚未清空的瞬间。
+        await page.wait_for_timeout(2000)
+
+        primary_drawer = self._primary_drawer(page)
+        result_title = primary_drawer.locator(
+            "div.testContent_list_title_dayType"
+        ).first
+        missing_span = primary_drawer.locator(
+            "div.testContent > div:nth-child(2) > span:nth-child(1)"
+        )
+
+        await result_title.wait_for(state="visible", timeout=45000)
+
+        for read_attempt, retry_delay_ms in enumerate(
+            (0, 2000, 4000), start=1
+        ):
+            if retry_delay_ms:
+                logger.info(
+                    f"Worker-{worker_id} 自动检测统计文本仍在渲染，"
+                    f"等待 {retry_delay_ms // 1000} 秒后进行第 "
+                    f"{read_attempt}/3 次读取。"
+                )
+                await page.wait_for_timeout(retry_delay_ms)
+
+            await missing_span.wait_for(state="attached", timeout=30000)
+            missing_text = (await missing_span.inner_text()).strip()
+            if missing_text != "：表示缺失数据":
+                logger.info(
+                    f"Worker-{worker_id} 自动检测结果已稳定渲染 "
+                    f"[{missing_text}]，Worker可以领取下一任务。"
+                )
+                return
+
+        raise MissingDataRenderError(
+            f"Worker-{worker_id} 捕获数据补齐完成信号后，自动检测统计文本"
+            "连续 3 次仍为渲染占位符。"
+        )
+
+    async def _finish_after_completion_signal(
+        self,
+        page: Page,
+        worker_id: str,
+    ) -> bool:
+        """完成信号确认业务成功；自动检测稳定后才释放当前Worker。"""
+        logger.info(
+            f"Worker-{worker_id} 捕获到数据补齐完成信号，"
+            "等待网页自动检测完成。"
+        )
+        await self._wait_for_auto_detection_rendered(page, worker_id)
+        logger.info(
+            f"Worker-{worker_id} 数据补齐完成且页面已稳定，当前任务成功。"
+        )
+        return True
+
+    @staticmethod
+    async def _cancel_wait_task(task: asyncio.Task) -> None:
+        """取消竞争等待中已不再需要的任务，并回收其异常。"""
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # 另一个竞争信号已经决定流程，不让被取消分支覆盖主结果。
+            pass
+
+    async def _wait_for_next_heartbeat(
+        self,
+        page: Page,
+        worker_id: str,
+    ) -> bool:
+        """完整跟踪一个同步心跳；False表示应进入静默兜底。"""
+        toast_handle: Optional[ElementHandle] = None
+        try:
+            try:
+                toast_handle = await page.wait_for_selector(
+                    ".el-message__content:has-text('同步成功')",
+                    state="attached",
+                    timeout=self.silent_timeout_seconds * 1000,
+                )
+            except PlaywrightTimeoutError:
+                logger.info(
+                    f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} "
+                    "秒无新信号，开始终态复检。"
+                )
+                return False
+
+            if toast_handle is None:
+                return True
+
+            try:
+                await toast_handle.wait_for_element_state(
+                    "hidden",
+                    timeout=30000,
+                )
+            except PlaywrightTimeoutError:
+                logger.warning(
+                    f"Worker-{worker_id} 当前心跳弹窗节点超过 30 秒仍未隐藏，"
+                    "停止心跳监听并进入终态检查。"
+                )
+                return False
+            return True
+        finally:
+            if toast_handle is not None:
+                try:
+                    await toast_handle.dispose()
+                except Exception:
+                    # 页面关闭或崩溃时，释放句柄本身也可能失败。
+                    pass
+
     async def wait_for_completion_or_heartbeat(
         self,
         page: Page,
@@ -776,55 +893,74 @@ class BackfillEngine:
         end_date: str,
     ) -> bool:
         """
-        心跳静默只触发终态复检；最终以重新请求后端得到的缺失量判定成功。
+        完成弹窗是任务成功信号；普通心跳维持监听，静默时保留后端复检兜底。
         """
-        toast_selector = ".el-message__content:has-text('同步成功')"
-        silent_timeout_ms = self.silent_timeout_seconds * 1000 
-        
+        completion_selector = ".el-message__content:has-text('数据补齐完成')"
+        completion_handle: Optional[ElementHandle] = None
+
         logger.info(
-            f"Worker-{worker_id} 开始静默监听（超过 "
-            f"{self.silent_timeout_seconds} 秒无心跳则进入后端终态复检）..."
+            f"Worker-{worker_id} 开始监听同步心跳与数据补齐完成信号（超过 "
+            f"{self.silent_timeout_seconds} 秒无新信号则进入后端终态复检）..."
         )
-        
-        while True:
-            try:
-                # 保存当前这一个心跳节点。后续只跟踪它，不让新出现的同类提示替换等待目标。
-                toast_handle = await page.wait_for_selector(
-                    toast_selector,
-                    state="attached",
-                    timeout=silent_timeout_ms,
-                )
-            except PlaywrightTimeoutError:
-                logger.info(
-                    f"Worker-{worker_id} 超过 {self.silent_timeout_seconds} 秒无新心跳，"
-                    "开始终态复检。"
-                )
-                break
-            except Exception as e:
-                logger.error(f"Worker-{worker_id} 监听过程中发生未知异常: {e}")
-                raise
 
-            if toast_handle is None:
-                # attached 状态正常不会返回 None，仅作为接口返回值的防御性处理。
-                continue
+        # 完成监听贯穿整个心跳循环，避免它在普通心跳隐藏期间出现而被漏掉。
+        completion_task = asyncio.create_task(
+            page.wait_for_selector(
+                completion_selector,
+                state="attached",
+                timeout=0,
+            )
+        )
 
-            try:
-                # ElementHandle 固定指向当前节点；其他成功提示即使同时出现，也不会影响本次等待。
-                # hidden 同时兼容节点隐藏和从 DOM 中移除。
-                await toast_handle.wait_for_element_state("hidden", timeout=30000)
-            except PlaywrightTimeoutError:
-                logger.warning(f"Worker-{worker_id} 当前心跳弹窗节点超过 30 秒仍未隐藏，停止心跳监听并进入终态检查。")
-                break
-            except Exception as e:
-                logger.error(f"Worker-{worker_id} 等待心跳弹窗消失时发生异常: {e}")
-                raise
-            finally:
+        try:
+            while True:
+                heartbeat_task = asyncio.create_task(
+                    self._wait_for_next_heartbeat(page, worker_id)
+                )
+                done, _ = await asyncio.wait(
+                    {completion_task, heartbeat_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                # 两种提示几乎同时出现时，完成信号拥有更高优先级。
+                if completion_task in done:
+                    await self._cancel_wait_task(heartbeat_task)
+                    completion_handle = completion_task.result()
+                    return await self._finish_after_completion_signal(
+                        page,
+                        worker_id,
+                    )
+
+                if not heartbeat_task.result():
+                    # 给恰好处于超时边界的完成事件一次调度机会。
+                    await asyncio.sleep(0)
+                    if completion_task.done():
+                        completion_handle = completion_task.result()
+                        return await self._finish_after_completion_signal(
+                            page,
+                            worker_id,
+                        )
+                    break
+        except Exception as error:
+            logger.error(f"Worker-{worker_id} 监听过程中发生异常: {error}")
+            raise
+        finally:
+            if not completion_task.done():
+                await self._cancel_wait_task(completion_task)
+            elif completion_handle is None:
+                # 静默超时边界上完成信号可能刚好到达；流程虽走兜底，句柄仍需释放。
+                unused_handle = completion_task.result()
+                if unused_handle is not None:
+                    try:
+                        await unused_handle.dispose()
+                    except Exception:
+                        pass
+            if completion_handle is not None:
                 try:
-                    await toast_handle.dispose()
+                    await completion_handle.dispose()
                 except Exception:
-                    # 页面关闭或崩溃时，释放句柄本身也可能失败，不覆盖原始异常。
                     pass
-                
+
         logger.info(
             f"Worker-{worker_id} 心跳停止，恢复一级弹窗并重新请求后端确认缺失量。"
         )
@@ -1043,7 +1179,7 @@ class BackfillEngine:
 
                 task_submitted = True
                 
-                # 4. 心跳静默后重新请求后端检测，以真实缺失量决定账本结果。
+                # 4. 完成弹窗直接确认成功；若未捕获，则在心跳静默后保留后端复检兜底。
                 completed_normally = await self.wait_for_completion_or_heartbeat(
                     page,
                     worker_id,

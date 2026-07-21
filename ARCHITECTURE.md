@@ -133,7 +133,7 @@ flowchart TD
     C --> D["4. _run_task_round<br/>建立共享队列"]
     D --> E["5. worker<br/>循环领取任务与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
-    F --> G["7. wait_for_completion_or_heartbeat<br/>理解静默触发与后端终态复检"]
+    F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成信号、心跳与静默兜底"]
     G --> H["8. _monitor_and_gc_page<br/>理解商智页面旁路 GC"]
     H --> I["9. _monitor_worker_error_toasts<br/>理解红色提示回收"]
     I --> J["10. TaskLedger<br/>理解重试与最终汇总"]
@@ -145,7 +145,7 @@ flowchart TD
 | 调度 | `_run_task_round()` | 如何建立共享队列，如何筛选健康 Worker？ |
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
-| 状态判断 | `wait_for_completion_or_heartbeat()` | 达到 Worker 静默阈值后如何恢复页面并用后端缺失量确认终态？ |
+| 状态判断 | `wait_for_completion_or_heartbeat()` | 如何用完成弹窗提前确认成功，并保留静默复检兜底？ |
 | 页面 GC | `_monitor_and_gc_page()` | 商智页面为什么独立于 Worker，何时关闭？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
 | 持久化 | `TaskLedger` | 首轮失败项如何变成第二轮任务？ |
@@ -319,8 +319,10 @@ flowchart TD
     Recover --> Whole
     ClickOK -->|"最终失败"| SubmitFail["清理弹窗并返回 False"]
     ClickOK -->|"成功"| Submitted["task_submitted = True"]
-    Submitted --> Heartbeat["进入 Worker 心跳监听<br/>历史默认静默阈值 120 秒"]
-    Heartbeat --> FinalRestore["恢复一级弹窗<br/>重新注入当前日期"]
+    Submitted --> Heartbeat["并发监听同步成功与数据补齐完成<br/>历史默认静默阈值 120 秒"]
+    Heartbeat -->|"捕获数据补齐完成"| AutoDetect["等待2秒<br/>等待自动检测结果渲染稳定"]
+    AutoDetect --> Success
+    Heartbeat -->|"静默超时或心跳节点异常"| FinalRestore["恢复一级弹窗<br/>重新注入当前日期"]
     FinalRestore --> FinalDetect["再次点击启动检测<br/>读取后端缺失量"]
     FinalDetect -->|"无缺失"| Success
     FinalDetect -->|"仍有缺失或结果不确定"| Failed["返回 False"]
@@ -378,34 +380,33 @@ flowchart TD
 sequenceDiagram
     autonumber
     participant W as datatoolcenter Worker
-    participant Toast as 同步成功提示节点
+    participant Heartbeat as 同步成功提示节点
+    participant Complete as 数据补齐完成节点
     participant Primary as 一级任务弹窗
 
     W->>W: 提交全店补齐
-    loop 每一次同步成功事件
-        W->>Toast: wait_for_selector(attached, Worker 静默阈值)
-        alt 静默阈值内捕获到新节点
-            Toast-->>W: 返回固定 ElementHandle
-            W->>Toast: 等待这个具体节点 hidden，最多 30 秒
-            alt 节点按时隐藏
-                W->>W: 释放句柄并重新等待下一次心跳
-            else 节点 30 秒仍未隐藏
-                W->>W: 停止心跳循环并进入终态检查
-            end
-        else 达到静默阈值仍没有新节点
-            W->>W: 静默期结束，进入终态检查
+    W->>Complete: 建立贯穿整个循环的完成监听
+    loop 任务尚未完成
+        W->>Heartbeat: 等待新心跳，最多达到Worker静默阈值
+        alt 捕获数据补齐完成
+            Complete-->>W: 当前业务任务成功
+            W->>W: 固定等待2秒，让自动检测进入渲染流程
+            W->>Primary: 等待result_title可见
+            W->>Primary: 退避读取missing_text直到脱离占位文本
+            W-->>W: 页面稳定，返回True
+        else 捕获同步成功
+            Heartbeat-->>W: 固定当前ElementHandle
+            W->>Heartbeat: 等待当前节点hidden，期间仍监听完成信号
+        else 达到静默阈值仍无新信号
+            W->>Primary: 恢复一级状态并重新注入当前日期
+            W->>Primary: 点击启动检测，执行原后端复检兜底
         end
-    end
-    W->>Primary: 恢复一级状态并重新注入当前日期
-    W->>Primary: 点击启动检测，重新请求后端缺失量
-    alt 返回可信的无缺失结果
-        W-->>W: 后端复检通过，返回 True
-    else 仍有缺失或结果不确定
-        W-->>W: 后端复检未通过，返回 False
     end
 ```
 
-达到 Worker 静默阈值本身不等于成功，也不再用三级弹窗存在性作为成功证据。三级、二级弹窗只在 `_restore_primary_state()` 中负责清理页面层级；最终结果来自重新点击“启动检测”后的后端缺失量。历史模式默认阈值为 120 秒：
+“数据补齐完成”是已提交任务的权威成功信号，即使系统中存在无法采集的固定缺失数据，任务仍可正常完成。捕获该信号后不再解析缺失数量，而是等待网页自动检测稳定：固定缓冲2秒，等待 `div.testContent_list_title_dayType` 可见，再按0、2、4秒退避读取顶部统计，直到文本不再是 `：表示缺失数据`。随后返回成功，下一任务通过正常初始化流程关闭一级弹窗并回到任务大盘。
+
+如果没有捕获完成信号，达到 Worker 静默阈值本身仍不等于成功。此时保留原有兜底：恢复页面层级、重新注入日期并请求后端缺失量。历史模式默认阈值为120秒：
 
 - 统计文本不含数字，按现有页面协议表示无缺失：任务成功；
 - 缺失数量大于 0：任务失败并进入对应模式的重试流程；
@@ -613,7 +614,7 @@ flowchart TD
 
 ### 8. Worker 心跳模块
 
-`wait_for_completion_or_heartbeat()` 在数仓 Worker 页监听“同步成功”节点。达到 Worker 静默阈值后，脚本恢复一级弹窗、重新注入当前日期并再次点击启动检测；只有后端复检确认无缺失时才返回成功。历史模式默认 120 秒，也可通过 `.env` 调整。
+`wait_for_completion_or_heartbeat()` 在数仓 Worker 页并发监听“同步成功”和“数据补齐完成”。完成信号优先确认任务成功，脚本等待自动检测结果脱离渲染占位状态后立即释放Worker；没有完成信号时，达到静默阈值仍使用后端复检兜底。历史模式默认120秒，也可通过 `.env` 调整。
 
 ### 9. 业务执行页面 GC 模块
 
@@ -642,7 +643,7 @@ flowchart TD
 7. 把首轮任务全部放入共享任务池，由多个 Worker 动态领取；
 8. 每个 Worker 清理遗留弹窗，打开任务卡片并注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
-10. 提交后按 Worker 静默阈值监听心跳；静默后恢复一级弹窗并重新请求后端缺失量，只有复检无缺失才成功；
+10. 提交后并发监听心跳和数据补齐完成；完成信号出现后等待自动检测稳定并立即成功，未捕获时才在静默后执行原后端复检兜底；
 11. 业务执行页 GC 使用更长的独立静默阈值回收没有正常关闭的页面；
 12. 每个任务结束后立即把本次尝试结果追加到 JSONL；
 13. Worker 发生普通任务失败时继续领取，发生致命页面异常时退出任务池；

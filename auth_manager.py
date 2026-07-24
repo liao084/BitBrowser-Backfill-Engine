@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""daily-mode 登录态重建预检：统一清理后注入 pkl Cookie，并保留失败诊断页。"""
+"""daily-mode 登录预检：支持 pkl Cookie 重建和 1688 按钮登录。"""
 
 import logging
 import pickle
@@ -183,12 +183,68 @@ class CookieAuthManager:
             logger.warning(f"访问平台主页等待超时，将根据当前 URL 继续判断: {home_url}")
         await page.wait_for_timeout(2000)
 
+    async def _ensure_1688_login(
+        self,
+        context: BrowserContext,
+        platform: Dict[str, Any],
+    ) -> bool:
+        """沿用现有业务脚本的策略：有登录按钮就点击，没有则视为已登录。"""
+        platform_name = platform["name"]
+        home_url = platform["home_url"]
+        page = await context.new_page()
+        succeeded = False
+
+        try:
+            logger.info(f"开始检查 {platform_name} 登录状态: {home_url}")
+            await self._goto_home(page, home_url)
+            login_button = page.locator(
+                "xpath=//*[@id='login-form']/div[6]/button"
+            )
+
+            try:
+                await login_button.wait_for(state="visible", timeout=10000)
+            except PlaywrightTimeoutError:
+                logger.info(
+                    f"✓ {platform_name} 未出现登录按钮，当前登录状态正常，"
+                    f"最终 URL: {page.url}"
+                )
+                succeeded = True
+                return True
+
+            logger.info(f"{platform_name} 检测到登录按钮，正在点击登录。")
+            await login_button.click(timeout=10000)
+            await page.wait_for_timeout(4000)
+
+            success_locator = page.locator(
+                "xpath=//*[@id='app']/div/div[1]/div/div/div/div[1]/ul/li[10]/a/span"
+            )
+            await success_locator.wait_for(state="visible", timeout=10000)
+            logger.info(
+                f"✓ {platform_name} 按钮登录成功，最终 URL: {page.url}"
+            )
+            succeeded = True
+            return True
+        except Exception as error:
+            logger.error(
+                f"{platform_name} 按钮登录失败，保留当前页面供人工处理: {error}"
+            )
+            return False
+        finally:
+            if succeeded and not page.is_closed():
+                try:
+                    await page.close()
+                except Exception as error:
+                    logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
     async def ensure_platform(
         self,
         context: BrowserContext,
         platform: Dict[str, Any],
     ) -> bool:
-        """为一个平台注入 pkl Cookie 并验证；失败时保留页面供人工巡检。"""
+        """按平台认证模式执行登录预检；失败时保留页面供人工巡检。"""
+        if platform.get("auth_mode", "pkl_cookie") == "1688_button_login":
+            return await self._ensure_1688_login(context, platform)
+
         platform_name = platform["name"]
         home_url = platform["home_url"]
         page = await context.new_page()
@@ -263,12 +319,21 @@ class CookieAuthManager:
         context: BrowserContext,
         platforms: Sequence[Dict[str, Any]],
     ) -> AuthReport:
-        """清空旧登录态后，顺序重建全部平台的 pkl Cookie 登录态。"""
-        # Playwright 的 context.clear_cookies() 会清理整个 BrowserContext。
-        # 因此只能在预检开始时执行一次，后续平台的 Cookie 才能共同保留。
-        logger.info("登录预检开始：清理浏览器上下文全部旧 Cookie。")
-        await context.clear_cookies()
-        logger.info("旧 Cookie 已清理，将按 PLATFORMS 顺序注入并验证各平台 pkl Cookie。")
+        """根据认证模式准备登录态，再顺序检查全部平台。"""
+        needs_cookie_rebuild = any(
+            platform.get("auth_mode", "pkl_cookie") == "pkl_cookie"
+            for platform in platforms
+        )
+        if needs_cookie_rebuild:
+            # Playwright 的 context.clear_cookies() 会清理整个 BrowserContext。
+            # 因此只能在预检开始时执行一次，后续平台的 Cookie 才能共同保留。
+            logger.info("登录预检开始：清理浏览器上下文全部旧 Cookie。")
+            await context.clear_cookies()
+            logger.info(
+                "旧 Cookie 已清理，将按 PLATFORMS 顺序注入并验证各平台登录态。"
+            )
+        else:
+            logger.info("当前平台不使用 pkl Cookie 重建，保留浏览器现有 Cookie。")
 
         results: Dict[str, bool] = {}
         for platform in platforms:

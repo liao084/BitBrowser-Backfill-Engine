@@ -50,26 +50,18 @@ else:
 
 
 def find_launcher_config() -> Path:
-    """兼容源码本地调试和桌面 EXE 两种配置位置。"""
-    candidates = [
-        runtime_dir / CONFIG_FILENAME,
-        runtime_dir / "_release" / CONFIG_FILENAME,
-        Path.cwd() / CONFIG_FILENAME,
-        Path.cwd() / "_release" / CONFIG_FILENAME,
-        Path.home() / "Desktop" / "backfill" / "_release" / CONFIG_FILENAME,
-    ]
-    checked: set[Path] = set()
-    for candidate in candidates:
-        normalized = candidate.resolve()
-        if normalized in checked:
-            continue
-        checked.add(normalized)
-        if normalized.is_file():
-            return normalized
+    """从 Launcher 同目录下的 backfill/_release 读取正式配置。"""
+    config_path = (
+        runtime_dir
+        / "backfill"
+        / "_release"
+        / CONFIG_FILENAME
+    ).resolve()
+    if config_path.is_file():
+        return config_path
     raise FileNotFoundError(
-        "未找到 backfill_launcher_config.json。"
-        "源码调试时请放在 backfill_launcher.py 同目录；"
-        "正式运行时请放在桌面 backfill/_release 目录。"
+        f"未找到 {config_path}。请确认 Launcher 同目录存在 "
+        "backfill\\_release\\backfill_launcher_config.json。"
     )
 
 
@@ -80,16 +72,8 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("管理器配置根节点必须是 JSON 对象")
 
-    deployment_root_raw = str(config.get("deployment_root", "")).strip()
-    # 正式部署时以配置文件所在的 backfill/_release 目录为准，避免从
-    # Mac 测试环境复制来的 deployment_root 在 Windows 上创建错误目录。
-    if config_path.parent.name == "_release":
-        deployment_root = config_path.parent.parent
-    elif deployment_root_raw:
-        deployment_root = Path(deployment_root_raw).expanduser()
-    else:
-        deployment_root = config_path.parent / "backfill_instances"
-
+    # 配置固定存放在 backfill/_release，部署根目录就是 _release 的父目录。
+    deployment_root = config_path.parent.parent
     config["deployment_root"] = str(deployment_root.resolve())
     config.setdefault("engine_filename", "backfill_engine.exe")
     config.setdefault("customers", [])
@@ -702,10 +686,6 @@ class BackfillLauncherWindow(QMainWindow):
                 self._load_customer_choices()
                 return
 
-            if os.name != "nt":
-                raise RuntimeError(
-                    "当前不是 Windows，配置已经保存，但不能启动 Windows EXE。"
-                )
             if running:
                 raise RuntimeError("该客户的 backfill_engine.exe 已经在运行")
             if not target_engine.is_file():
@@ -738,6 +718,10 @@ def main() -> int:
     application = QApplication(sys.argv)
     application.setApplicationName("Backfill Launcher")
     application.setStyle("Fusion")
+
+    if os.name != "nt":
+        QMessageBox.critical(None, "启动失败", "Backfill Launcher 仅支持 Windows。")
+        return 1
 
     try:
         config_path = find_launcher_config()

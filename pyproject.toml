@@ -5,7 +5,9 @@ description = "Async Playwright engine for resilient BitBrowser backfill automat
 requires-python = ">=3.12"
 dependencies = [
     "playwright>=1.60.0",
+    "psutil>=7.2.2",
     "pyinstaller>=6.21.0",
+    "pyside6-essentials>=6.11.1",
     "python-dotenv>=1.1.1",
     "requests>=2.34.2",
 ]

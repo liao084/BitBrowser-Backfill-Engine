@@ -1,0 +1,58 @@
+{
+    "deployment_root": "",
+    "engine_filename": "backfill_engine.exe",
+    "customers": [
+        {
+            "name": "BitBrowser_示例客户",
+            "bite_id": "replace_with_bitbrowser_id",
+            "platforms": [
+                "京东商智"
+            ]
+        },
+        {
+            "name": "外部浏览器_示例任务",
+            "bite_id": "",
+            "platforms": [
+                "1688生意参谋"
+            ]
+        }
+    ],
+    "platforms": [
+        {
+            "name": "京东商智",
+            "markers": [
+                "ppzh.jd.com"
+            ]
+        },
+        {
+            "name": "抖音罗盘经营",
+            "markers": [
+                "compass.jinritemai.com"
+            ]
+        },
+        {
+            "name": "抖音电商罗盘",
+            "markers": [
+                "compassbrand"
+            ]
+        },
+        {
+            "name": "淘宝生意参谋",
+            "markers": [
+                "sycm.taobao.com"
+            ]
+        },
+        {
+            "name": "1688生意参谋",
+            "markers": [
+                "sycm.1688.com"
+            ]
+        }
+    ],
+    "defaults": {
+        "cdp_address": "127.0.0.1:9222",
+        "worker_heartbeat_seconds": 120,
+        "business_heartbeat_seconds": 180,
+        "task_start": "2025-01-01"
+    }
+}

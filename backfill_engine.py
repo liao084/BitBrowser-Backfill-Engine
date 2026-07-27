@@ -768,12 +768,12 @@ class BackfillEngine:
         )
         return None
 
-    async def _wait_for_auto_detection_rendered(
+    async def _read_auto_detection_result(
         self,
         page: Page,
         worker_id: str,
-    ) -> None:
-        """完成信号出现后，等待网页自动检测的结果文字完成渲染。"""
+    ) -> Optional[bool]:
+        """读取自动检测结果；True=仍有缺失，False=无缺失，None=结果不可信。"""
         # 完成弹窗会立即触发自动检测；短暂缓冲用于避开上一轮结果尚未清空的瞬间。
         await page.wait_for_timeout(2000)
 
@@ -801,32 +801,66 @@ class BackfillEngine:
             await missing_span.wait_for(state="attached", timeout=30000)
             missing_text = (await missing_span.inner_text()).strip()
             if missing_text != "：表示缺失数据":
-                logger.info(
-                    f"Worker-{worker_id} 自动检测结果已稳定渲染 "
-                    f"[{missing_text}]，Worker可以领取下一任务。"
-                )
-                return
+                break
+        else:
+            raise MissingDataRenderError(
+                f"Worker-{worker_id} 捕获数据补齐完成信号后，自动检测统计文本"
+                "连续 3 次仍为渲染占位符。"
+            )
 
-        raise MissingDataRenderError(
-            f"Worker-{worker_id} 捕获数据补齐完成信号后，自动检测统计文本"
-            "连续 3 次仍为渲染占位符。"
+        match = re.search(r"-?\d+", missing_text)
+        if not match:
+            logger.info(
+                f"Worker-{worker_id} 自动检测统计文本 [{missing_text}] 不含数字，"
+                "确认当前日期无缺失数据。"
+            )
+            return False
+
+        missing_count = int(match.group())
+        if missing_count > 0:
+            logger.warning(
+                f"Worker-{worker_id} 自动检测统计文本 [{missing_text}]，"
+                f"确认仍有 {missing_count} 条缺失数据。"
+            )
+            return True
+
+        logger.warning(
+            f"Worker-{worker_id} 自动检测统计文本 [{missing_text}] 显示 0 或负数，"
+            "无法作为可信的成功依据。"
         )
+        return None
 
     async def _finish_after_completion_signal(
         self,
         page: Page,
         worker_id: str,
     ) -> bool:
-        """完成信号确认业务成功；自动检测稳定后才释放当前Worker。"""
+        """完成信号只表示队列遍历结束，最终结果以自动检测缺失量为准。"""
         logger.info(
             f"Worker-{worker_id} 捕获到数据补齐完成信号，"
             "等待网页自动检测完成。"
         )
-        await self._wait_for_auto_detection_rendered(page, worker_id)
-        logger.info(
-            f"Worker-{worker_id} 数据补齐完成且页面已稳定，当前任务成功。"
+        auto_missing = await self._read_auto_detection_result(
+            page,
+            worker_id,
         )
-        return True
+        if auto_missing is False:
+            logger.info(
+                f"Worker-{worker_id} 自动检测确认无缺失数据，当前任务成功。"
+            )
+            return True
+        if auto_missing is True:
+            logger.warning(
+                f"Worker-{worker_id} 队列已遍历完成，但自动检测仍有缺失数据，"
+                "当前任务失败并交由调度器决定是否重试。"
+            )
+            return False
+
+        logger.warning(
+            f"Worker-{worker_id} 队列已遍历完成，但自动检测结果不可信，"
+            "当前任务不写入成功结果。"
+        )
+        return False
 
     @staticmethod
     async def _cancel_wait_task(task: asyncio.Task) -> None:
@@ -893,7 +927,7 @@ class BackfillEngine:
         end_date: str,
     ) -> bool:
         """
-        完成弹窗是任务成功信号；普通心跳维持监听，静默时保留后端复检兜底。
+        完成弹窗触发自动检测结果核验；普通心跳维持监听，静默时保留后端复检兜底。
         """
         completion_selector = ".el-message__content:has-text('数据补齐完成')"
         completion_handle: Optional[ElementHandle] = None
@@ -1179,7 +1213,7 @@ class BackfillEngine:
 
                 task_submitted = True
                 
-                # 4. 完成弹窗直接确认成功；若未捕获，则在心跳静默后保留后端复检兜底。
+                # 4. 完成弹窗触发自动检测核验；若未捕获，则在心跳静默后执行后端复检。
                 completed_normally = await self.wait_for_completion_or_heartbeat(
                     page,
                     worker_id,

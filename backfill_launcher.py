@@ -81,10 +81,12 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
         raise ValueError("管理器配置根节点必须是 JSON 对象")
 
     deployment_root_raw = str(config.get("deployment_root", "")).strip()
-    if deployment_root_raw:
-        deployment_root = Path(deployment_root_raw).expanduser()
-    elif config_path.parent.name == "_release":
+    # 正式部署时以配置文件所在的 backfill/_release 目录为准，避免从
+    # Mac 测试环境复制来的 deployment_root 在 Windows 上创建错误目录。
+    if config_path.parent.name == "_release":
         deployment_root = config_path.parent.parent
+    elif deployment_root_raw:
+        deployment_root = Path(deployment_root_raw).expanduser()
     else:
         deployment_root = config_path.parent / "backfill_instances"
 
@@ -692,7 +694,9 @@ class BackfillLauncherWindow(QMainWindow):
                 elif engine_updated:
                     detail = "配置已保存，并已同步 _release 中的最新 EXE。"
                 else:
-                    detail = "配置已保存；_release 中暂无 EXE，未执行复制。"
+                    detail = (
+                        f"配置已保存；未找到 {source_engine}，未执行 EXE 复制。"
+                    )
                 self.status_label.setText(detail)
                 QMessageBox.information(self, "保存成功", f"{detail}\n\n{env_path}")
                 self._load_customer_choices()

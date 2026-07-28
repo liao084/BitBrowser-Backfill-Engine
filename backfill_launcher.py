@@ -72,8 +72,8 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("管理器配置根节点必须是 JSON 对象")
 
-    # 配置固定存放在 backfill/_release，部署根目录就是 _release 的父目录。
-    deployment_root = config_path.parent.parent
+    # Launcher 位于桌面，所有客户实例统一部署到同目录下的 backfill。
+    deployment_root = runtime_dir / "backfill"
     config["deployment_root"] = str(deployment_root.resolve())
     config.setdefault("engine_filename", "backfill_engine.exe")
     config.setdefault("customers", [])
@@ -388,13 +388,8 @@ class BackfillLauncherWindow(QMainWindow):
             int(defaults.get("business_heartbeat_seconds", 180))
         )
 
-        start_date = QDate.fromString(
-            str(defaults.get("task_start", "2025-01-01")),
-            "yyyy-MM-dd",
-        )
-        self.start_date_edit.setDate(
-            start_date if start_date.isValid() else QDate.currentDate().addYears(-1)
-        )
+        # 新建任务默认补采最新完整日期；加载已有任务时会由任务值覆盖。
+        self.start_date_edit.setDate(QDate.currentDate().addDays(-1))
         self._update_latest_date(True)
         self._update_browser_fields()
         self._apply_selected_customer_defaults()

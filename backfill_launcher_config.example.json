@@ -51,7 +51,6 @@
     "defaults": {
         "cdp_address": "127.0.0.1:9222",
         "worker_heartbeat_seconds": 120,
-        "business_heartbeat_seconds": 180,
-        "task_start": "2025-01-01"
+        "business_heartbeat_seconds": 180
     }
 }

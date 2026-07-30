@@ -1,0 +1,79 @@
+name: Build Machine 7 Scripts Test
+
+on:
+  workflow_dispatch:
+
+  push:
+    branches:
+      - ci/machine-7-scripts
+    paths:
+      - "7号机脚本/*.py"
+      - ".github/workflows/build-machine-7-scripts-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v8.3.2
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install build dependencies
+        shell: pwsh
+        run: |
+          uv venv
+          uv pip install pyinstaller requests selenium
+
+      - name: Check all scripts
+        shell: pwsh
+        run: |
+          $scripts = Get-ChildItem "7号机脚本" -Filter *.py
+          if ($scripts.Count -eq 0) {
+            throw "7号机脚本目录中没有找到 Python 文件"
+          }
+          foreach ($script in $scripts) {
+            uv run --no-sync python -m py_compile $script.FullName
+            if ($LASTEXITCODE -ne 0) {
+              throw "语法检查失败: $($script.Name)"
+            }
+          }
+
+      - name: Build every script as a standalone EXE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $outputDir = "package\7号机脚本"
+          New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+
+          Get-ChildItem "7号机脚本" -Filter *.py | ForEach-Object {
+            $name = $_.BaseName
+            uv run --no-sync pyinstaller `
+              --clean `
+              --onefile `
+              --console `
+              --name $name `
+              $_.FullName
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "打包失败: $($_.Name)"
+            }
+
+            Copy-Item "dist\$name.exe" $outputDir
+          }
+
+      - name: Upload Machine 7 package
+        uses: actions/upload-artifact@v7
+        with:
+          name: 7号机脚本
+          path: package/7号机脚本/
+          if-no-files-found: error
+          retention-days: 30

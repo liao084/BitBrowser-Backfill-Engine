@@ -60,6 +60,7 @@ jobs:
               --clean `
               --onefile `
               --console `
+              --collect-all selenium `
               --name $name `
               $_.FullName
 

@@ -56,7 +56,7 @@ class DouyinJDTaskRunnerEnhanced:
         self.pdd_passport_url = 'https://passport.pinduoduo.com/'  # 拼多多认证域名
         self.haozke_home_url = 'https://wp-admin.haozke.com/'  # 鲸钻客
         self.reduyun_home_url = 'https://seller.sviptrader.com/home/index?islogin=1'  # 热度云
-        self.task_url = 'https://datatoolcenter.com/web/dateCenter.html?activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0'
+        self.task_url = 'https://datatoolcenter.com/web/testone1.html?activeName=free_analysis_brand&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0&currentMenuIndex=0'
 
     def open_browser(self):
         """打开比特浏览器"""

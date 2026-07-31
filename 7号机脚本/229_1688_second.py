@@ -183,7 +183,7 @@ class Bite():
 
         '''打开三个相同的页面(可设置)'''
         for _ in range(3):
-            driver.execute_script("window.open('https://datatoolcenter.com/web/dateCenter.html?activeName=free_analysis_overview&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0&currentMenuIndex=206&dateType=day&runAsUserId=%E5%85%A8%E9%83%A8%E5%BA%97%E9%93%BA')")
+            driver.execute_script("window.open('https://datatoolcenter.com/web/testone1.html?activeName=free_analysis_brand&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0&currentMenuIndex=0')")
 
         # 获取所有窗口句柄
         windows = driver.window_handles

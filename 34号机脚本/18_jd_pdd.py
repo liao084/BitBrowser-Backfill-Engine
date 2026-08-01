@@ -36,7 +36,7 @@ class DouyinJDTaskRunnerEnhanced:
         self.platforms = ['京东','拼多多']
         
         # 任务配置：数仓任务索引
-        self.task_indices = [5276, 5288, 5298]
+        self.task_indices = [5276, 5288, 5298, 5792]
 
         # ====================================================
 

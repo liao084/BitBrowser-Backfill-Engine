@@ -925,3 +925,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+# https://datatoolcenter.com/web/dateCenter.html?activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0&currentMenuIndex=0
+# https://datatoolcenter.com/web/dateCenter.html?activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0&currentMenuIndex=0

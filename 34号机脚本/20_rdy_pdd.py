@@ -36,7 +36,7 @@ class DouyinJDTaskRunnerEnhanced:
         self.platforms = ['热度云','拼多多']
         
         # 任务配置：数仓任务索引
-        self.task_indices = [5243, 5279]
+        self.task_indices = [5243, 5279, 5793]
 
         # ====================================================
 

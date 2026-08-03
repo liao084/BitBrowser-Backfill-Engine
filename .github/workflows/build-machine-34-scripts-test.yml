@@ -7,7 +7,7 @@ on:
     branches:
       - ci/machine-34-scripts
     paths:
-      - "34号机脚本/*.py"
+      - "34号机_线上环境_qtmm1/*.py"
       - ".github/workflows/build-machine-34-scripts-test.yml"
 
 permissions:
@@ -36,9 +36,9 @@ jobs:
       - name: Check all scripts
         shell: pwsh
         run: |
-          $scripts = Get-ChildItem "34号机脚本" -Filter *.py
+          $scripts = Get-ChildItem "34号机_线上环境_qtmm1" -Filter *.py
           if ($scripts.Count -eq 0) {
-            throw "34号机脚本目录中没有找到 Python 文件"
+            throw "34号机_线上环境_qtmm1 目录中没有找到 Python 文件"
           }
           foreach ($script in $scripts) {
             uv run --no-sync python -m py_compile $script.FullName
@@ -54,7 +54,7 @@ jobs:
           $outputDir = "package\34号机脚本"
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 
-          Get-ChildItem "34号机脚本" -Filter *.py | ForEach-Object {
+          Get-ChildItem "34号机_线上环境_qtmm1" -Filter *.py | ForEach-Object {
             $name = $_.BaseName
             uv run --no-sync pyinstaller `
               --clean `

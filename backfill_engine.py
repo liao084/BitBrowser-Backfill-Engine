@@ -644,6 +644,28 @@ class BackfillEngine:
             self._primary_drawer(page), "一级任务弹窗", worker_id
         )
 
+    async def _open_task_card_by_id(
+        self,
+        page: Page,
+        task_card_id: int,
+    ) -> None:
+        """按数仓任务 ID 查询并打开唯一匹配的任务卡片。"""
+        id_input = page.locator("input.el-input__inner").nth(0)
+        search_button = page.locator(
+            "button.el-button.el-button--default"
+        ).nth(5)
+        result_card = page.locator(
+            "div.workTool_page_card_test_dataCard"
+        ).nth(0)
+        expected_id_marker = result_card.locator(
+            f'span.timeInfo[title="任务ID：{task_card_id}"]'
+        )
+
+        await id_input.fill(str(task_card_id))
+        await search_button.click(timeout=30000)
+        await expected_id_marker.wait_for(state="visible", timeout=45000)
+        await result_card.click(timeout=30000)
+
     async def inject_dates(self, page: Page, start_date: str, end_date: str, worker_id: str):
         """
         日期注入逻辑：通过模拟真实的物理键盘事件，确保触发 Vue 框架的数据双向绑定。
@@ -1064,7 +1086,7 @@ class BackfillEngine:
         list_index: int,
     ) -> bool:
         """执行一个独立日期区块；普通失败返回 False，致命页面异常向外抛出。"""
-        task_card_index = task["card"]
+        task_card_id = task["card"]
         date_chunks = [(task["start"], task["end"])]
         worker_id = f"页面-{list_index + 1}"
         logger.info(
@@ -1078,10 +1100,11 @@ class BackfillEngine:
             # 1. 按层级清理可能遗留的三级、二级和一级弹窗。
             await self._close_all_task_layers(page, worker_id)
                 
-            # 2. 点击进入“补采专属任务卡片”
-            nth_index = task_card_index - 1
-            backfill_card_selector = f"div.workTool_page_card_test_dataCard >> nth={nth_index}"
-            await page.click(backfill_card_selector)
+            # 2. 按任务 ID 查询并进入唯一匹配的任务卡片。
+            await self._open_task_card_by_id(
+                page,
+                task_card_id,
+            )
             
             # 等待包含启动按钮的一级弹窗真正展开。
             primary_drawer = self._primary_drawer(page)

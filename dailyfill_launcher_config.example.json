@@ -1,0 +1,102 @@
+{
+    "engine_filename": "daily_engine.exe",
+    "customers": [
+        {
+            "name": "235_示例客户",
+            "bite_id": "replace_with_bitbrowser_id_235",
+            "platforms": [
+                "京东品牌主页（商智）"
+            ],
+            "worker_count": 1,
+            "max_attempts": 5,
+            "target_date_offset_days": 1
+        },
+        {
+            "name": "218_示例客户",
+            "bite_id": "replace_with_bitbrowser_id_218",
+            "platforms": [
+                "抖音电商罗盘",
+                "京东品牌主页（商智）"
+            ],
+            "worker_count": 4,
+            "max_attempts": 5,
+            "target_date_offset_days": 1
+        }
+    ],
+    "platforms": [
+        {
+            "name": "京东品牌主页（商智）",
+            "markers": [
+                "ppzh.jd.com"
+            ],
+            "home_url": "https://ppzh.jd.com/brand/homePage/index.html",
+            "login_url_markers": [
+                "login"
+            ],
+            "cookie_key": "京东品牌主页",
+            "file_prefix": "jd_cookies",
+            "cookie_enabled": true
+        },
+        {
+            "name": "抖音罗盘经营",
+            "markers": [
+                "compass.jinritemai.com"
+            ],
+            "home_url": "https://compass.jinritemai.com/shop",
+            "login_url_markers": [
+                "/login"
+            ],
+            "cookie_key": "抖音罗盘经营",
+            "file_prefix": "douyin_shop_cookies",
+            "cookie_enabled": true
+        },
+        {
+            "name": "抖音电商罗盘",
+            "markers": [
+                "compassbrand"
+            ],
+            "home_url": "https://compassbrand.jinritemai.com/",
+            "login_url_markers": [
+                "/login"
+            ],
+            "cookie_key": "抖音电商罗盘",
+            "file_prefix": "douyin_cookies",
+            "cookie_enabled": true
+        },
+        {
+            "name": "淘宝生意参谋",
+            "markers": [
+                "sycm.taobao.com"
+            ],
+            "home_url": "https://sycm.taobao.com/portal/home.htm",
+            "login_url_markers": [
+                "custom/login.htm"
+            ],
+            "cookie_key": "淘宝生意参谋",
+            "file_prefix": "sycm_cookies",
+            "cookie_enabled": true
+        },
+        {
+            "name": "1688生意参谋",
+            "markers": [
+                "sycm.1688.com"
+            ],
+            "home_url": "https://sycm.1688.com/ms/rival/downStream",
+            "login_url_markers": [
+                "login"
+            ],
+            "auth_mode": "1688_button_login",
+            "cookie_enabled": false
+        }
+    ],
+    "defaults": {
+        "worker_heartbeat_seconds": 120,
+        "business_heartbeat_seconds": 180,
+        "worker_count": 1,
+        "max_attempts": 5,
+        "target_date_offset_days": 1,
+        "keep_browser_after_run": true,
+        "cookie_dir": "C:/Users/Administrator/Desktop/COOKIE",
+        "task_url": "https://datatoolcenter.com/web/dateCenter.html?activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
+    }
+}

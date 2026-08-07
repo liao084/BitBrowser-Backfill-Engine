@@ -142,13 +142,15 @@ def load_daily_runtime_config(
         raise ValueError("DAILY_TASKS 必须是非空的 JSON 对象数组")
     for index, task in enumerate(daily_tasks_raw, start=1):
         try:
-            card = int(task.get("card", task.get("task_card_index")))
+            card_id = int(task.get("card_id"))
         except (TypeError, ValueError) as error:
             raise ValueError(
-                f"DAILY_TASKS 第 {index} 项缺少有效的 card"
+                f"DAILY_TASKS 第 {index} 项缺少有效的 card_id"
             ) from error
-        if card <= 0:
-            raise ValueError(f"DAILY_TASKS 第 {index} 项的 card 必须大于 0")
+        if card_id <= 0:
+            raise ValueError(
+                f"DAILY_TASKS 第 {index} 项的 card_id 必须大于 0"
+            )
         if task.get("date"):
             _validate_date(str(task["date"]), f"DAILY_TASKS[{index}].date")
 
@@ -242,9 +244,9 @@ class DailyEngine(BackfillEngine):
         tasks: List[Dict[str, Any]] = []
         seen_task_ids = set()
         for config in tasks_config:
-            card = int(config.get("card", config.get("task_card_index", 1)))
+            card_id = int(config["card_id"])
             task_date = str(config.get("date", target_date))
-            task_id = f"card-{card}_{task_date}"
+            task_id = f"card-{card_id}_{task_date}"
             if task_id in seen_task_ids:
                 logger.warning(f"检测到重复每日任务 {task_id}，已跳过。")
                 continue
@@ -252,7 +254,9 @@ class DailyEngine(BackfillEngine):
             tasks.append(
                 {
                     "task_id": task_id,
-                    "card": card,
+                    # BackfillEngine.execute_task 当前以 card 作为内部任务字段，
+                    # 这里承载的已经是数仓唯一任务 ID，而不是页面顺序。
+                    "card": card_id,
                     "start": task_date,
                     "end": task_date,
                     "attempt": 1,

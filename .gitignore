@@ -13,6 +13,7 @@
 !.env.example
 !notify_agent.env.example
 !backfill_launcher_config.example.json
+!dailyfill_launcher_config.example.json
 !pyproject.toml
 !uv.lock
 !.python-version

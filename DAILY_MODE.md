@@ -25,16 +25,20 @@ Daily-mode 使用以下字段：
 | `WORKER_COUNT` | Worker 页面数量上限；实际数量不会超过任务数 |
 | `MAX_ATTEMPTS` | 每个单日任务最多执行次数，包含首次执行 |
 | `KEEP_BROWSER_AFTER_RUN` | 全部任务成功时是否保留比特浏览器；默认 `true`。失败或未进入有效任务阶段时始终保留现场 |
-| `TARGET_DATE_OFFSET_DAYS` | 默认目标日期相对今天向前偏移的天数 |
+| `TARGET_DATE_OFFSET_DAYS` | 旧配置和未填写单任务偏移时使用的默认日期偏移 |
 | `TARGET_DATE` | 可选的统一指定日期；留空时使用日期偏移 |
 | `COOKIE_DIR` | pkl Cookie 文件目录 |
 | `TASK_URL` | datatoolcenter 工作台地址；省略时使用源码默认值 |
-| `DAILY_TASKS` | 每日任务卡片 JSON 数组；单项可用 `date` 覆盖统一日期 |
+| `DAILY_TASKS` | 每日任务卡片 JSON 数组；单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |
 | `PLATFORMS` | 本客户所有可能触发业务执行页的平台 JSON 数组；程序会按顺序重建每个平台的 pkl Cookie 登录态 |
 | `CUSTOMER_NAME` | 仅供 `daily_notify_agent.py` 在飞书中显示客户名称；daily_engine 不读取 |
 | `REPORT_READY_TIME` | 仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总；daily_engine 不读取 |
 
 JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`。建议将 `.env` 保存为 UTF-8。
+
+任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
+`target_date_offset_days`、全局 `TARGET_DATE_OFFSET_DAYS`。因此旧 `.env`
+可以继续运行，新 Launcher 保存后则会为每个任务写入各自的日期偏移。
 
 ## 运行结果
 
@@ -63,3 +67,24 @@ uv run pyinstaller --onefile --noconsole --name daily_engine daily_engine.py
 不需要提前准备 `.spec`。上述命令会在当前 Windows 构建目录生成 `daily_engine.spec`，并把最终程序写入 `dist\daily_engine.exe`。当前命令已经能够稳定打包时，可以继续让本地或 CI 每次按相同参数生成 spec；只有需要复杂打包配置时再把 spec 纳入版本控制。
 
 `.env` 是部署时的外部文件，不要使用 PyInstaller 打进 EXE。
+
+## Dailyfill Launcher 部署
+
+Launcher 使用与 Backfill Launcher 相同的桌面部署布局：
+
+```text
+Desktop\
+├─ dailyfill_launcher.exe
+└─ dailyfill\
+   ├─ _release\
+   │  ├─ daily_engine.exe
+   │  └─ dailyfill_launcher_config.json
+   └─ 客户名\
+      ├─ daily_engine.exe
+      └─ .env
+```
+
+`dailyfill_launcher.exe` 固定读取同目录下
+`dailyfill\_release\dailyfill_launcher_config.json`。保存客户配置时，会在
+`dailyfill\客户名` 创建 `.env`，并从 `_release` 复制最新版
+`daily_engine.exe`。`_release` 只保存通用发布文件，不存放客户实例。

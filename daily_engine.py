@@ -153,6 +153,19 @@ def load_daily_runtime_config(
             )
         if task.get("date"):
             _validate_date(str(task["date"]), f"DAILY_TASKS[{index}].date")
+        if task.get("target_date_offset_days") is not None:
+            try:
+                task_offset = int(task["target_date_offset_days"])
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "DAILY_TASKS 第 "
+                    f"{index} 项的 target_date_offset_days 必须是整数"
+                ) from error
+            if task_offset < 0:
+                raise ValueError(
+                    "DAILY_TASKS 第 "
+                    f"{index} 项的 target_date_offset_days 不能小于 0"
+                )
 
     platforms_raw = _load_json_list_env("PLATFORMS")
     if not platforms_raw or not all(
@@ -236,16 +249,24 @@ class DailyEngine(BackfillEngine):
         target_date: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """每张卡片只生成一个单日任务；重复卡片配置自动去重。"""
-        if target_date is None:
-            target_date = (
-                date.today() - timedelta(days=self.target_date_offset_days)
-            ).strftime("%Y-%m-%d")
-
         tasks: List[Dict[str, Any]] = []
         seen_task_ids = set()
         for config in tasks_config:
             card_id = int(config["card_id"])
-            task_date = str(config.get("date", target_date))
+            if config.get("date"):
+                task_date = str(config["date"])
+            elif target_date is not None:
+                task_date = target_date
+            else:
+                task_offset = int(
+                    config.get(
+                        "target_date_offset_days",
+                        self.target_date_offset_days,
+                    )
+                )
+                task_date = (
+                    date.today() - timedelta(days=task_offset)
+                ).strftime("%Y-%m-%d")
             task_id = f"card-{card_id}_{task_date}"
             if task_id in seen_task_ids:
                 logger.warning(f"检测到重复每日任务 {task_id}，已跳过。")
@@ -263,9 +284,10 @@ class DailyEngine(BackfillEngine):
                 }
             )
 
+        task_dates = sorted({task["start"] for task in tasks})
         logger.info(
-            f"✓ 每日任务池构建完成：目标日期 {target_date}，"
-            f"共 {len(tasks)} 个唯一任务。"
+            "✓ 每日任务池构建完成：目标日期 "
+            f"{', '.join(task_dates)}，共 {len(tasks)} 个唯一任务。"
         )
         return tasks
 

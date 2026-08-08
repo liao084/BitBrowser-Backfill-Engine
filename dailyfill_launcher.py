@@ -49,20 +49,19 @@ else:
 
 
 def find_launcher_config() -> Path:
-    """源码测试读取同目录配置；打包后读取 dailyfill/_release 配置。"""
-    candidates = [runtime_dir / CONFIG_FILENAME]
-    if getattr(sys, "frozen", False):
-        candidates.insert(
-            0,
-            runtime_dir / "dailyfill" / "_release" / CONFIG_FILENAME,
-        )
-
-    for path in candidates:
-        if path.is_file():
-            return path.resolve()
-
-    searched = "\n".join(str(path.resolve()) for path in candidates)
-    raise FileNotFoundError(f"未找到 Dailyfill Launcher 配置：\n{searched}")
+    """从 Launcher 同目录下的 dailyfill/_release 读取正式配置。"""
+    config_path = (
+        runtime_dir
+        / "dailyfill"
+        / "_release"
+        / CONFIG_FILENAME
+    ).resolve()
+    if config_path.is_file():
+        return config_path
+    raise FileNotFoundError(
+        f"未找到 {config_path}。请确认 Launcher 同目录存在 "
+        "dailyfill\\_release\\dailyfill_launcher_config.json。"
+    )
 
 
 def load_launcher_config(config_path: Path) -> dict[str, Any]:
@@ -72,16 +71,8 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("管理器配置根节点必须是 JSON 对象")
 
-    if getattr(sys, "frozen", False):
-        deployment_root = runtime_dir / "dailyfill"
-    else:
-        configured_root = str(config.get("deployment_root", "")).strip()
-        deployment_root = (
-            Path(configured_root)
-            if configured_root
-            else runtime_dir.parent / "dailyfill_launcher_test"
-        )
-
+    # Launcher 位于桌面，客户实例统一部署到同目录下的 dailyfill。
+    deployment_root = runtime_dir / "dailyfill"
     config["deployment_root"] = str(deployment_root.resolve())
     config.setdefault("engine_filename", "daily_engine.exe")
     config.setdefault("customers", [])
@@ -185,6 +176,7 @@ class DailyfillLauncherWindow(QMainWindow):
         self.platform_checks: dict[str, QCheckBox] = {}
         self.cookie_dir = ""
         self.task_url = ""
+        self.default_target_offset_days = 1
 
         self.setWindowTitle("Dailyfill 客户实例管理器")
         self.resize(600, 720)
@@ -240,6 +232,8 @@ class DailyfillLauncherWindow(QMainWindow):
         self.business_heartbeat_spin.setRange(1, 86400)
         self.business_heartbeat_spin.setSuffix(" 秒")
 
+        new_button = QPushButton("新建客户")
+        new_button.clicked.connect(self.start_new_customer)
         load_button = QPushButton("加载已有 .env")
         load_button.clicked.connect(self.load_customer_env)
         folder_button = QPushButton("打开客户目录")
@@ -247,8 +241,9 @@ class DailyfillLauncherWindow(QMainWindow):
 
         layout.addWidget(QLabel("客户"), 0, 0)
         layout.addWidget(self.customer_combo, 0, 1, 1, 3)
-        layout.addWidget(load_button, 1, 1)
-        layout.addWidget(folder_button, 1, 2, 1, 2)
+        layout.addWidget(new_button, 1, 1)
+        layout.addWidget(load_button, 1, 2)
+        layout.addWidget(folder_button, 1, 3)
         layout.addWidget(QLabel("BITE_ID"), 2, 0)
         layout.addWidget(self.bite_id_edit, 2, 1, 1, 3)
         layout.addWidget(QLabel("Worker 心跳静默"), 3, 0)
@@ -290,9 +285,6 @@ class DailyfillLauncherWindow(QMainWindow):
         self.target_offset_spin = QSpinBox()
         self.target_offset_spin.setRange(0, 365)
         self.target_offset_spin.setSuffix(" 天")
-        self.target_offset_spin.valueChanged.connect(
-            self._refresh_task_offsets
-        )
         self.keep_browser_check = QCheckBox("任务完成后保留浏览器")
 
         add_button = QPushButton("新增任务 ID")
@@ -364,15 +356,23 @@ class DailyfillLauncherWindow(QMainWindow):
         return layout
 
     def _load_customer_choices(self) -> None:
+        current_name = self.customer_combo.currentText().strip()
         names = set(self.customers)
         if self.deployment_root.is_dir():
             for child in self.deployment_root.iterdir():
                 if child.is_dir() and child.name != "_release":
                     names.add(child.name)
-        self.customer_combo.clear()
-        self.customer_combo.addItems(sorted(names))
 
-    def _apply_defaults(self) -> None:
+        self.customer_combo.blockSignals(True)
+        try:
+            self.customer_combo.clear()
+            self.customer_combo.addItems(sorted(names))
+            if current_name:
+                self.customer_combo.setCurrentText(current_name)
+        finally:
+            self.customer_combo.blockSignals(False)
+
+    def _apply_defaults(self, *, apply_customer: bool = True) -> None:
         defaults = self.config["defaults"]
         self.worker_heartbeat_spin.setValue(
             int(defaults.get("worker_heartbeat_seconds", 120))
@@ -382,9 +382,10 @@ class DailyfillLauncherWindow(QMainWindow):
         )
         self.worker_count_spin.setValue(int(defaults.get("worker_count", 1)))
         self.max_attempts_spin.setValue(int(defaults.get("max_attempts", 5)))
-        self.target_offset_spin.setValue(
-            int(defaults.get("target_date_offset_days", 1))
+        self.default_target_offset_days = int(
+            defaults.get("target_date_offset_days", 1)
         )
+        self.target_offset_spin.setValue(self.default_target_offset_days)
         self.keep_browser_check.setChecked(
             bool(defaults.get("keep_browser_after_run", True))
         )
@@ -392,7 +393,8 @@ class DailyfillLauncherWindow(QMainWindow):
             defaults.get("cookie_dir", "C:/Users/Administrator/Desktop/COOKIE")
         )
         self.task_url = str(defaults.get("task_url", ""))
-        self._apply_selected_customer_defaults()
+        if apply_customer:
+            self._apply_selected_customer_defaults()
 
     def _apply_selected_customer_defaults(self) -> None:
         customer = self.customers.get(self.customer_combo.currentText().strip())
@@ -409,15 +411,43 @@ class DailyfillLauncherWindow(QMainWindow):
         if "max_attempts" in customer:
             self.max_attempts_spin.setValue(int(customer["max_attempts"]))
         if "target_date_offset_days" in customer:
-            self.target_offset_spin.setValue(
-                int(customer["target_date_offset_days"])
+            self.default_target_offset_days = int(
+                customer["target_date_offset_days"]
             )
+            self.target_offset_spin.setValue(self.default_target_offset_days)
+
+    def start_new_customer(self) -> None:
+        """清空客户专属数据，并恢复 Launcher 的通用默认设置。"""
+        self.customer_combo.blockSignals(True)
+        try:
+            self.customer_combo.setCurrentIndex(-1)
+            self.customer_combo.clearEditText()
+        finally:
+            self.customer_combo.blockSignals(False)
+
+        self.bite_id_edit.clear()
+        self.task_table.setRowCount(0)
+        self.card_id_spin.setValue(1)
+        self.custom_markers_edit.clear()
+        for checkbox in self.platform_checks.values():
+            checkbox.setChecked(False)
+        self._apply_defaults(apply_customer=False)
+        self.status_label.setText("新建客户：请填写客户名称、BITE_ID 和任务清单。")
+        self.customer_combo.setFocus()
 
     def _current_task(self) -> dict[str, int]:
-        return {"card_id": self.card_id_spin.value()}
+        return {
+            "card_id": self.card_id_spin.value(),
+            "target_date_offset_days": self.target_offset_spin.value(),
+        }
 
     def _task_at_row(self, row: int) -> dict[str, int]:
-        return {"card_id": int(self.task_table.item(row, 0).text())}
+        offset_item = self.task_table.item(row, 1)
+        offset = offset_item.data(Qt.ItemDataRole.UserRole)
+        return {
+            "card_id": int(self.task_table.item(row, 0).text()),
+            "target_date_offset_days": int(offset),
+        }
 
     def _all_tasks(self) -> list[dict[str, int]]:
         return [
@@ -428,33 +458,30 @@ class DailyfillLauncherWindow(QMainWindow):
     def _append_task_row(self, task: dict[str, Any]) -> None:
         row = self.task_table.rowCount()
         self.task_table.insertRow(row)
-        values = (
-            str(int(task["card_id"])),
-            self._target_offset_text(),
+        offset = int(
+            task.get(
+                "target_date_offset_days",
+                self.default_target_offset_days,
+            )
         )
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(value)
-            item.setTextAlignment(Qt.AlignCenter)
-            self.task_table.setItem(row, column, item)
+        card_item = QTableWidgetItem(str(int(task["card_id"])))
+        card_item.setTextAlignment(Qt.AlignCenter)
+        offset_item = QTableWidgetItem(self._target_offset_text(offset))
+        offset_item.setTextAlignment(Qt.AlignCenter)
+        offset_item.setData(Qt.ItemDataRole.UserRole, offset)
+        self.task_table.setItem(row, 0, card_item)
+        self.task_table.setItem(row, 1, offset_item)
 
-    def _target_offset_text(self) -> str:
-        offset = self.target_offset_spin.value()
+    @staticmethod
+    def _target_offset_text(offset: int) -> str:
         return "当天" if offset == 0 else f"{offset} 天前"
-
-    def _refresh_task_offsets(self) -> None:
-        """全局日期偏移变化时，同步刷新任务清单中的展示值。"""
-        text = self._target_offset_text()
-        for row in range(self.task_table.rowCount()):
-            item = self.task_table.item(row, 1)
-            if item is None:
-                item = QTableWidgetItem()
-                item.setTextAlignment(Qt.AlignCenter)
-                self.task_table.setItem(row, 1, item)
-            item.setText(text)
 
     def add_task(self) -> None:
         task = self._current_task()
-        if task in self._all_tasks():
+        if any(
+            existing["card_id"] == task["card_id"]
+            for existing in self._all_tasks()
+        ):
             QMessageBox.warning(self, "任务重复", "该任务 ID 已存在。")
             return
         self._append_task_row(task)
@@ -472,11 +499,22 @@ class DailyfillLauncherWindow(QMainWindow):
             for index in range(self.task_table.rowCount())
             if index != row
         ]
-        if task in other_tasks:
+        if any(
+            existing["card_id"] == task["card_id"]
+            for existing in other_tasks
+        ):
             QMessageBox.warning(self, "任务重复", "该任务 ID 已存在。")
             return
         self.task_table.item(row, 0).setText(str(task["card_id"]))
-        self.status_label.setText("选中任务 ID 已更新。")
+        offset_item = self.task_table.item(row, 1)
+        offset_item.setText(
+            self._target_offset_text(task["target_date_offset_days"])
+        )
+        offset_item.setData(
+            Qt.ItemDataRole.UserRole,
+            task["target_date_offset_days"],
+        )
+        self.status_label.setText("选中任务 ID 和日期偏移已更新。")
 
     def delete_selected_task(self) -> None:
         row = self.task_table.currentRow()
@@ -489,8 +527,10 @@ class DailyfillLauncherWindow(QMainWindow):
     def _load_selected_task_into_editor(self) -> None:
         row = self.task_table.currentRow()
         if row >= 0:
-            self.card_id_spin.setValue(
-                int(self.task_table.item(row, 0).text())
+            task = self._task_at_row(row)
+            self.card_id_spin.setValue(task["card_id"])
+            self.target_offset_spin.setValue(
+                task["target_date_offset_days"]
             )
 
     def _selected_platform_values(
@@ -562,7 +602,7 @@ class DailyfillLauncherWindow(QMainWindow):
             "business_heartbeat_seconds": self.business_heartbeat_spin.value(),
             "worker_count": self.worker_count_spin.value(),
             "max_attempts": self.max_attempts_spin.value(),
-            "target_date_offset_days": self.target_offset_spin.value(),
+            "target_date_offset_days": self.default_target_offset_days,
             "keep_browser_after_run": self.keep_browser_check.isChecked(),
             "cookie_dir": self.cookie_dir,
             "task_url": self.task_url,
@@ -593,9 +633,10 @@ class DailyfillLauncherWindow(QMainWindow):
             )
             self.worker_count_spin.setValue(int(values.get("WORKER_COUNT") or 1))
             self.max_attempts_spin.setValue(int(values.get("MAX_ATTEMPTS") or 5))
-            self.target_offset_spin.setValue(
-                int(values.get("TARGET_DATE_OFFSET_DAYS") or 1)
+            self.default_target_offset_days = int(
+                values.get("TARGET_DATE_OFFSET_DAYS") or 1
             )
+            self.target_offset_spin.setValue(self.default_target_offset_days)
             self.keep_browser_check.setChecked(
                 str(values.get("KEEP_BROWSER_AFTER_RUN") or "true").lower()
                 in {"true", "1", "yes"}

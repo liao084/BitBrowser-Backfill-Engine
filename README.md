@@ -24,6 +24,7 @@ backfill/
   backfill_engine.py       # 历史补采入口与通用 Worker 能力
   browser_connector.py     # BitBrowser / 外部 Chromium CDP 连接器
   daily_engine.py          # 日常采集入口
+  dailyfill_launcher.py    # Dailyfill 客户配置和实例启动 GUI
   auth_manager.py          # pkl Cookie 登录态重建预检
   browser_manager.py       # Bit 浏览器启动、关闭与 CDP 地址获取
   task_ledger.py           # JSONL 任务账本与重试结果汇总
@@ -44,6 +45,9 @@ uv run pyinstaller --onefile --name backfill_engine backfill_engine.py
 
 # 日常采集
 uv run pyinstaller --onefile --noconsole --name daily_engine daily_engine.py
+
+# Dailyfill 客户实例管理器
+uv run pyinstaller --onefile --noconsole --name dailyfill_launcher dailyfill_launcher.py
 
 # 飞书巡检通知器
 uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py

@@ -8,8 +8,12 @@ on:
       - main
     paths:
       - "backfill_engine.py"
+      - "backfill_launcher.py"
+      - "backfill_launcher_config.example.json"
       - "browser_connector.py"
       - "daily_engine.py"
+      - "dailyfill_launcher.py"
+      - "dailyfill_launcher_config.example.json"
       - "daily_notify_agent.py"
       - "auth_manager.py"
       - "browser_manager.py"
@@ -42,8 +46,10 @@ jobs:
         run: >
           uv run python -m py_compile
           backfill_engine.py
+          backfill_launcher.py
           browser_connector.py
           daily_engine.py
+          dailyfill_launcher.py
           daily_notify_agent.py
           auth_manager.py
           browser_manager.py
@@ -74,6 +80,36 @@ jobs:
           --name daily_notify_agent
           daily_notify_agent.py
 
+      - name: Build Backfill Launcher EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --noconsole
+          --name backfill_launcher
+          backfill_launcher.py
+
+      - name: Build Dailyfill Launcher EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --noconsole
+          --name dailyfill_launcher
+          dailyfill_launcher.py
+
+      - name: Prepare launcher packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path backfill-launcher-package -Force
+          Copy-Item dist\backfill_launcher.exe backfill-launcher-package\
+          Copy-Item backfill_launcher_config.example.json backfill-launcher-package\backfill_launcher_config.json
+
+          New-Item -ItemType Directory -Path dailyfill-deployment-package\dailyfill\_release -Force
+          Copy-Item dist\dailyfill_launcher.exe dailyfill-deployment-package\
+          Copy-Item dist\daily_engine.exe dailyfill-deployment-package\dailyfill\_release\
+          Copy-Item dailyfill_launcher_config.example.json dailyfill-deployment-package\dailyfill\_release\dailyfill_launcher_config.json
+
       - name: Upload Backfill EXE
         uses: actions/upload-artifact@v7
         with:
@@ -95,5 +131,21 @@ jobs:
         with:
           name: daily-notify-agent-windows
           path: dist/daily_notify_agent.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Backfill Launcher package
+        uses: actions/upload-artifact@v7
+        with:
+          name: backfill-launcher-windows
+          path: backfill-launcher-package/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Dailyfill deployment package
+        uses: actions/upload-artifact@v7
+        with:
+          name: dailyfill-deployment-windows
+          path: dailyfill-deployment-package/
           if-no-files-found: error
           retention-days: 30

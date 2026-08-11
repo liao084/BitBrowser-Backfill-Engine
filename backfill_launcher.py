@@ -169,7 +169,7 @@ class BackfillLauncherWindow(QMainWindow):
         self.setMinimumSize(600, 680)
         self._build_ui()
         self._load_customer_choices()
-        self._apply_defaults()
+        self._on_customer_changed()
 
     def _build_ui(self) -> None:
         central_widget = QWidget()
@@ -207,7 +207,7 @@ class BackfillLauncherWindow(QMainWindow):
         self.customer_combo = QComboBox()
         self.customer_combo.setEditable(True)
         self.customer_combo.currentIndexChanged.connect(
-            self._apply_selected_customer_defaults
+            self._on_customer_changed
         )
 
         self.browser_type_combo = QComboBox()
@@ -229,6 +229,8 @@ class BackfillLauncherWindow(QMainWindow):
         self.business_heartbeat_spin.setRange(1, 86400)
         self.business_heartbeat_spin.setSuffix(" 秒")
 
+        new_button = QPushButton("新建客户")
+        new_button.clicked.connect(self.start_new_customer)
         load_button = QPushButton("加载已有 .env")
         load_button.clicked.connect(self.load_customer_env)
         folder_button = QPushButton("打开客户目录")
@@ -236,8 +238,9 @@ class BackfillLauncherWindow(QMainWindow):
 
         layout.addWidget(QLabel("客户"), 0, 0)
         layout.addWidget(self.customer_combo, 0, 1, 1, 3)
-        layout.addWidget(load_button, 1, 1)
-        layout.addWidget(folder_button, 1, 2, 1, 2)
+        layout.addWidget(new_button, 1, 1)
+        layout.addWidget(load_button, 1, 2)
+        layout.addWidget(folder_button, 1, 3)
         layout.addWidget(QLabel("浏览器来源"), 2, 0)
         layout.addWidget(self.browser_type_combo, 2, 1, 1, 3)
         layout.addWidget(QLabel("BITE_ID"), 3, 0)
@@ -277,7 +280,7 @@ class BackfillLauncherWindow(QMainWindow):
         layout = QGridLayout(group)
 
         self.card_spin = QSpinBox()
-        self.card_spin.setRange(1, 9999)
+        self.card_spin.setRange(1, 999_999_999)
         self.card_spin.setMaximumWidth(110)
         self.start_date_edit = QDateEdit()
         self.start_date_edit.setCalendarPopup(True)
@@ -302,7 +305,7 @@ class BackfillLauncherWindow(QMainWindow):
         delete_button = QPushButton("删除选中任务")
         delete_button.clicked.connect(self.delete_selected_task)
 
-        layout.addWidget(QLabel("卡片编号"), 0, 0)
+        layout.addWidget(QLabel("任务卡片 ID"), 0, 0)
         layout.addWidget(self.card_spin, 0, 1)
         layout.addWidget(QLabel("单个区块天数"), 0, 2)
         layout.addWidget(self.chunk_days_spin, 0, 3)
@@ -324,7 +327,7 @@ class BackfillLauncherWindow(QMainWindow):
         layout = QVBoxLayout(group)
         self.task_table = QTableWidget(0, 4)
         self.task_table.setHorizontalHeaderLabels(
-            ["Card", "开始日期", "结束日期", "区块天数"]
+            ["任务卡片 ID", "开始日期", "结束日期", "区块天数"]
         )
         self.task_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.task_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -368,16 +371,29 @@ class BackfillLauncherWindow(QMainWindow):
         return layout
 
     def _load_customer_choices(self) -> None:
+        current_name = self.customer_combo.currentText().strip()
         names = set(self.customers)
+        # 历史补采实例保持单层部署，只识别 backfill 根目录的直接子目录。
         if self.deployment_root.is_dir():
             for child in self.deployment_root.iterdir():
                 if child.is_dir() and child.name != "_release":
                     names.add(child.name)
-        self.customer_combo.clear()
-        self.customer_combo.addItems(sorted(names))
+        self.customer_combo.blockSignals(True)
+        try:
+            self.customer_combo.clear()
+            self.customer_combo.addItems(sorted(names))
+            if current_name:
+                self.customer_combo.setCurrentText(current_name)
+        finally:
+            self.customer_combo.blockSignals(False)
 
-    def _apply_defaults(self) -> None:
+    def _apply_defaults(self, *, apply_customer: bool = True) -> None:
         defaults = self.config["defaults"]
+        browser_type = str(defaults.get("browser_type", "bitbrowser"))
+        browser_index = self.browser_type_combo.findData(browser_type)
+        self.browser_type_combo.setCurrentIndex(
+            browser_index if browser_index >= 0 else 0
+        )
         self.cdp_address_edit.setText(
             str(defaults.get("cdp_address", "127.0.0.1:9222"))
         )
@@ -392,7 +408,8 @@ class BackfillLauncherWindow(QMainWindow):
         self.start_date_edit.setDate(QDate.currentDate().addDays(-1))
         self._update_latest_date(True)
         self._update_browser_fields()
-        self._apply_selected_customer_defaults()
+        if apply_customer:
+            self._apply_selected_customer_defaults()
 
     def _apply_selected_customer_defaults(self) -> None:
         customer = self.customers.get(self.customer_combo.currentText().strip())
@@ -403,9 +420,45 @@ class BackfillLauncherWindow(QMainWindow):
         default_platforms = {
             str(name) for name in customer.get("platforms", [])
         }
-        if default_platforms:
-            for name, checkbox in self.platform_checks.items():
-                checkbox.setChecked(name in default_platforms)
+        for name, checkbox in self.platform_checks.items():
+            checkbox.setChecked(name in default_platforms)
+
+    def _clear_customer_state(self) -> None:
+        """清除上一个客户的专属内容，避免切换后残留旧配置。"""
+        self.bite_id_edit.clear()
+        self.cdp_address_edit.clear()
+        self.task_table.setRowCount(0)
+        self.card_spin.setValue(1)
+        self.chunk_days_spin.setValue(1)
+        self.custom_markers_edit.clear()
+        for checkbox in self.platform_checks.values():
+            checkbox.setChecked(False)
+
+    def _on_customer_changed(self, _index: int | None = None) -> None:
+        """切换客户时恢复默认值，并自动载入已有实例配置。"""
+        self._clear_customer_state()
+        self._apply_defaults()
+        env_path = self._customer_dir() / ".env"
+        if env_path.is_file():
+            self._load_customer_env_file(env_path)
+        else:
+            self.status_label.setText("当前客户尚无 .env，已应用 Launcher 默认配置。")
+
+    def start_new_customer(self) -> None:
+        """清空客户专属数据，并恢复 Launcher 的通用默认设置。"""
+        self.customer_combo.blockSignals(True)
+        try:
+            self.customer_combo.setCurrentIndex(-1)
+            self.customer_combo.clearEditText()
+        finally:
+            self.customer_combo.blockSignals(False)
+
+        self._clear_customer_state()
+        self._apply_defaults(apply_customer=False)
+        self.status_label.setText(
+            "新建客户：请填写客户名称、浏览器参数和历史补采任务。"
+        )
+        self.customer_combo.setFocus()
 
     def _update_browser_fields(self) -> None:
         is_bitbrowser = self.browser_type_combo.currentData() == "bitbrowser"
@@ -605,6 +658,10 @@ class BackfillLauncherWindow(QMainWindow):
             )
             return
 
+        self._load_customer_env_file(env_path)
+
+    def _load_customer_env_file(self, env_path: Path) -> None:
+        """载入一个已有 Backfill 客户实例的可编辑配置。"""
         try:
             values = dotenv_values(env_path)
             browser_type = str(values.get("BROWSER_TYPE") or "bitbrowser")

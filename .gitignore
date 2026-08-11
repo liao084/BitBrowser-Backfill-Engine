@@ -21,6 +21,10 @@
 !.github/workflows/
 !.github/workflows/*.yml
 
+# 个人复盘资料保留在本地，不属于仓库交付文档
+project_retrospective.md
+popup_layering_fix_retrospective.md
+
 # 3. 补丁黑名单：坚决屏蔽运行时的产物（哪怕它们刚好是 py 或 md 后缀）
 # PyInstaller 打包产物
 build/
@@ -54,5 +58,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# 主管原脚本仅用于本地设计参考，不属于本项目交付内容
+# 外部参考脚本仅用于本地兼容性分析，不属于项目交付内容
 131_pdd_lpjy.py

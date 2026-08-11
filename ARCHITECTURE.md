@@ -1,6 +1,6 @@
 # Backfill Engine 架构与执行流程
 
-本文档已按 2026-07-20 的 Backfill 与 Daily 代码校正，用于：
+本文档按当前 Backfill 与 Daily 主线代码维护，用于：
 
 - 按调用顺序通读代码；
 - 在遗忘实现细节后快速恢复对脚本的理解；
@@ -21,7 +21,7 @@ mindmap
         GC_PAGE_URL_MARKERS
         Worker 与业务页静默阈值
       TASKS_CONFIG
-        任务卡片
+        任务卡片 ID
         起止日期
         日期区块大小
       浏览器连接器
@@ -35,7 +35,7 @@ mindmap
       健康 Worker 隔离
     单任务业务流
       清理旧弹窗
-      打开任务卡片
+      按 ID 查询并打开任务卡片
       注入日期
       启动检测
       判断缺失数据
@@ -82,8 +82,8 @@ flowchart LR
     end
 
     subgraph Business["实际业务执行页面"]
-        JD1["京东商智页面 A"]
-        JDN["京东商智页面 N"]
+        JD1["业务执行页面 A"]
+        JDN["业务执行页面 N"]
         GC["Context 级业务执行页 GC<br/>独立静默阈值 + 退出收尾"]
     end
 
@@ -120,8 +120,8 @@ flowchart LR
 
 架构中存在三条互相解耦的执行线：
 
-1. **主业务线**：任务池 → Worker → 数仓弹窗 → 商智采集；
-2. **页面资源线**：Context 捕获商智页面 → 心跳监控 → 僵尸页面回收；
+1. **主业务线**：任务池 → Worker → 数仓弹窗 → 业务平台采集；
+2. **页面资源线**：Context 按 URL 标记捕获业务执行页 → 心跳监控 → 僵尸页面回收；
 3. **可观测与恢复线**：日志 + JSONL 账本 → 失败任务重建 → 第二轮重试。
 
 ## 三、推荐的代码阅读顺序
@@ -134,7 +134,7 @@ flowchart TD
     D --> E["5. worker<br/>循环领取任务与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
     F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成信号、心跳与静默兜底"]
-    G --> H["8. _monitor_and_gc_page<br/>理解商智页面旁路 GC"]
+    G --> H["8. _monitor_and_gc_page<br/>理解业务执行页旁路 GC"]
     H --> I["9. _monitor_worker_error_toasts<br/>理解红色提示回收"]
     I --> J["10. TaskLedger<br/>理解重试与最终汇总"]
 ```
@@ -145,8 +145,8 @@ flowchart TD
 | 调度 | `_run_task_round()` | 如何建立共享队列，如何筛选健康 Worker？ |
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
-| 状态判断 | `wait_for_completion_or_heartbeat()` | 如何用完成弹窗提前确认成功，并保留静默复检兜底？ |
-| 页面 GC | `_monitor_and_gc_page()` | 商智页面为什么独立于 Worker，何时关闭？ |
+| 状态判断 | `wait_for_completion_or_heartbeat()` | 完成弹窗如何触发自动检测结果读取，静默时如何主动复检？ |
+| 页面 GC | `_monitor_and_gc_page()` | 业务执行页为什么独立于 Worker，何时关闭？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
 | 持久化 | `TaskLedger` | 首轮失败项如何变成第二轮任务？ |
 
@@ -200,20 +200,20 @@ sequenceDiagram
 假设 `.env` 中的 `TASKS_CONFIG` 包含：
 
 ```dotenv
-TASKS_CONFIG=[{"card":3,"start":"2025-07-01","end":"2025-07-07","chunk_days":3}]
+TASKS_CONFIG=[{"card":1001,"start":"2025-07-01","end":"2025-07-07","chunk_days":3}]
 ```
 
 会生成：
 
 ```text
-card-3_2025-07-01_2025-07-03
-card-3_2025-07-04_2025-07-06
-card-3_2025-07-07_2025-07-07
+card-1001_2025-07-01_2025-07-03
+card-1001_2025-07-04_2025-07-06
+card-1001_2025-07-07_2025-07-07
 ```
 
 ```mermaid
 flowchart TD
-    A["读取一条 tasks_config"] --> B["解析 card / start / end / chunk_days"]
+    A["读取一条 tasks_config"] --> B["解析任务卡片 ID / start / end / chunk_days"]
     B --> C["current_date = start"]
     C --> D{"current_date <= end?"}
     D -->|"否"| J["该配置切分结束"]
@@ -292,7 +292,9 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     Start["execute_task(page, task)"] --> Init["初始化清理<br/>依次关闭三级、二级、一级弹窗"]
-    Init --> OpenCard["按 card-1 下标点击任务卡片"]
+    Init --> SearchCard["覆盖任务 ID 输入框并点击查询"]
+    SearchCard --> VerifyCard["等待唯一结果并校验 span.timeInfo 中的任务 ID"]
+    VerifyCard --> OpenCard["点击查询结果中的任务卡片"]
     OpenCard --> Primary["等待一级 Drawer 与启动检测按钮可操作"]
     Primary --> InitOK{"初始化成功?"}
     InitOK -->|"否：致命异常"| Fatal["向上抛出<br/>Worker 立即熔断"]
@@ -320,8 +322,9 @@ flowchart TD
     ClickOK -->|"最终失败"| SubmitFail["清理弹窗并返回 False"]
     ClickOK -->|"成功"| Submitted["task_submitted = True"]
     Submitted --> Heartbeat["并发监听同步成功与数据补齐完成<br/>历史默认静默阈值 120 秒"]
-    Heartbeat -->|"捕获数据补齐完成"| AutoDetect["等待2秒<br/>等待自动检测结果渲染稳定"]
-    AutoDetect --> Success
+    Heartbeat -->|"捕获数据补齐完成"| AutoDetect["等待2秒<br/>读取自动检测缺失量"]
+    AutoDetect -->|"无缺失"| Success
+    AutoDetect -->|"仍有缺失或结果不可信"| Failed
     Heartbeat -->|"静默超时或心跳节点异常"| FinalRestore["恢复一级弹窗<br/>重新注入当前日期"]
     FinalRestore --> FinalDetect["再次点击启动检测<br/>读取后端缺失量"]
     FinalDetect -->|"无缺失"| Success
@@ -389,11 +392,11 @@ sequenceDiagram
     loop 任务尚未完成
         W->>Heartbeat: 等待新心跳，最多达到Worker静默阈值
         alt 捕获数据补齐完成
-            Complete-->>W: 当前业务任务成功
+            Complete-->>W: 当前业务队列遍历结束
             W->>W: 固定等待2秒，让自动检测进入渲染流程
             W->>Primary: 等待result_title可见
             W->>Primary: 退避读取missing_text直到脱离占位文本
-            W-->>W: 页面稳定，返回True
+            W->>W: 根据缺失数量返回成功或失败
         else 捕获同步成功
             Heartbeat-->>W: 固定当前ElementHandle
             W->>Heartbeat: 等待当前节点hidden，期间仍监听完成信号
@@ -404,7 +407,7 @@ sequenceDiagram
     end
 ```
 
-“数据补齐完成”是已提交任务的权威成功信号，即使系统中存在无法采集的固定缺失数据，任务仍可正常完成。捕获该信号后不再解析缺失数量，而是等待网页自动检测稳定：固定缓冲2秒，等待 `div.testContent_list_title_dayType` 可见，再按0、2、4秒退避读取顶部统计，直到文本不再是 `：表示缺失数据`。随后返回成功，下一任务通过正常初始化流程关闭一级弹窗并回到任务大盘。
+“数据补齐完成”只表示业务队列已经遍历结束，不再直接作为任务成功依据。捕获该信号后，脚本固定缓冲 2 秒，等待 `div.testContent_list_title_dayType` 可见，再按 0、2、4 秒退避读取顶部统计，直到文本不再是 `：表示缺失数据`。自动检测确认无缺失时返回成功；仍有缺失或结果不可信时返回失败并进入对应模式的重试流程。
 
 如果没有捕获完成信号，达到 Worker 静默阈值本身仍不等于成功。此时保留原有兜底：恢复页面层级、重新注入日期并请求后端缺失量。历史模式默认阈值为120秒：
 
@@ -541,7 +544,7 @@ flowchart LR
 每一次最终任务尝试写入一行：
 
 ```json
-{"task_id":"card-3_2025-07-01_2025-07-01","card":3,"start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false}
+{"task_id":"card-1001_2025-07-01_2025-07-01","card":1001,"start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false}
 ```
 
 ```mermaid
@@ -551,7 +554,7 @@ flowchart TD
     Record1 --> Load["第一轮全部 Worker 收敛后<br/>failed_tasks(attempt=1)"]
     Load --> Failed{"存在 success=false?"}
     Failed -->|"否"| Summary["summary"]
-    Failed -->|"是"| Rebuild["复制 card/start/end<br/>attempt 改为 2"]
+    Failed -->|"是"| Rebuild["复制任务卡片 ID/start/end<br/>attempt 改为 2"]
     Rebuild --> Healthy{"仍有健康 Worker?"}
     Healthy -->|"是"| Round2["失败任务进入新的共享池"]
     Healthy -->|"否"| FinalFail["没有 Worker 可重试"]
@@ -614,7 +617,7 @@ flowchart TD
 
 ### 8. Worker 心跳模块
 
-`wait_for_completion_or_heartbeat()` 在数仓 Worker 页并发监听“同步成功”和“数据补齐完成”。完成信号优先确认任务成功，脚本等待自动检测结果脱离渲染占位状态后立即释放Worker；没有完成信号时，达到静默阈值仍使用后端复检兜底。历史模式默认120秒，也可通过 `.env` 调整。
+`wait_for_completion_or_heartbeat()` 在数仓 Worker 页并发监听“同步成功”和“数据补齐完成”。完成信号只触发自动检测结果读取，确认无缺失后才成功；仍有缺失或结果不可信时失败。没有完成信号时，达到静默阈值仍使用主动后端复检兜底。历史模式默认 120 秒，也可通过 `.env` 调整。
 
 ### 9. 业务执行页面 GC 模块
 
@@ -641,9 +644,9 @@ flowchart TD
 5. 把配置日期切分成唯一日期区块，生成首轮任务列表；
 6. 重置 JSONL 任务账本，为每个 Worker 启动红色提示监控器；
 7. 把首轮任务全部放入共享任务池，由多个 Worker 动态领取；
-8. 每个 Worker 清理遗留弹窗，打开任务卡片并注入当前区间日期；
+8. 每个 Worker 清理遗留弹窗，按任务卡片 ID 查询、校验并打开唯一结果，再注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
-10. 提交后并发监听心跳和数据补齐完成；完成信号出现后等待自动检测稳定并立即成功，未捕获时才在静默后执行原后端复检兜底；
+10. 提交后并发监听心跳和数据补齐完成；完成信号出现后读取自动检测缺失量并据此判定结果，未捕获时在静默后执行主动后端复检兜底；
 11. 业务执行页 GC 使用更长的独立静默阈值回收没有正常关闭的页面；
 12. 每个任务结束后立即把本次尝试结果追加到 JSONL；
 13. Worker 发生普通任务失败时继续领取，发生致命页面异常时退出任务池；
@@ -694,7 +697,7 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 `daily_notify_agent.py` 不接入浏览器，也不读取内存中的任务池。它以文件为边界，递归扫描本机 `dailyfill` 下每个客户目录的 `.env`：
 
 1. `REPORT_READY_TIME` 未到的客户不纳入本次通知；
-2. 用 `DAILY_TASKS`、`TARGET_DATE` 或日期偏移量还原当天应有的 `task_id`；
+2. 用 `DAILY_TASKS` 中每项的 `card_id` 和 `target_date_offset_days` 还原当天应有的 `task_id`；字段缺失或无效时将该客户标记为配置异常；
 3. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量；
 4. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
 5. 将全部客户状态合并为一条飞书文本消息。

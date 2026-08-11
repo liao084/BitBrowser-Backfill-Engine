@@ -81,21 +81,34 @@ def minutes_since_modified(path: Path) -> int | None:
 
 
 def expected_task_ids(client_env: dict[str, str]) -> set[str]:
-    """按 daily_engine.py 的规则还原本次应该出现的 task_id。"""
+    """按 Dailyfill Launcher 任务配置还原本次应出现的 task_id。"""
     tasks = json.loads(client_env.get("DAILY_TASKS", "[]"))
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("DAILY_TASKS 必须是非空 JSON 数组")
 
-    target_date = client_env.get("TARGET_DATE", "").strip()
-    if not target_date:
-        offset_days = int(client_env.get("TARGET_DATE_OFFSET_DAYS", "1"))
-        target_date = (date.today() - timedelta(days=offset_days)).strftime("%Y-%m-%d")
-
     task_ids: set[str] = set()
-    for task in tasks:
-        card = int(task.get("card", task.get("task_card_index", 1)))
-        task_date = str(task.get("date", target_date))
-        task_ids.add(f"card-{card}_{task_date}")
+    for index, task in enumerate(tasks, start=1):
+        if not isinstance(task, dict):
+            raise ValueError(f"DAILY_TASKS 第 {index} 项必须是 JSON 对象")
+        try:
+            card_id = int(task["card_id"])
+            offset_days = int(task["target_date_offset_days"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"DAILY_TASKS 第 {index} 项必须包含有效的 "
+                "card_id 和 target_date_offset_days"
+            ) from error
+        if card_id <= 0:
+            raise ValueError(f"DAILY_TASKS 第 {index} 项的 card_id 必须大于 0")
+        if offset_days < 0:
+            raise ValueError(
+                f"DAILY_TASKS 第 {index} 项的 target_date_offset_days 不能小于 0"
+            )
+
+        task_date = (date.today() - timedelta(days=offset_days)).strftime(
+            "%Y-%m-%d"
+        )
+        task_ids.add(f"card-{card_id}_{task_date}")
     return task_ids
 
 

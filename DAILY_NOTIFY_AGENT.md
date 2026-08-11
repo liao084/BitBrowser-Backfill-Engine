@@ -1,6 +1,6 @@
-# daily-mode 飞书巡检通知器
+# Dailyfill 飞书巡检通知器
 
-`daily_notify_agent.py` 是 daily-mode 的旁路巡检工具。它不参与采集或浏览器控制，只负责定时扫描**本机**客户目录，读取 `.env`、`daily_results.jsonl`、`daily_run.log`，然后发送一条飞书汇总消息。
+`daily_notify_agent.py` 是 Dailyfill 的旁路巡检工具。它不参与采集或浏览器控制，只负责定时扫描**本机**客户目录，读取 `.env`、`daily_results.jsonl`、`daily_run.log`，然后发送一条飞书汇总消息。
 
 ## 目录约定
 
@@ -12,14 +12,14 @@ dailyfill/
   notify_agent.env
 
   jd/
-    235-极米_1/
+    235_客户1/
       daily_engine.exe
       .env
       daily_results.jsonl
       daily_run.log
 
   jd_douyin/
-    154-安克_1/
+    218_客户2/
       daily_engine.exe
       .env
       daily_results.jsonl
@@ -27,18 +27,21 @@ dailyfill/
 ```
 
 通知器会递归扫描 `dailyfill` 下所有名为 `.env` 的文件。每个 `.env` 所在目录就是一个客户任务目录。
+通知器会用 `DAILY_TASKS` 中每条任务的 `card_id` 和
+`target_date_offset_days` 还原当天应该出现的 `task_id`；这两个字段
+缺失或无效时，该客户会显示为“配置异常”。
 
 ## 客户 .env 需要增加的字段
 
 ```env
-CUSTOMER_NAME=235_极米
+CUSTOMER_NAME=235_客户1
 REPORT_READY_TIME=08:45
 ```
 
 - `CUSTOMER_NAME`：飞书消息里显示的客户名；不填时使用文件夹名。
 - `REPORT_READY_TIME`：到这个时间后，该客户才纳入飞书汇总。
 
-不再需要 `REPORT_PLATFORMS`。客户采集什么平台由目录或你自己的命名管理，通知器只关心“几点纳入汇报”。
+不再需要 `REPORT_PLATFORMS`。平台分类由部署目录维护，通知器只依据 `REPORT_READY_TIME` 判断客户何时纳入汇总。
 
 ## notify_agent.env
 
@@ -53,7 +56,7 @@ copy notify_agent.env.example notify_agent.env
 ```env
 CLIENTS_ROOT=
 FEISHU_WEBHOOK_URL=
-NOTIFY_TITLE=Daily RPA 巡检｜6号机
+NOTIFY_TITLE=Daily RPA 巡检｜节点A
 NOTIFY_START_TIME=09:00
 NOTIFY_END_TIME=18:00
 NOTIFY_INTERVAL_MINUTES=30
@@ -65,7 +68,7 @@ STALE_LOG_MINUTES=20
 `NOTIFY_TITLE` 可以直接带机器名，例如：
 
 ```env
-NOTIFY_TITLE=Daily RPA 巡检｜6号机
+NOTIFY_TITLE=Daily RPA 巡检｜节点A
 ```
 
 `DAILY_RESULTS_FILENAME` 和 `DAILY_LOG_FILENAME` 通常保持默认值即可；它们必须与 `daily_engine.py` 的产物文件名一致。
@@ -75,14 +78,14 @@ NOTIFY_TITLE=Daily RPA 巡检｜6号机
 示例：
 
 ```text
-【Daily RPA 巡检｜6号机】2026-07-09 09:30
+【Daily RPA 巡检｜节点A】2026-07-09 09:30
 
 汇总：完成 3｜运行中 2｜未开始 1｜需关注 1
 
-✅ 154_安克｜完成｜4/4
-⏳ 235_极米｜运行中｜1/3
-⚪ 259_伊利｜未开始｜0/2｜未发现今日账本记录
-⚠️ 233_西门子｜运行中｜2/5｜log 25 分钟未更新，疑似故障
+✅ 235_客户1｜完成｜4/4
+⏳ 218_客户2｜运行中｜1/3
+⚪ 252_客户3｜未开始｜0/2｜未发现今日账本记录
+⚠️ 233_客户4｜运行中｜2/5｜log 25 分钟未更新，疑似故障
 ```
 
 ## 手动发送一次

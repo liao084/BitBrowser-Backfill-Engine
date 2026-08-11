@@ -10,7 +10,7 @@
 - `.env`
 - `COOKIE` 目录或 `.env` 中指定的其他 Cookie 目录
 
-程序核心逻辑保存在 EXE 中。更换客户、卡片、日期或并发量时，只需使用 Notepad++ 修改 `.env`，不需要重新打包。
+程序核心逻辑保存在 EXE 中。推荐使用 Dailyfill Launcher 创建和更新客户实例；也可以直接编辑 `.env` 调整客户、任务卡片 ID、日期或并发量，无需重新打包。
 
 ## 创建配置
 
@@ -29,7 +29,7 @@ Daily-mode 使用以下字段：
 | `TARGET_DATE` | 可选的统一指定日期；留空时使用日期偏移 |
 | `COOKIE_DIR` | pkl Cookie 文件目录 |
 | `TASK_URL` | datatoolcenter 工作台地址；省略时使用源码默认值 |
-| `DAILY_TASKS` | 每日任务卡片 JSON 数组；单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |
+| `DAILY_TASKS` | 每日任务卡片 JSON 数组；`card_id` 表示数仓任务卡片 ID，单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |
 | `PLATFORMS` | 本客户所有可能触发业务执行页的平台 JSON 数组；程序会按顺序重建每个平台的 pkl Cookie 登录态 |
 | `CUSTOMER_NAME` | 仅供 `daily_notify_agent.py` 在飞书中显示客户名称；daily_engine 不读取 |
 | `REPORT_READY_TIME` | 由 Dailyfill Launcher 配置统一生成；仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总，daily_engine 不读取 |
@@ -39,6 +39,7 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
 `target_date_offset_days`、全局 `TARGET_DATE_OFFSET_DAYS`。因此旧 `.env`
 可以继续运行，新 Launcher 保存后则会为每个任务写入各自的日期偏移。
+飞书通知器按 Launcher 格式还原当天预期任务，因此需要通知汇总的客户应确保每个任务均包含 `card_id` 和 `target_date_offset_days`。
 
 ## 运行结果
 
@@ -52,7 +53,7 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 - 任务失败且未达到 `MAX_ATTEMPTS` 时，会立即以 `attempt + 1` 放回共享队列尾部，不再等待其他任务全部结束后进行总体重试。
 - 健康 Worker 会持续等待队列；所有任务成功或达到各自执行上限后，调度器才统一停止 Worker。
 - Backfill 与 Daily 共用的普通业务元素渲染、可见性和点击等待统一为 30 秒；5 秒 trial、页面导航与稳定等待、页面健康探针、120 秒 Worker 心跳和 180 秒 GC 均保持原值。
-- Worker并发监听“同步成功”和“数据补齐完成”；完成信号出现后等待网页自动检测结果脱离占位状态并立即写入 `success=true`，只有未捕获完成信号且静默超时时才执行原后端复检兜底。
+- Worker 并发监听“同步成功”和“数据补齐完成”。完成信号只表示业务队列遍历结束；脚本等待网页自动检测结果稳定，确认无缺失后才写入 `success=true`，仍有缺失或结果不可信时进入重试。未捕获完成信号且静默超时时执行主动后端复检兜底。
 - 每次缺失检测都会先等待一级弹窗内的结果项标题 `div.testContent_list_title_dayType` 渲染，再等待 1 秒读取顶部统计；若统计仍是固定占位文本 `：表示缺失数据`，按 0、2、4 秒退避读取同一轮结果，连续 3 次仍未完成时记为失败。
 
 ## 打包

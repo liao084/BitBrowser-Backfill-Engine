@@ -2,8 +2,8 @@
     "engine_filename": "daily_engine.exe",
     "customers": [
         {
-            "name": "235_示例客户",
-            "bite_id": "replace_with_bitbrowser_id_235",
+            "name": "235_客户1",
+            "bite_id": "replace_with_bitbrowser_id_1",
             "platforms": [
                 "京东品牌主页（商智）"
             ],
@@ -13,8 +13,8 @@
             "report_ready_time": "08:45"
         },
         {
-            "name": "218_示例客户",
-            "bite_id": "replace_with_bitbrowser_id_218",
+            "name": "218_客户2",
+            "bite_id": "replace_with_bitbrowser_id_2",
             "platforms": [
                 "抖音电商罗盘",
                 "京东品牌主页（商智）"

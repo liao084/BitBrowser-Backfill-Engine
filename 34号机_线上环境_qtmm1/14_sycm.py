@@ -29,14 +29,14 @@ class DouyinJDTaskRunnerEnhanced:
         # ==================== 核心配置（按需修改） ====================
 
         # 比特浏览器ID
-        self.bite_id = bite_id or '7e50f44d99ce41af98b5cedfab4d43ff' #qiutianmanman
+        self.bite_id = bite_id or 'f6282da1688e4eb68b3d360d150d0513' #qiutianmanman
 
         # 平台配置：要采集的平台
         # 可选值: '抖音电商罗盘', '抖音罗盘经营', '京东', '生意参谋', '拼多多', '鲸钻客', '热度云'
         self.platforms = ['生意参谋']
         
         # 任务配置：数仓任务索引
-        self.task_indices = [5246, 5293, 5294, 5295, 5296, 5297]
+        self.task_indices = [5246, 5293, 5294, 5295, 5296, 5297, 5544]
 
         # ====================================================
 
@@ -45,7 +45,7 @@ class DouyinJDTaskRunnerEnhanced:
         self.headers = {'Content-Type': 'application/json'}
 
         # Cookie存储目录
-        self.cookie_dir = 'C:/Users/Administrator/Desktop/COOKIE'
+        self.cookie_dir = 'C:/Users/it_00/Desktop/COOKIE'
 
         # 关键URL
         self.douyin_brand_url = 'https://compassbrand.jinritemai.com/'  # 抖音电商罗盘（策略）
@@ -731,8 +731,11 @@ class DouyinJDTaskRunnerEnhanced:
             print(f"执行任务 {task_index}...")
             
             # 按任务 ID 搜索
-            input_element = driver.find_element(
-                By.XPATH, '//*[@id="pane-first"]/div[1]/div[2]/input'
+            input_element = WebDriverWait(driver,30).until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    '//*[@id="pane-first"]/div[1]/div[2]/input',
+                ))
             )
             input_element.send_keys(task_index)
             search_btn = driver.find_element(

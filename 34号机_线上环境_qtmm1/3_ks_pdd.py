@@ -731,8 +731,11 @@ class DouyinJDTaskRunnerEnhanced:
             print(f"执行任务 {task_index}...")
             
             # 按任务 ID 搜索
-            input_element = driver.find_element(
-                By.XPATH, '//*[@id="pane-first"]/div[1]/div[2]/input'
+            input_element = WebDriverWait(driver,30).until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    '//*[@id="pane-first"]/div[1]/div[2]/input',
+                ))
             )
             input_element.send_keys(task_index)
             search_btn = driver.find_element(

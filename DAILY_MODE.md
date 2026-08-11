@@ -32,7 +32,7 @@ Daily-mode 使用以下字段：
 | `DAILY_TASKS` | 每日任务卡片 JSON 数组；单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |
 | `PLATFORMS` | 本客户所有可能触发业务执行页的平台 JSON 数组；程序会按顺序重建每个平台的 pkl Cookie 登录态 |
 | `CUSTOMER_NAME` | 仅供 `daily_notify_agent.py` 在飞书中显示客户名称；daily_engine 不读取 |
-| `REPORT_READY_TIME` | 仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总；daily_engine 不读取 |
+| `REPORT_READY_TIME` | 由 Dailyfill Launcher 配置统一生成；仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总，daily_engine 不读取 |
 
 JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`。建议将 `.env` 保存为 UTF-8。
 
@@ -79,12 +79,22 @@ Desktop\
    ├─ _release\
    │  ├─ daily_engine.exe
    │  └─ dailyfill_launcher_config.json
-   └─ 客户名\
+   ├─ JD\
+   │  └─ 客户名\
+   │     ├─ daily_engine.exe
+   │     └─ .env
+   └─ 新建客户\
       ├─ daily_engine.exe
       └─ .env
 ```
 
 `dailyfill_launcher.exe` 固定读取同目录下
-`dailyfill\_release\dailyfill_launcher_config.json`。保存客户配置时，会在
-`dailyfill\客户名` 创建 `.env`，并从 `_release` 复制最新版
-`daily_engine.exe`。`_release` 只保存通用发布文件，不存放客户实例。
+`dailyfill\_release\dailyfill_launcher_config.json`。Launcher 会递归扫描
+`dailyfill` 下所有客户 `.env`，因此客户可以按 JD、SYCM、DY_JD
+等平台目录分类；下拉框仅显示 `.env` 所在的客户目录名。新建客户会先
+保存到 `dailyfill\客户名`，之后可人工移入平台分类目录。
+
+保存时，Launcher 会从 `_release` 复制最新版 `daily_engine.exe`。
+`defaults.task_url` 以及客户或默认的 `report_ready_time` 是 Launcher
+权威值：加载旧 `.env` 时不会用其中的旧值覆盖，再次保存即会回写最新值。
+`_release` 只保存通用发布文件，不存放客户实例。

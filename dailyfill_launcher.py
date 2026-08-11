@@ -99,6 +99,7 @@ def build_env_content(values: dict[str, Any]) -> str:
             f"BITE_ID={json_env_value(values['bite_id'])}",
             f"GC_PAGE_URL_MARKERS={json_env_value(values['markers'])}",
             f"CUSTOMER_NAME={json_env_value(values['customer_name'])}",
+            f"REPORT_READY_TIME={values['report_ready_time']}",
             "",
             "WORKER_HEARTBEAT_SILENCE_SECONDS="
             f"{values['worker_heartbeat_seconds']}",
@@ -174,8 +175,10 @@ class DailyfillLauncherWindow(QMainWindow):
             raise ValueError("platforms 中没有可用的平台配置")
 
         self.platform_checks: dict[str, QCheckBox] = {}
+        self.customer_dirs: dict[str, Path] = {}
         self.cookie_dir = ""
         self.task_url = ""
+        self.report_ready_time = ""
         self.default_target_offset_days = 1
 
         self.setWindowTitle("Dailyfill 客户实例管理器")
@@ -183,7 +186,7 @@ class DailyfillLauncherWindow(QMainWindow):
         self.setMinimumSize(600, 640)
         self._build_ui()
         self._load_customer_choices()
-        self._apply_defaults()
+        self._on_customer_changed()
 
     def _build_ui(self) -> None:
         central_widget = QWidget()
@@ -221,7 +224,7 @@ class DailyfillLauncherWindow(QMainWindow):
         self.customer_combo = QComboBox()
         self.customer_combo.setEditable(True)
         self.customer_combo.currentIndexChanged.connect(
-            self._apply_selected_customer_defaults
+            self._on_customer_changed
         )
         self.bite_id_edit = QLineEdit()
 
@@ -358,10 +361,23 @@ class DailyfillLauncherWindow(QMainWindow):
     def _load_customer_choices(self) -> None:
         current_name = self.customer_combo.currentText().strip()
         names = set(self.customers)
+        discovered_dirs: dict[str, Path] = {}
         if self.deployment_root.is_dir():
-            for child in self.deployment_root.iterdir():
-                if child.is_dir() and child.name != "_release":
-                    names.add(child.name)
+            for env_path in self.deployment_root.rglob(".env"):
+                if self.release_dir in env_path.parents:
+                    continue
+                customer_dir = env_path.parent.resolve()
+                customer_name = customer_dir.name
+                existing_dir = discovered_dirs.get(customer_name)
+                if existing_dir is not None and existing_dir != customer_dir:
+                    raise ValueError(
+                        f"发现重名客户目录 {customer_name!r}："
+                        f"{existing_dir} 与 {customer_dir}。"
+                        "请先修改其中一个客户目录名称。"
+                    )
+                discovered_dirs[customer_name] = customer_dir
+                names.add(customer_name)
+        self.customer_dirs = discovered_dirs
 
         self.customer_combo.blockSignals(True)
         try:
@@ -393,6 +409,9 @@ class DailyfillLauncherWindow(QMainWindow):
             defaults.get("cookie_dir", "C:/Users/Administrator/Desktop/COOKIE")
         )
         self.task_url = str(defaults.get("task_url", ""))
+        self.report_ready_time = str(
+            defaults.get("report_ready_time", "")
+        ).strip()
         if apply_customer:
             self._apply_selected_customer_defaults()
 
@@ -415,6 +434,27 @@ class DailyfillLauncherWindow(QMainWindow):
                 customer["target_date_offset_days"]
             )
             self.target_offset_spin.setValue(self.default_target_offset_days)
+        if "report_ready_time" in customer:
+            self.report_ready_time = str(
+                customer["report_ready_time"]
+            ).strip()
+
+    def _clear_customer_state(self) -> None:
+        """清除上一个客户的专属内容，避免切换后残留旧配置。"""
+        self.bite_id_edit.clear()
+        self.task_table.setRowCount(0)
+        self.card_id_spin.setValue(1)
+        self.custom_markers_edit.clear()
+        for checkbox in self.platform_checks.values():
+            checkbox.setChecked(False)
+
+    def _on_customer_changed(self, _index: int | None = None) -> None:
+        """切换客户时先应用权威配置，再自动载入该客户的 .env。"""
+        self._clear_customer_state()
+        self._apply_defaults()
+        env_path = self._customer_dir() / ".env"
+        if env_path.is_file():
+            self._load_customer_env_file(env_path)
 
     def start_new_customer(self) -> None:
         """清空客户专属数据，并恢复 Launcher 的通用默认设置。"""
@@ -425,12 +465,7 @@ class DailyfillLauncherWindow(QMainWindow):
         finally:
             self.customer_combo.blockSignals(False)
 
-        self.bite_id_edit.clear()
-        self.task_table.setRowCount(0)
-        self.card_id_spin.setValue(1)
-        self.custom_markers_edit.clear()
-        for checkbox in self.platform_checks.values():
-            checkbox.setChecked(False)
+        self._clear_customer_state()
         self._apply_defaults(apply_customer=False)
         self.status_label.setText("新建客户：请填写客户名称、BITE_ID 和任务清单。")
         self.customer_combo.setFocus()
@@ -591,10 +626,22 @@ class DailyfillLauncherWindow(QMainWindow):
             raise ValueError("Launcher 配置中的 cookie_dir 不能为空")
         if not self.task_url.strip():
             raise ValueError("Launcher 配置中的 task_url 不能为空")
+        if not self.report_ready_time:
+            raise ValueError(
+                "Launcher 配置中的 report_ready_time 不能为空"
+            )
+        if re.fullmatch(
+            r"(?:[01]\d|2[0-3]):[0-5]\d",
+            self.report_ready_time,
+        ) is None:
+            raise ValueError(
+                "Launcher 配置中的 report_ready_time 必须使用 HH:MM 格式"
+            )
 
         return {
             "customer_name": customer_name,
             "bite_id": bite_id,
+            "report_ready_time": self.report_ready_time,
             "markers": markers,
             "platforms": platforms,
             "tasks": tasks,
@@ -610,6 +657,8 @@ class DailyfillLauncherWindow(QMainWindow):
 
     def _customer_dir(self, customer_name: str | None = None) -> Path:
         name = customer_name or self.customer_combo.currentText().strip()
+        if name in self.customer_dirs:
+            return self.customer_dirs[name]
         return self.deployment_root / name
 
     def load_customer_env(self) -> None:
@@ -621,6 +670,11 @@ class DailyfillLauncherWindow(QMainWindow):
                 f"未找到 {env_path}，保存后将创建新客户实例。",
             )
             return
+
+        self._load_customer_env_file(env_path)
+
+    def _load_customer_env_file(self, env_path: Path) -> None:
+        """载入客户可编辑项；权威字段始终保留 Launcher 配置值。"""
 
         try:
             values = dotenv_values(env_path)
@@ -642,7 +696,6 @@ class DailyfillLauncherWindow(QMainWindow):
                 in {"true", "1", "yes"}
             )
             self.cookie_dir = str(values.get("COOKIE_DIR") or self.cookie_dir)
-            self.task_url = str(values.get("TASK_URL") or self.task_url)
 
             selected_platforms = json.loads(
                 str(values.get("PLATFORMS") or "[]")

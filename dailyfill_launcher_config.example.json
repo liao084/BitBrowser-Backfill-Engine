@@ -9,7 +9,8 @@
             ],
             "worker_count": 1,
             "max_attempts": 5,
-            "target_date_offset_days": 1
+            "target_date_offset_days": 1,
+            "report_ready_time": "08:45"
         },
         {
             "name": "218_示例客户",
@@ -20,7 +21,8 @@
             ],
             "worker_count": 4,
             "max_attempts": 5,
-            "target_date_offset_days": 1
+            "target_date_offset_days": 1,
+            "report_ready_time": "10:30"
         }
     ],
     "platforms": [
@@ -96,6 +98,7 @@
         "max_attempts": 5,
         "target_date_offset_days": 1,
         "keep_browser_after_run": true,
+        "report_ready_time": "10:30",
         "cookie_dir": "C:/Users/Administrator/Desktop/COOKIE",
         "task_url": "https://datatoolcenter.com/web/dateCenter.html?activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
     }

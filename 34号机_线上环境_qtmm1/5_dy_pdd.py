@@ -36,7 +36,7 @@ class DouyinJDTaskRunnerEnhanced:
         self.platforms = ['抖音罗盘经营','拼多多']
         
         # 任务配置：数仓任务索引
-        self.task_indices = [5274, 5284, 5715, 5790]
+        self.task_indices = [5274, 5284, 5790]
 
         # ====================================================
 

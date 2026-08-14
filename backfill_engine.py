@@ -580,6 +580,19 @@ class BackfillEngine:
         try:
             await close_button.click(timeout=5000)
         except PlaywrightTimeoutError:
+            # ElementUI 可能在可见性检查与实际点击之间完成退出动画并移除节点。
+            # 此时普通点击会等待旧 Locator 至超时，但弹窗实际上已经关闭，
+            # 不应继续等待 DOM 降级点击，更不能误判为 Worker 无响应。
+            if not await self._locator_is_visible(
+                container,
+                worker_id,
+                layer_name,
+            ):
+                logger.info(
+                    f"Worker-{worker_id} {layer_name}已在点击等待期间自行关闭。"
+                )
+                return True
+
             # 仅对已经精确限定在弹窗内部的关闭按钮使用 DOM 点击，避免遮挡层
             # 导致 Playwright 命中测试永久失败；业务按钮仍保留真实点击保护。
             logger.warning(

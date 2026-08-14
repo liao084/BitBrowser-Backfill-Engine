@@ -648,8 +648,8 @@ class BackfillEngine:
         self,
         page: Page,
         task_card_id: int,
-    ) -> None:
-        """按数仓任务 ID 查询并打开唯一匹配的任务卡片。"""
+    ) -> Optional[str]:
+        """按数仓任务 ID 查询卡片，读取任务名称后打开唯一结果。"""
         id_input = page.locator("input.el-input__inner").nth(0)
         search_button = page.locator(
             "button.el-button.el-button--default"
@@ -664,7 +664,38 @@ class BackfillEngine:
         await id_input.fill(str(task_card_id))
         await search_button.click(timeout=30000)
         await expected_id_marker.wait_for(state="visible", timeout=45000)
+
+        task_name: Optional[str] = None
+        title_element = result_card.locator(
+            "span.workTool_page_card_test_dataCard_title_span"
+        )
+        try:
+            raw_task_name = await title_element.evaluate(
+                """
+                element => Array.from(element.childNodes)
+                    .filter(node => node.nodeType === 3)
+                    .map(node => (node.textContent || "").trim())
+                    .filter(Boolean)
+                    .join(" ")
+                """
+            )
+            normalized_task_name = str(raw_task_name).strip()
+            if normalized_task_name:
+                task_name = normalized_task_name
+            else:
+                logger.warning(
+                    f"任务 ID {task_card_id} 的卡片标题为空，task_name 将记为 null。"
+                )
+        except Exception as error:
+            if self._fatal_page_error_reason(error):
+                raise
+            logger.warning(
+                f"读取任务 ID {task_card_id} 的任务名称失败，"
+                f"task_name 将记为 null: {error}"
+            )
+
         await result_card.click(timeout=30000)
+        return task_name
 
     async def inject_dates(self, page: Page, start_date: str, end_date: str, worker_id: str):
         """
@@ -706,8 +737,8 @@ class BackfillEngine:
         start_date: str,
         end_date: str,
         phase: str,
-    ) -> Optional[bool]:
-        """重新请求后端检测缺失量；True=有缺失，False=无缺失，None=结果不确定。"""
+    ) -> Optional[int]:
+        """重新请求后端检测缺失量；0=无缺失，正整数=缺失量，None=不确定。"""
         start_btn = primary_drawer.locator("#checkbutn")
         result_title = primary_drawer.locator(
             "div.testContent_list_title_dayType"
@@ -769,7 +800,7 @@ class BackfillEngine:
                     f"Worker-{worker_id} {phase}统计文本 [{missing_text}] 不含数字，"
                     "确认当前日期无缺失数据。"
                 )
-                return False
+                return 0
 
             missing_count = int(match.group())
             if missing_count > 0:
@@ -778,7 +809,7 @@ class BackfillEngine:
                     f"Worker-{worker_id} {phase}统计文本 [{missing_text}]，"
                     f"确认仍有 {missing_count} 条缺失数据。"
                 )
-                return True
+                return missing_count
 
             logger.warning(
                 f"Worker-{worker_id} {phase}统计文本 [{missing_text}] 显示 0 或负数，"
@@ -794,8 +825,8 @@ class BackfillEngine:
         self,
         page: Page,
         worker_id: str,
-    ) -> Optional[bool]:
-        """读取自动检测结果；True=仍有缺失，False=无缺失，None=结果不可信。"""
+    ) -> Optional[int]:
+        """读取自动检测结果；0=无缺失，正整数=缺失量，None=不可信。"""
         # 完成弹窗会立即触发自动检测；短暂缓冲用于避开上一轮结果尚未清空的瞬间。
         await page.wait_for_timeout(2000)
 
@@ -836,7 +867,7 @@ class BackfillEngine:
                 f"Worker-{worker_id} 自动检测统计文本 [{missing_text}] 不含数字，"
                 "确认当前日期无缺失数据。"
             )
-            return False
+            return 0
 
         missing_count = int(match.group())
         if missing_count > 0:
@@ -844,7 +875,7 @@ class BackfillEngine:
                 f"Worker-{worker_id} 自动检测统计文本 [{missing_text}]，"
                 f"确认仍有 {missing_count} 条缺失数据。"
             )
-            return True
+            return missing_count
 
         logger.warning(
             f"Worker-{worker_id} 自动检测统计文本 [{missing_text}] 显示 0 或负数，"
@@ -856,33 +887,34 @@ class BackfillEngine:
         self,
         page: Page,
         worker_id: str,
-    ) -> bool:
+    ) -> Optional[int]:
         """完成信号只表示队列遍历结束，最终结果以自动检测缺失量为准。"""
         logger.info(
             f"Worker-{worker_id} 捕获到数据补齐完成信号，"
             "等待网页自动检测完成。"
         )
-        auto_missing = await self._read_auto_detection_result(
+        missing_count = await self._read_auto_detection_result(
             page,
             worker_id,
         )
-        if auto_missing is False:
+        if missing_count == 0:
             logger.info(
                 f"Worker-{worker_id} 自动检测确认无缺失数据，当前任务成功。"
             )
-            return True
-        if auto_missing is True:
+            return 0
+        if missing_count is not None:
             logger.warning(
-                f"Worker-{worker_id} 队列已遍历完成，但自动检测仍有缺失数据，"
+                f"Worker-{worker_id} 队列已遍历完成，但自动检测仍有 "
+                f"{missing_count} 条缺失数据，"
                 "当前任务失败并交由调度器决定是否重试。"
             )
-            return False
+            return missing_count
 
         logger.warning(
             f"Worker-{worker_id} 队列已遍历完成，但自动检测结果不可信，"
             "当前任务不写入成功结果。"
         )
-        return False
+        return None
 
     @staticmethod
     async def _cancel_wait_task(task: asyncio.Task) -> None:
@@ -947,7 +979,7 @@ class BackfillEngine:
         worker_id: str,
         start_date: str,
         end_date: str,
-    ) -> bool:
+    ) -> Optional[int]:
         """
         完成弹窗触发自动检测结果核验；普通心跳维持监听，静默时保留后端复检兜底。
         """
@@ -1031,21 +1063,22 @@ class BackfillEngine:
             "终态复检",
         )
 
-        if terminal_missing is False:
+        if terminal_missing == 0:
             logger.info(
                 f"Worker-{worker_id} 终态复检确认无缺失数据，当前任务成功。"
             )
-            return True
-        if terminal_missing is True:
+            return 0
+        if terminal_missing is not None:
             logger.warning(
-                f"Worker-{worker_id} 终态复检仍有缺失数据，当前任务失败。"
+                f"Worker-{worker_id} 终态复检仍有 {terminal_missing} 条缺失数据，"
+                "当前任务失败。"
             )
-            return False
+            return terminal_missing
 
         logger.warning(
             f"Worker-{worker_id} 终态复检结果不确定，不写入成功结果。"
         )
-        return False
+        return None
 
     def build_tasks(self, tasks_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """把配置中的日期范围拆成共享任务池使用的唯一任务。"""
@@ -1087,6 +1120,8 @@ class BackfillEngine:
     ) -> bool:
         """执行一个独立日期区块；普通失败返回 False，致命页面异常向外抛出。"""
         task_card_id = task["card"]
+        # 每次 attempt 都必须重新产生最终缺失量，不能继承上一次失败结果。
+        task["missing_count"] = None
         date_chunks = [(task["start"], task["end"])]
         worker_id = f"页面-{list_index + 1}"
         logger.info(
@@ -1101,10 +1136,12 @@ class BackfillEngine:
             await self._close_all_task_layers(page, worker_id)
                 
             # 2. 按任务 ID 查询并进入唯一匹配的任务卡片。
-            await self._open_task_card_by_id(
+            task_name = await self._open_task_card_by_id(
                 page,
                 task_card_id,
             )
+            if task_name:
+                task["task_name"] = task_name
             
             # 等待包含启动按钮的一级弹窗真正展开。
             primary_drawer = self._primary_drawer(page)
@@ -1150,7 +1187,8 @@ class BackfillEngine:
                     "首次检测",
                 )
 
-                if detection_result is False:
+                if detection_result == 0:
+                    task["missing_count"] = 0
                     continue
                 if detection_result is None:
                     logger.warning(
@@ -1237,12 +1275,14 @@ class BackfillEngine:
                 task_submitted = True
                 
                 # 4. 完成弹窗触发自动检测核验；若未捕获，则在心跳静默后执行后端复检。
-                completed_normally = await self.wait_for_completion_or_heartbeat(
+                missing_count = await self.wait_for_completion_or_heartbeat(
                     page,
                     worker_id,
                     start_date,
                     end_date,
                 )
+                task["missing_count"] = missing_count
+                completed_normally = missing_count == 0
                 if completed_normally:
                     logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")
                 else:

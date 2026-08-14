@@ -12,6 +12,7 @@ on:
       - "backfill_launcher_config.example.json"
       - "browser_connector.py"
       - "daily_engine.py"
+      - "daily_run_status.py"
       - "dailyfill_launcher.py"
       - "dailyfill_launcher_config.example.json"
       - "daily_notify_agent.py"
@@ -49,6 +50,7 @@ jobs:
           backfill_launcher.py
           browser_connector.py
           daily_engine.py
+          daily_run_status.py
           dailyfill_launcher.py
           daily_notify_agent.py
           auth_manager.py
@@ -101,9 +103,10 @@ jobs:
       - name: Prepare launcher packages
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path backfill-launcher-package -Force
-          Copy-Item dist\backfill_launcher.exe backfill-launcher-package\
-          Copy-Item backfill_launcher_config.example.json backfill-launcher-package\backfill_launcher_config.json
+          New-Item -ItemType Directory -Path backfill-deployment-package\backfill\_release -Force
+          Copy-Item dist\backfill_launcher.exe backfill-deployment-package\
+          Copy-Item dist\backfill_engine.exe backfill-deployment-package\backfill\_release\
+          Copy-Item backfill_launcher_config.example.json backfill-deployment-package\backfill\_release\backfill_launcher_config.json
 
           New-Item -ItemType Directory -Path dailyfill-deployment-package\dailyfill\_release -Force
           Copy-Item dist\dailyfill_launcher.exe dailyfill-deployment-package\
@@ -134,11 +137,11 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload Backfill Launcher package
+      - name: Upload Backfill deployment package
         uses: actions/upload-artifact@v7
         with:
-          name: backfill-launcher-windows
-          path: backfill-launcher-package/
+          name: backfill-deployment-windows
+          path: backfill-deployment-package/
           if-no-files-found: error
           retention-days: 30
 

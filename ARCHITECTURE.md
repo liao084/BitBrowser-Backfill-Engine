@@ -544,8 +544,10 @@ flowchart LR
 每一次最终任务尝试写入一行：
 
 ```json
-{"task_id":"card-1001_2025-07-01_2025-07-01","card":1001,"start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false}
+{"task_id":"card-1001_2025-07-01_2025-07-01","card":1001,"task_name":"[日] 示例任务","start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false,"missing_count":7}
 ```
+
+`task_name` 在按 ID 找到唯一卡片后、点击卡片前读取。`missing_count` 只保存本次尝试最后一次可信的后端检测结果：成功为 `0`，确认仍有缺失为正整数，未完成终态检测或结果不可信为 `null`。Backfill 和 Daily 共用该账本结构。
 
 ```mermaid
 flowchart TD
@@ -663,20 +665,24 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    Start["读取 EXE 同目录 .env"] --> Bit["关闭并启动指定 Bit 浏览器"]
+    Start["读取 EXE 同目录 .env"] --> Status["创建 daily_run_status.json<br/>running / ledger_reset=false"]
+    Status --> Bit["关闭并启动指定 Bit 浏览器"]
     Bit --> CDP["Playwright connect_over_cdp"]
     CDP --> Clear["预检开始时全局清理一次旧 Cookie"]
     Clear --> Auth["按 PLATFORMS 顺序\n访问主页、注入 pkl、再次访问验证"]
-    Auth --> Result{"至少一个平台重建成功?"}
+    Auth --> AuthStatus["写入 auth_mode / auth_results"]
+    AuthStatus --> Result{"至少一个平台重建成功?"}
     Result -->|"否"| Keep["不创建任务池\n保留失败登录页供人工处理"]
     Result -->|"是"| Worker["并行创建 min(WORKER_COUNT, 任务数) 个 Worker"]
-    Worker --> Pool["持续共享任务池\n失败任务立即回队"]
+    Worker --> Reset["重置 daily_results.jsonl<br/>ledger_reset=true"]
+    Reset --> Pool["持续共享任务池\n失败任务立即回队"]
     Pool --> Ledger["daily_results.jsonl 覆盖写入本次结果"]
     Ledger --> Finish{"全部任务成功且\nKEEP_BROWSER_AFTER_RUN=false?"}
     Finish -->|"是"| Close["关闭比特浏览器"]
     Finish -->|"否"| KeepFinal["保留浏览器和页面现场"]
     Close --> Summary["输出各阶段耗时、总耗时和实际浏览器处理结果"]
     KeepFinal --> Summary
+    Summary --> Finished["状态归属仍为本 run_id 时<br/>phase=finished"]
 ```
 
 Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重启、登录预检、Worker 初始化和持续任务池；外层 `finally` 统一补充总运行时间。因此参数错误、浏览器启动失败或登录预检失败等提前退出路径，也会留下总耗时和实际浏览器处理结果，而不会再固定打印“保留现场”。
@@ -698,9 +704,11 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 
 1. `REPORT_READY_TIME` 未到的客户不纳入本次通知；
 2. 用 `DAILY_TASKS` 中每项的 `card_id` 和 `target_date_offset_days` 还原当天应有的 `task_id`；字段缺失或无效时将该客户标记为配置异常；
-3. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量；
-4. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
-5. 将全部客户状态合并为一条飞书文本消息。
+3. 读取 `daily_run_status.json`，只在状态属于今天且 `ledger_reset=true` 时读取新版账本；没有状态文件的旧部署继续兼容；
+4. 从 `auth_results` 汇总登录失效的平台，全部失败时标记“登录异常”；
+5. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量，并展示任务名称和可信的剩余缺失条数；
+6. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
+7. 将全部客户状态合并为一条可展开详情的飞书交互卡片。
 
 这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器读取上一次账本和日志；通知器异常也不会影响采集任务。
 

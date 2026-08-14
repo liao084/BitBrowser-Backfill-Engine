@@ -1,6 +1,6 @@
 # Dailyfill 飞书巡检通知器
 
-`daily_notify_agent.py` 是 Dailyfill 的旁路巡检工具。它不参与采集或浏览器控制，只负责定时扫描**本机**客户目录，读取 `.env`、`daily_results.jsonl`、`daily_run.log`，然后发送一条飞书汇总消息。
+`daily_notify_agent.py` 是 Dailyfill 的旁路巡检工具。它不参与采集或浏览器控制，只负责定时扫描**本机**客户目录，读取 `.env`、`daily_run_status.json`、`daily_results.jsonl`、`daily_run.log`，然后发送一条可展开客户详情的飞书汇总卡片。
 
 ## 目录约定
 
@@ -15,6 +15,7 @@ dailyfill/
     235_客户1/
       daily_engine.exe
       .env
+      daily_run_status.json
       daily_results.jsonl
       daily_run.log
 
@@ -22,6 +23,7 @@ dailyfill/
     218_客户2/
       daily_engine.exe
       .env
+      daily_run_status.json
       daily_results.jsonl
       daily_run.log
 ```
@@ -71,7 +73,15 @@ STALE_LOG_MINUTES=20
 NOTIFY_TITLE=Daily RPA 巡检｜节点A
 ```
 
-`DAILY_RESULTS_FILENAME` 和 `DAILY_LOG_FILENAME` 通常保持默认值即可；它们必须与 `daily_engine.py` 的产物文件名一致。
+`DAILY_STATUS_FILENAME`、`DAILY_RESULTS_FILENAME` 和 `DAILY_LOG_FILENAME` 通常保持默认值即可；它们必须与 `daily_engine.py` 的产物文件名一致。
+
+## 状态判定
+
+- 今天的 `daily_run_status.json` 尚未把 `ledger_reset` 标为 `true` 时，不读取旧 JSONL，避免上一轮结果污染本轮通知。
+- 状态文件的 `run_date` 不是今天时，客户显示为“未开始”，同样忽略旧 JSONL。
+- `auth_results` 中失败的平台会直接显示在客户详情中；全部平台失败时显示“登录异常”。
+- 没有状态文件的旧版 DailyEngine 仍按原方式读取 JSONL，便于渐进升级。
+- JSONL 是任务完成情况的真值；log 最后修改时间只用于补充“疑似故障”提示。
 
 ## 消息格式
 
@@ -87,6 +97,8 @@ NOTIFY_TITLE=Daily RPA 巡检｜节点A
 ⚪ 252_客户3｜未开始｜0/2｜未发现今日账本记录
 ⚠️ 233_客户4｜运行中｜2/5｜log 25 分钟未更新，疑似故障
 ```
+
+点击客户行可展开平台登录异常、任务名称、卡片 ID、目标日期、尝试次数以及可信的剩余缺失条数。
 
 ## 手动发送一次
 

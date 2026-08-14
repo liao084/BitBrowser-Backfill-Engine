@@ -30,10 +30,12 @@ class TaskLedger:
         record = {
             "task_id": task["task_id"],
             "card": task["card"],
+            "task_name": task.get("task_name"),
             "start": task["start"],
             "end": task["end"],
             "attempt": task["attempt"],
             "success": bool(success),
+            "missing_count": task.get("missing_count"),
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
 
@@ -76,9 +78,11 @@ class TaskLedger:
             {
                 "task_id": record["task_id"],
                 "card": record["card"],
+                "task_name": record.get("task_name"),
                 "start": record["start"],
                 "end": record["end"],
                 "attempt": attempt + 1,
+                "missing_count": None,
             }
             for record in latest_by_task.values()
             if record.get("success") is False

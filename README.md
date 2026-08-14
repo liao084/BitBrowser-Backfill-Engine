@@ -7,7 +7,7 @@
 | 历史补采 | `backfill_engine.py` | 通过 `.env` 选择 BitBrowser 或外部 Chromium CDP，将日期范围切分为区块并由多个既有 Worker 动态补采。 |
 | 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按 pkl Cookie 重建业务平台登录态、创建 Worker，并让失败的单日任务立即回队重试。 |
 
-`daily_notify_agent.py` 是日常采集的旁路巡检器：它读取各客户目录中的 `.env`、`daily_results.jsonl` 和 `daily_run.log`，定时发送一条本机汇总飞书消息，不参与任何浏览器操作。
+`daily_notify_agent.py` 是日常采集的旁路巡检器：它读取各客户目录中的 `.env`、`daily_run_status.json`、`daily_results.jsonl` 和 `daily_run.log`，定时发送一条可展开客户详情的本机飞书汇总卡片，不参与任何浏览器操作。
 
 ## 文档入口
 
@@ -27,6 +27,7 @@ backfill/
   auth_manager.py          # pkl Cookie 登录态重建预检
   browser_manager.py       # Bit 浏览器启动、关闭与 CDP 地址获取
   task_ledger.py           # JSONL 任务账本与重试结果汇总
+  daily_run_status.py      # Daily 单次运行状态与跨进程归属保护
   daily_notify_agent.py    # 本机飞书巡检通知器
   .env.example             # 历史补采 / 日常采集配置模板
   backfill_launcher_config.example.json # Backfill Launcher 配置模板
@@ -34,7 +35,7 @@ backfill/
   notify_agent.env.example # 飞书通知器配置模板
 ```
 
-真实 `.env`、Cookie、日志、JSONL 账本、PyInstaller 产物均不会提交到仓库。
+真实 `.env`、Cookie、日志、JSONL 账本、Daily 运行状态和 PyInstaller 产物均不会提交到仓库。
 
 ## 开发与打包
 
@@ -58,6 +59,8 @@ uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 ```
 
 部署时将对应 EXE 与其配置文件放在同一目录：`backfill_engine.exe` 和 `daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。
+
+CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。
 
 历史补采的浏览器连接方式由 `.env` 决定：
 

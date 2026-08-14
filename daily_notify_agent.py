@@ -80,13 +80,13 @@ def minutes_since_modified(path: Path) -> int | None:
     return max(0, math.floor((datetime.now() - modified_at).total_seconds() / 60))
 
 
-def expected_task_ids(client_env: dict[str, str]) -> set[str]:
-    """按 Dailyfill Launcher 任务配置还原本次应出现的 task_id。"""
+def expected_tasks(client_env: dict[str, str]) -> dict[str, dict[str, int]]:
+    """按 Dailyfill Launcher 配置还原本次任务及其展示信息。"""
     tasks = json.loads(client_env.get("DAILY_TASKS", "[]"))
     if not isinstance(tasks, list) or not tasks:
         raise ValueError("DAILY_TASKS 必须是非空 JSON 数组")
 
-    task_ids: set[str] = set()
+    expected: dict[str, dict[str, int]] = {}
     for index, task in enumerate(tasks, start=1):
         if not isinstance(task, dict):
             raise ValueError(f"DAILY_TASKS 第 {index} 项必须是 JSON 对象")
@@ -108,8 +108,12 @@ def expected_task_ids(client_env: dict[str, str]) -> set[str]:
         task_date = (date.today() - timedelta(days=offset_days)).strftime(
             "%Y-%m-%d"
         )
-        task_ids.add(f"card-{card_id}_{task_date}")
-    return task_ids
+        task_id = f"card-{card_id}_{task_date}"
+        expected[task_id] = {
+            "card_id": card_id,
+            "target_date_offset_days": offset_days,
+        }
+    return expected
 
 
 def latest_jsonl_results(path: Path) -> dict[str, dict[str, Any]]:
@@ -138,6 +142,55 @@ def latest_jsonl_results(path: Path) -> dict[str, dict[str, Any]]:
     return latest
 
 
+def read_run_status(path: Path) -> dict[str, Any] | None:
+    """读取 DailyEngine 当前运行状态；旧版实例没有该文件时返回 None。"""
+    if not path.exists():
+        return None
+
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path.name} 不是有效 JSON: {error}") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{path.name} 必须是 JSON 对象")
+
+    run_date = str(value.get("run_date", "")).strip()
+    if not run_date:
+        raise ValueError(f"{path.name} 缺少 run_date")
+    try:
+        date.fromisoformat(run_date)
+    except ValueError as error:
+        raise ValueError(f"{path.name} 的 run_date 不是有效日期") from error
+
+    phase = str(value.get("phase", "")).strip().lower()
+    if phase not in {"running", "finished"}:
+        raise ValueError(f"{path.name} 的 phase 必须是 running 或 finished")
+
+    auth_mode = str(value.get("auth_mode", "NOT_CHECKED")).strip().upper()
+    if auth_mode not in {"NOT_CHECKED", "NORMAL", "DEGRADED", "AUTH_REQUIRED"}:
+        raise ValueError(f"{path.name} 的 auth_mode 无效: {auth_mode}")
+
+    auth_results = value.get("auth_results", {})
+    if not isinstance(auth_results, dict):
+        raise ValueError(f"{path.name} 的 auth_results 必须是 JSON 对象")
+
+    return {
+        **value,
+        "run_date": run_date,
+        "phase": phase,
+        "ledger_reset": value.get("ledger_reset") is True,
+        "auth_mode": auth_mode,
+        "auth_results": {
+            str(name): succeeded is True
+            for name, succeeded in auth_results.items()
+        },
+    }
+
+
+def append_note(note: str, addition: str) -> str:
+    return f"{note}；{addition}" if note else addition
+
+
 def inspect_client(env_path: Path, config: dict[str, Any]) -> dict[str, Any] | None:
     """巡检一个客户目录；未到 REPORT_READY_TIME 时返回 None。"""
     client_dir = env_path.parent
@@ -151,34 +204,112 @@ def inspect_client(env_path: Path, config: dict[str, Any]) -> dict[str, Any] | N
     if datetime.now() < ready_at:
         return None
 
-    task_ids = expected_task_ids(client_env)
-    results = latest_jsonl_results(client_dir / config["results_file"])
+    expected = expected_tasks(client_env)
+    run_status = read_run_status(client_dir / config["status_file"])
+    is_current_run = (
+        run_status is not None
+        and run_status["run_date"] == date.today().isoformat()
+    )
+    # 没有状态文件时兼容尚未升级的 DailyEngine；一旦存在新版状态文件，
+    # 只有本日运行且已经 reset 的账本才属于当前批次。
+    ledger_available = run_status is None or (
+        is_current_run and run_status["ledger_reset"]
+    )
+    results = (
+        latest_jsonl_results(client_dir / config["results_file"])
+        if ledger_available
+        else {}
+    )
     matched = {
         task_id: record
         for task_id, record in results.items()
-        if task_id in task_ids
+        if task_id in expected
     }
 
     success_count = sum(record.get("success") is True for record in matched.values())
-    total_count = len(task_ids)
+    total_count = len(expected)
+    max_attempts = int(client_env.get("MAX_ATTEMPTS", "1"))
+    phase = run_status["phase"] if is_current_run else None
+    auth_mode = run_status["auth_mode"] if is_current_run else "NOT_CHECKED"
+    auth_results = run_status["auth_results"] if is_current_run else {}
+    failed_platforms = [
+        name for name, succeeded in auth_results.items() if not succeeded
+    ]
 
-    if not matched:
+    task_details = []
+    for task_id, task in expected.items():
+        record = matched.get(task_id)
+        if record is None:
+            task_status = "未完成" if phase == "finished" and ledger_available else "暂无结果"
+            attempt = None
+            task_name = None
+            missing_count = None
+        elif record.get("success") is True:
+            task_status = "完成"
+            attempt = int(record.get("attempt", 0))
+            task_name = record.get("task_name")
+            missing_count = record.get("missing_count")
+        else:
+            attempt = int(record.get("attempt", 0))
+            task_status = (
+                "重试中"
+                if attempt < max_attempts and phase != "finished"
+                else "未完成"
+            )
+            task_name = record.get("task_name")
+            missing_count = record.get("missing_count")
+
+        task_details.append(
+            {
+                **task,
+                "task_name": task_name,
+                "status": task_status,
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "missing_count": missing_count,
+            }
+        )
+
+    note = ""
+    if run_status is not None and not is_current_run:
         status = "未开始"
-        note = "未发现今日账本记录"
+        note = "今日 DailyEngine 尚未启动"
+    elif auth_mode == "AUTH_REQUIRED":
+        status = "登录异常"
+        note = "全部平台登录失效，任务未启动"
+    elif is_current_run and not run_status["ledger_reset"]:
+        if phase == "running":
+            status = "运行中"
+            note = "任务账本尚未重置"
+        else:
+            status = "未完成"
+            note = "本轮未进入任务执行阶段"
+    elif not matched:
+        if phase == "finished":
+            status = "未完成"
+            note = "本轮未产生任务结果"
+        else:
+            status = "未开始"
+            note = "未发现今日账本记录"
     elif success_count >= total_count:
         status = "完成"
-        note = ""
+    elif phase == "finished":
+        status = "未完成"
     else:
         status = "运行中"
-        note = ""
 
-    if status != "完成":
+    if failed_platforms and auth_mode != "AUTH_REQUIRED":
+        note = append_note(note, f"登录失效：{'、'.join(failed_platforms)}")
+
+    if status != "完成" and phase != "finished" and not (
+        run_status is not None and not is_current_run
+    ):
         log_age = minutes_since_modified(client_dir / config["log_file"])
         if log_age is None:
-            note = f"{note}；未发现 log" if note else "未发现 log"
+            note = append_note(note, "未发现 log")
         elif log_age >= config["stale_log_minutes"]:
             warning = f"log {log_age} 分钟未更新，疑似故障"
-            note = f"{note}；{warning}" if note else warning
+            note = append_note(note, warning)
 
     return {
         "customer": customer_name,
@@ -186,6 +317,8 @@ def inspect_client(env_path: Path, config: dict[str, Any]) -> dict[str, Any] | N
         "success": success_count,
         "total": total_count,
         "note": note,
+        "tasks": task_details,
+        "failed_platforms": failed_platforms,
     }
 
 
@@ -199,14 +332,21 @@ def inspect_client_safe(env_path: Path, config: dict[str, Any]) -> dict[str, Any
             "success": 0,
             "total": 0,
             "note": str(error),
+            "tasks": [],
+            "failed_platforms": [],
         }
 
 
 def progress_line(item: dict[str, Any]) -> str:
-    if item["status"] == "完成":
-        emoji = "✅"
-    elif item["status"] == "配置异常" or "疑似故障" in item["note"]:
+    needs_attention = (
+        item["status"] in ("配置异常", "登录异常", "未完成")
+        or bool(item.get("failed_platforms"))
+        or "疑似故障" in item["note"]
+    )
+    if needs_attention:
         emoji = "⚠️"
+    elif item["status"] == "完成":
+        emoji = "✅"
     elif item["status"] == "运行中":
         emoji = "⏳"
     else:
@@ -222,7 +362,12 @@ def build_message(items: list[dict[str, Any]], title: str) -> str:
     done = sum(item["status"] == "完成" for item in items)
     running = sum(item["status"] == "运行中" for item in items)
     not_started = sum(item["status"] == "未开始" for item in items)
-    attention = sum(item["status"] == "配置异常" or "疑似故障" in item["note"] for item in items)
+    attention = sum(
+        item["status"] in ("配置异常", "登录异常", "未完成")
+        or bool(item.get("failed_platforms"))
+        or "疑似故障" in item["note"]
+        for item in items
+    )
 
     lines = [
         f"【{title}】{datetime.now():%Y-%m-%d %H:%M}",
@@ -237,13 +382,133 @@ def build_message(items: list[dict[str, Any]], title: str) -> str:
     return "\n".join(lines)
 
 
-def send_feishu(message: str, webhook_url: str) -> None:
+def task_detail_line(task: dict[str, Any]) -> str:
+    status = task["status"]
+    if status == "完成":
+        emoji = "✅"
+    elif status in ("重试中", "未完成"):
+        emoji = "⏳"
+    else:
+        emoji = "⚪"
+
+    task_label = (
+        f"{task['task_name']}（ID: {task['card_id']}）"
+        if task.get("task_name")
+        else f"任务 {task['card_id']}"
+    )
+    offset = task["target_date_offset_days"]
+    date_label = "当天" if offset == 0 else f"前{offset}天"
+    line = f"{emoji} {task_label}｜{date_label}｜{status}"
+    if status in ("重试中", "未完成"):
+        if task["attempt"] is not None:
+            line += f"｜第{task['attempt']}/{task['max_attempts']}次"
+        missing_count = task.get("missing_count")
+        if isinstance(missing_count, int) and missing_count > 0:
+            line += f"｜剩余缺失 {missing_count} 条"
+    return line
+
+
+def build_card(items: list[dict[str, Any]], title: str) -> dict[str, Any]:
+    """构建目录树样式的客户任务折叠卡片。"""
+    done = sum(item["status"] == "完成" for item in items)
+    running = sum(item["status"] == "运行中" for item in items)
+    not_started = sum(item["status"] == "未开始" for item in items)
+    attention = sum(
+        item["status"] in ("配置异常", "登录异常", "未完成")
+        or bool(item.get("failed_platforms"))
+        or "疑似故障" in item["note"]
+        for item in items
+    )
+
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": (
+                f"**汇总：** 完成 {done}｜运行中 {running}｜"
+                f"未开始 {not_started}｜需关注 {attention}"
+            ),
+        }
+    ]
+
+    for index, item in enumerate(items, start=1):
+        detail_lines = [
+            f"❌ {platform_name}｜登录失效"
+            for platform_name in item.get("failed_platforms", [])
+        ]
+        detail_lines.extend(task_detail_line(task) for task in item["tasks"])
+        if not detail_lines:
+            detail_lines.append(item["note"] or "暂无任务详情")
+
+        elements.append(
+            {
+                "tag": "collapsible_panel",
+                "element_id": f"customer_{index}",
+                "expanded": False,
+                "header": {
+                    "title": {
+                        "tag": "plain_text",
+                        "content": progress_line(item),
+                    },
+                    "width": "auto_when_fold",
+                    "vertical_align": "center",
+                    "icon": {
+                        "tag": "standard_icon",
+                        "token": "down-small-ccm_outlined",
+                        "size": "16px 16px",
+                    },
+                    "icon_position": "left",
+                    "icon_expanded_angle": -180,
+                    "padding": "2px 0px 2px 0px",
+                },
+                "margin": "0px",
+                "vertical_spacing": "2px",
+                "padding": "2px 0px 4px 24px",
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": "\n".join(detail_lines),
+                    }
+                ],
+            }
+        )
+
+    if not items:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": (
+                    "当前没有到达 REPORT_READY_TIME 的客户任务，"
+                    "或未发现客户 .env。"
+                ),
+            }
+        )
+
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True},
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"【{title}】{datetime.now():%Y-%m-%d %H:%M}",
+            },
+            "template": "blue",
+        },
+        "body": {
+            "direction": "vertical",
+            "vertical_spacing": "4px",
+            "padding": "8px 12px 10px 12px",
+            "elements": elements,
+        },
+    }
+
+
+def send_feishu(card: dict[str, Any], webhook_url: str) -> None:
     if not webhook_url:
         raise ValueError("notify_agent.env 缺少 FEISHU_WEBHOOK_URL")
 
     response = requests.post(
         webhook_url,
-        json={"msg_type": "text", "content": {"text": message}},
+        json={"msg_type": "interactive", "card": card},
         timeout=10,
     )
     response.raise_for_status()
@@ -259,8 +524,9 @@ def run_once(config: dict[str, Any]) -> None:
         for env_path in env_files
         if (item := inspect_client_safe(env_path, config)) is not None
     ]
+    card = build_card(items, config["title"])
+    send_feishu(card, config["webhook_url"])
     message = build_message(items, config["title"])
-    send_feishu(message, config["webhook_url"])
     logger.info("飞书通知发送成功。\n%s", message)
 
 
@@ -322,6 +588,7 @@ def load_config(path: Path) -> dict[str, Any]:
         "stale_log_minutes": int(raw.get("STALE_LOG_MINUTES", "20")),
         "results_file": raw.get("DAILY_RESULTS_FILENAME", "daily_results.jsonl"),
         "log_file": raw.get("DAILY_LOG_FILENAME", "daily_run.log"),
+        "status_file": raw.get("DAILY_STATUS_FILENAME", "daily_run_status.json"),
     }
 
 

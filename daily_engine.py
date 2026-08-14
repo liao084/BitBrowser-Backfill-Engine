@@ -29,6 +29,7 @@ from backfill_engine import (
     runtime_dir,
 )
 from browser_manager import BitBrowserManager
+from daily_run_status import DailyRunStatus
 from task_ledger import TaskLedger
 
 
@@ -580,6 +581,8 @@ class DailyEngine(BackfillEngine):
         run_succeeded = False
         browser_opened = False
         browser_action = "未启动浏览器"
+        run_status: Optional[DailyRunStatus] = None
+        run_status_started = False
 
         try:
             if not tasks_config or not all(
@@ -597,6 +600,16 @@ class DailyEngine(BackfillEngine):
             if not initial_tasks:
                 logger.error("配置没有生成任何每日任务。")
                 return False
+
+            run_status = DailyRunStatus(runtime_dir / "daily_run_status.json")
+            try:
+                run_status.start()
+                run_status_started = True
+                logger.info(
+                    f"本轮 Daily 运行状态已创建: run_id={run_status.run_id}"
+                )
+            except Exception as error:
+                logger.exception(f"无法创建 Daily 运行状态文件，将继续执行任务: {error}")
 
             ledger = TaskLedger(runtime_dir / "daily_results.jsonl")
             browser_started = time.perf_counter()
@@ -634,6 +647,16 @@ class DailyEngine(BackfillEngine):
                             time.perf_counter() - auth_started
                         )
                     self._log_auth_report(auth_report)
+                    if run_status_started:
+                        try:
+                            run_status.record_auth(
+                                auth_report.mode,
+                                auth_report.results,
+                            )
+                        except Exception as error:
+                            logger.exception(
+                                f"无法更新 Daily 登录预检状态，将继续执行任务: {error}"
+                            )
                     if not auth_report.any_succeeded:
                         logger.error(
                             "全部平台登录态重建失败，daily-mode 不创建任务池；"
@@ -666,6 +689,14 @@ class DailyEngine(BackfillEngine):
                     except Exception as error:
                         logger.error(f"无法创建或覆盖 daily 任务账本: {error}")
                         return False
+
+                    if run_status_started:
+                        try:
+                            run_status.mark_ledger_reset()
+                        except Exception as error:
+                            logger.exception(
+                                f"无法标记 Daily 任务账本已重置，将继续执行任务: {error}"
+                            )
 
                     logger.info(
                         f"Worker 已稳定，本轮 Daily 任务账本已重置: {ledger.path}；"
@@ -732,6 +763,14 @@ class DailyEngine(BackfillEngine):
                     + ("\n".join(timing_lines) + "\n" if timing_lines else "")
                     + f"  浏览器处理：{browser_action}"
                 )
+
+            if run_status_started and run_status is not None:
+                try:
+                    run_status.finish()
+                except Exception as error:
+                    logger.exception(
+                        f"无法把 Daily 运行状态更新为 finished: {error}"
+                    )
 
 
 if __name__ == "__main__":

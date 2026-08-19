@@ -419,6 +419,53 @@ def task_detail_line(task: dict[str, Any]) -> str:
     return line
 
 
+def task_detail_element(
+    task: dict[str, Any],
+    customer_index: int,
+    task_index: int,
+) -> dict[str, Any]:
+    """有缺失类目时构建二级折叠面板，否则返回普通任务行。"""
+    task_line = task_detail_line(task)
+    categories = task.get("detail_missing_categories")
+    if not categories:
+        return {
+            "tag": "markdown",
+            "content": task_line,
+        }
+
+    return {
+        "tag": "collapsible_panel",
+        "element_id": f"task_{customer_index}_{task_index}",
+        "expanded": False,
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": task_line,
+            },
+            "width": "auto_when_fold",
+            "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "size": "14px 14px",
+            },
+            "icon_position": "left",
+            "icon_expanded_angle": -180,
+            "padding": "1px 0px 1px 0px",
+        },
+        "margin": "0px",
+        "vertical_spacing": "2px",
+        "padding": "2px 0px 4px 24px",
+        "elements": [
+            {
+                "tag": "markdown",
+                "content": "**缺失类目：**\n"
+                + "\n".join(f"• {category}" for category in categories),
+            }
+        ],
+    }
+
+
 def build_card(items: list[dict[str, Any]], title: str) -> dict[str, Any]:
     """构建目录树样式的客户任务折叠卡片。"""
     done = sum(item["status"] == "完成" for item in items)
@@ -451,20 +498,29 @@ def build_card(items: list[dict[str, Any]], title: str) -> dict[str, Any]:
         )
 
     for index, item in enumerate(items, start=1):
-        detail_lines = [
-            f"❌ {platform_name}｜登录失效"
-            for platform_name in item.get("failed_platforms", [])
-        ]
-        for task in item["tasks"]:
-            detail_lines.append(task_detail_line(task))
-            categories = task.get("detail_missing_categories")
-            if categories:
-                detail_lines.append("　**缺失类目：**")
-                detail_lines.extend(
-                    f"　• {category}" for category in categories
-                )
-        if not detail_lines:
-            detail_lines.append(item["note"] or "暂无任务详情")
+        detail_elements: list[dict[str, Any]] = []
+        failed_platforms = item.get("failed_platforms", [])
+        if failed_platforms:
+            detail_elements.append(
+                {
+                    "tag": "markdown",
+                    "content": "\n".join(
+                        f"❌ {platform_name}｜登录失效"
+                        for platform_name in failed_platforms
+                    ),
+                }
+            )
+        detail_elements.extend(
+            task_detail_element(task, index, task_index)
+            for task_index, task in enumerate(item["tasks"], start=1)
+        )
+        if not detail_elements:
+            detail_elements.append(
+                {
+                    "tag": "markdown",
+                    "content": item["note"] or "暂无任务详情",
+                }
+            )
 
         elements.append(
             {
@@ -490,12 +546,7 @@ def build_card(items: list[dict[str, Any]], title: str) -> dict[str, Any]:
                 "margin": "0px",
                 "vertical_spacing": "2px",
                 "padding": "2px 0px 4px 24px",
-                "elements": [
-                    {
-                        "tag": "markdown",
-                        "content": "\n".join(detail_lines),
-                    }
-                ],
+                "elements": detail_elements,
             }
         )
 

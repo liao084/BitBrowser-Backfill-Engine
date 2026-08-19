@@ -259,6 +259,16 @@ def inspect_client(env_path: Path, config: dict[str, Any]) -> dict[str, Any] | N
             task_name = record.get("task_name")
             missing_count = record.get("missing_count")
 
+        detail_missing_categories = None
+        if record is not None:
+            raw_categories = record.get("detail_missing_categories")
+            if isinstance(raw_categories, list):
+                detail_missing_categories = [
+                    category.strip()
+                    for category in raw_categories
+                    if isinstance(category, str) and category.strip()
+                ]
+
         task_details.append(
             {
                 **task,
@@ -267,6 +277,7 @@ def inspect_client(env_path: Path, config: dict[str, Any]) -> dict[str, Any] | N
                 "attempt": attempt,
                 "max_attempts": max_attempts,
                 "missing_count": missing_count,
+                "detail_missing_categories": detail_missing_categories,
             }
         )
 
@@ -430,12 +441,28 @@ def build_card(items: list[dict[str, Any]], title: str) -> dict[str, Any]:
         }
     ]
 
+    has_login_failure = any(item.get("failed_platforms") for item in items)
+    if has_login_failure:
+        elements.append(
+            {
+                "tag": "markdown",
+                "content": "🚨 **登录异常，请及时处理：** <at id=all></at>",
+            }
+        )
+
     for index, item in enumerate(items, start=1):
         detail_lines = [
             f"❌ {platform_name}｜登录失效"
             for platform_name in item.get("failed_platforms", [])
         ]
-        detail_lines.extend(task_detail_line(task) for task in item["tasks"])
+        for task in item["tasks"]:
+            detail_lines.append(task_detail_line(task))
+            categories = task.get("detail_missing_categories")
+            if categories:
+                detail_lines.append("　**缺失类目：**")
+                detail_lines.extend(
+                    f"　• {category}" for category in categories
+                )
         if not detail_lines:
             detail_lines.append(item["note"] or "暂无任务详情")
 

@@ -46,7 +46,7 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 - 日志追加写入 EXE 同目录的 `daily_run.log`。
 - 本次任务结果覆盖写入 `daily_results.jsonl`。
 - 本轮流程状态原子覆盖写入 `daily_run_status.json`。它记录 `run_id`、运行日期、开始和更新时间、`running/finished` 阶段、账本是否已重置，以及各平台登录预检结果。
-- 账本每次尝试除任务 ID、卡片 ID、日期、次数和成功状态外，还记录卡片标题 `task_name` 与后端最终检测到的 `missing_count`。确认无缺失时为 `0`，确认仍有缺失时为正整数，未获得可信终态检测时为 `null`。
+- 账本每次尝试除任务 ID、卡片 ID、日期、次数和成功状态外，还记录卡片标题 `task_name`、后端最终检测到的 `missing_count` 与具体缺失类目 `detail_missing_categories`。类目字段为 `null` 表示未完成可信检测，为空列表表示检测完成且没有缺失类目，非空列表按页面顺序保存全部 `loseItem` 类目。
 - 结束汇总会记录浏览器启动、登录预检、Worker 初始化、任务池执行和本次总运行时间；流程提前失败时也至少记录已经完成的阶段和总耗时。
 - 全部任务成功时，`KEEP_BROWSER_AFTER_RUN=true` 保留浏览器，设为 `false` 则自动关闭；登录失败、初始化失败或存在最终失败任务时始终保留现场供人工检查。
 - 登录态重建预检开始时会清理一次浏览器中的旧 Cookie，再按 `PLATFORMS` 逐个平台注入对应 pkl Cookie 并验证。

@@ -544,10 +544,10 @@ flowchart LR
 每一次最终任务尝试写入一行：
 
 ```json
-{"task_id":"card-1001_2025-07-01_2025-07-01","card":1001,"task_name":"[日] 示例任务","start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false,"missing_count":7}
+{"task_id":"card-1001_2025-07-01_2025-07-01","card":1001,"task_name":"[日] 示例任务","start":"2025-07-01","end":"2025-07-01","attempt":1,"success":false,"missing_count":7,"detail_missing_categories":["示例缺失类目"]}
 ```
 
-`task_name` 在按 ID 找到唯一卡片后、点击卡片前读取。`missing_count` 只保存本次尝试最后一次可信的后端检测结果：成功为 `0`，确认仍有缺失为正整数，未完成终态检测或结果不可信为 `null`。Backfill 和 Daily 共用该账本结构。
+`task_name` 在按 ID 找到唯一卡片后、点击卡片前读取。`missing_count` 只保存本次尝试最后一次可信的后端检测结果：成功为 `0`，确认仍有缺失为正整数，未完成终态检测或结果不可信为 `null`。`detail_missing_categories` 在终态检测完成后读取当前一级弹窗中的全部 `loseItem`：`null` 表示未完成可信检测，空列表表示确认没有缺失类目，非空列表保存具体类目。Backfill 和 Daily 共用该账本结构。
 
 ```mermaid
 flowchart TD
@@ -706,7 +706,7 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 2. 用 `DAILY_TASKS` 中每项的 `card_id` 和 `target_date_offset_days` 还原当天应有的 `task_id`；字段缺失或无效时将该客户标记为配置异常；
 3. 读取 `daily_run_status.json`，只在状态属于今天且 `ledger_reset=true` 时读取新版账本；没有状态文件的旧部署继续兼容；
 4. 从 `auth_results` 汇总登录失效的平台，全部失败时标记“登录异常”；
-5. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量，并展示任务名称和可信的剩余缺失条数；
+5. 读取 `daily_results.jsonl` 的每个任务最新尝试，计算完成数量，并展示任务名称、可信的剩余缺失条数与全部具体缺失类目；
 6. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
 7. 将全部客户状态合并为一条可展开详情的飞书交互卡片。
 

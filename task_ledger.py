@@ -36,6 +36,9 @@ class TaskLedger:
             "attempt": task["attempt"],
             "success": bool(success),
             "missing_count": task.get("missing_count"),
+            "detail_missing_categories": task.get(
+                "detail_missing_categories"
+            ),
         }
         line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
 
@@ -83,6 +86,7 @@ class TaskLedger:
                 "end": record["end"],
                 "attempt": attempt + 1,
                 "missing_count": None,
+                "detail_missing_categories": None,
             }
             for record in latest_by_task.values()
             if record.get("success") is False

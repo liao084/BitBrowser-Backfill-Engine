@@ -282,6 +282,8 @@ class DailyEngine(BackfillEngine):
                     "start": task_date,
                     "end": task_date,
                     "attempt": 1,
+                    "missing_count": None,
+                    "detail_missing_categories": None,
                 }
             )
 
@@ -418,7 +420,12 @@ class DailyEngine(BackfillEngine):
             try:
                 await ledger.record(task, success)
                 if not success and task["attempt"] < self.max_attempts:
-                    retry_task = {**task, "attempt": task["attempt"] + 1}
+                    retry_task = {
+                        **task,
+                        "attempt": task["attempt"] + 1,
+                        "missing_count": None,
+                        "detail_missing_categories": None,
+                    }
                     task_queue.put_nowait(retry_task)
                     logger.warning(
                         f"任务 {task['task_id']} 第 {task['attempt']}/"

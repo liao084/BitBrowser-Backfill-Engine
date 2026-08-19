@@ -896,6 +896,21 @@ class BackfillEngine:
         )
         return None
 
+    async def _read_detail_missing_categories(self, page: Page) -> List[str]:
+        """读取当前一级弹窗中所有 loseItem 类目的文本，保持页面顺序。"""
+        primary_drawer = self._primary_drawer(page)
+        missing_items = primary_drawer.locator(
+            "div.testContent_list_title_testLine_item.loseItem"
+        )
+        categories: List[str] = []
+        for index in range(await missing_items.count()):
+            category = (
+                await missing_items.nth(index).locator("span").first.inner_text()
+            ).strip()
+            if category:
+                categories.append(category)
+        return categories
+
     async def _finish_after_completion_signal(
         self,
         page: Page,
@@ -1119,6 +1134,8 @@ class BackfillEngine:
                         "start": start_date,
                         "end": end_date,
                         "attempt": 1,
+                        "missing_count": None,
+                        "detail_missing_categories": None,
                     }
                 )
 
@@ -1133,8 +1150,9 @@ class BackfillEngine:
     ) -> bool:
         """执行一个独立日期区块；普通失败返回 False，致命页面异常向外抛出。"""
         task_card_id = task["card"]
-        # 每次 attempt 都必须重新产生最终缺失量，不能继承上一次失败结果。
+        # 每次 attempt 都必须重新产生终态结果，不能继承上一次失败详情。
         task["missing_count"] = None
+        task["detail_missing_categories"] = None
         date_chunks = [(task["start"], task["end"])]
         worker_id = f"页面-{list_index + 1}"
         logger.info(
@@ -1202,6 +1220,7 @@ class BackfillEngine:
 
                 if detection_result == 0:
                     task["missing_count"] = 0
+                    task["detail_missing_categories"] = []
                     continue
                 if detection_result is None:
                     logger.warning(
@@ -1295,6 +1314,21 @@ class BackfillEngine:
                     end_date,
                 )
                 task["missing_count"] = missing_count
+                if missing_count is None:
+                    task["detail_missing_categories"] = None
+                elif missing_count == 0:
+                    task["detail_missing_categories"] = []
+                else:
+                    try:
+                        task["detail_missing_categories"] = (
+                            await self._read_detail_missing_categories(page)
+                        )
+                    except Exception as detail_error:
+                        task["detail_missing_categories"] = None
+                        logger.warning(
+                            f"Worker-{worker_id} 读取终态缺失类目失败，"
+                            f"不影响 missing_count 判定: {detail_error}"
+                        )
                 completed_normally = missing_count == 0
                 if completed_normally:
                     logger.info(f"Worker-{worker_id} 成功跑完任务: {start_date} 至 {end_date}")

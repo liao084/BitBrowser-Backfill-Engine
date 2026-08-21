@@ -410,14 +410,19 @@ async def login_tmall_supermarket(
             succeeded = True
             return True
 
-        username_input = page.locator("#fm-login-id")
+        login_frame = page.frame_locator("iframe#alibaba-login-box")
+        username_input = login_frame.locator("#fm-login-id")
         await username_input.wait_for(state="visible", timeout=10000)
         await username_input.click(timeout=10000)
         await page.keyboard.press("ArrowDown")
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(1000)
 
-        login_button = page.get_by_role("button", name="登录", exact=True)
+        login_button = login_frame.get_by_role(
+            "button",
+            name="登录",
+            exact=True,
+        )
         await login_button.click(timeout=10000)
         await page.wait_for_timeout(3000)
 

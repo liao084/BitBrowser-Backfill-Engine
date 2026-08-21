@@ -622,8 +622,60 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} {layer_name}已关闭。")
         return True
 
+    async def _close_message_box_if_visible(
+        self,
+        page: Page,
+        worker_id: str,
+    ) -> bool:
+        """关闭遮挡任务弹窗的最上层可见 ElementUI MessageBox。"""
+        message_box = page.locator("div.el-message-box:visible").last
+        if not await self._locator_is_visible(
+            message_box,
+            worker_id,
+            "提示弹窗",
+        ):
+            return False
+
+        close_button = message_box.locator("i.el-icon-close")
+        close_count = await self._await_page_operation(
+            close_button.count(),
+            worker_id,
+            "查询提示弹窗关闭按钮数量",
+        )
+        if close_count != 1:
+            raise RuntimeError(
+                f"Worker-{worker_id} 提示弹窗内部预期 1 个关闭按钮，"
+                f"实际找到 {close_count} 个"
+            )
+
+        logger.info(f"Worker-{worker_id} 正在关闭页面提示弹窗...")
+        await self._await_page_operation(
+            close_button.evaluate("node => node.click()"),
+            worker_id,
+            "精准点击提示弹窗关闭按钮",
+        )
+
+        try:
+            await message_box.wait_for(state="hidden", timeout=5000)
+        except PlaywrightTimeoutError as error:
+            await self._assert_page_healthy(page, worker_id)
+            if not await self._locator_is_visible(
+                message_box,
+                worker_id,
+                "提示弹窗",
+            ):
+                logger.info(f"Worker-{worker_id} 提示弹窗已在超时边界完成关闭。")
+                return True
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} 提示弹窗关闭指令已发出，但弹窗仍未隐藏"
+            ) from error
+
+        logger.info(f"Worker-{worker_id} 页面提示弹窗已关闭。")
+        return True
+
     async def _restore_primary_state(self, page: Page, worker_id: str):
         """依次关闭三级、二级弹窗，恢复到可操作的一级弹窗。"""
+        await self._close_message_box_if_visible(page, worker_id)
         await self._close_layer_if_visible(
             self._progress_dialog(page), "三级进度弹窗", worker_id
         )
@@ -647,6 +699,7 @@ class BackfillEngine:
 
     async def _close_all_task_layers(self, page: Page, worker_id: str):
         """Worker 初始化时按层级关闭三级、二级和一级弹窗。"""
+        await self._close_message_box_if_visible(page, worker_id)
         await self._close_layer_if_visible(
             self._progress_dialog(page), "三级进度弹窗", worker_id
         )

@@ -17,6 +17,7 @@ on:
       - "dailyfill_launcher_config.example.json"
       - "daily_notify_agent.py"
       - "auth_manager.py"
+      - "login_flows.py"
       - "browser_manager.py"
       - "task_ledger.py"
       - "pyproject.toml"
@@ -54,6 +55,7 @@ jobs:
           dailyfill_launcher.py
           daily_notify_agent.py
           auth_manager.py
+          login_flows.py
           browser_manager.py
           task_ledger.py
 

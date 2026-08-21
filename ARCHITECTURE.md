@@ -668,8 +668,8 @@ flowchart TD
     Start["读取 EXE 同目录 .env"] --> Status["创建 daily_run_status.json<br/>running / ledger_reset=false"]
     Status --> Bit["关闭并启动指定 Bit 浏览器"]
     Bit --> CDP["Playwright connect_over_cdp"]
-    CDP --> Clear["预检开始时全局清理一次旧 Cookie"]
-    Clear --> Auth["按 PLATFORMS 顺序\n访问主页、注入 pkl、再次访问验证"]
+    CDP --> Runtime["创建本轮共享 LoginRuntime\n记录已清理 Cookie domain"]
+    Runtime --> Auth["auth_manager 按 PLATFORMS 顺序\n分发 login_flows 中的具体流程"]
     Auth --> AuthStatus["写入 auth_mode / auth_results"]
     AuthStatus --> Result{"至少一个平台重建成功?"}
     Result -->|"否"| Keep["不创建任务池\n保留失败登录页供人工处理"]
@@ -689,14 +689,19 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 
 ### 登录态重建预检
 
-日常模式不能假定 Bit 浏览器中已有 Cookie 可靠可用。预检因此不是“当前 URL 没有出现 login 就通过”，而是一次确定性的登录态重建：
+日常模式不能假定 Bit 浏览器中的登录态可靠可用。`auth_manager.py` 只负责共享环境准备、按配置顺序分发流程并生成 `AuthReport`；具体 URL、等待、定位器、点击和验证动作保存在 `login_flows.py`，第一版不提前抽象跨平台基类。
 
-1. 对整个 `BrowserContext` 执行一次 `clear_cookies()`；
-2. 对 `.env` 的每个 `PLATFORMS` 项访问 `home_url`，加载该平台 pkl 中 `cookie_key` 对应的 Cookie 并注入；
-3. 再次访问 `home_url`；仍进入 `login_url_markers` 指定的登录页则判定失败；
-4. 成功预检页关闭，失败预检页保留给人工巡检或登录。
+当前登录预检规则为：
 
-`BrowserContext` 的 Cookie 覆盖全部站点，所以清理动作必须只执行一次。若在“注入抖音 Cookie”后又为京东执行全局清理，抖音 Cookie 会被删除，最终抖音业务页仍会失效。
+1. `auth_manager.py` 为整轮预检创建一个共享 `LoginRuntime`，再按配置顺序将每个平台交给 `auth_mode` 对应的注册流程；
+2. `pkl_cookie` 流程在清理旧状态前完整加载并格式化 pkl，无法得到有效 Cookie 或 domain 时直接失败；
+3. 流程只清理 pkl 中涉及的精确 Cookie domain，不再清空整个 `BrowserContext`；
+4. `LoginRuntime` 保存本轮已经清理的 domain；多个平台涉及同一父域时，只有第一个平台清理，后续平台直接补充自己的 Cookie；
+5. 注入完成后再次访问 `home_url`，仍进入 `login_url_markers` 指定的登录页则判定失败；
+6. `1688_button_login` 流程沿用现有按钮登录和成功元素校验；
+7. 成功预检页关闭，失败预检页保留给人工巡检或登录。
+
+按 domain 清理会移除该 domain 下所有名称和路径的旧 Cookie。该策略适用于当前“一台浏览器通常只重建一个平台登录态”的业务模式，同时保留其他未涉及 domain 的既有登录态。
 
 ### 单机飞书巡检器
 

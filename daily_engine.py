@@ -20,7 +20,7 @@ os.environ.setdefault("RPA_CONSOLE_LOGGING", "0")
 from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Page, async_playwright
 
-from auth_manager import AuthReport, CookieAuthManager
+from auth_manager import AuthManager, AuthReport
 from backfill_engine import (
     BackfillEngine,
     TaskPageInitializationError,
@@ -242,7 +242,7 @@ class DailyEngine(BackfillEngine):
         self.task_url = task_url
         self.keep_browser_after_run = keep_browser_after_run
         self.browser_manager = BitBrowserManager(bite_id, self.bt_url)
-        self.auth_manager = CookieAuthManager(bite_id, self.cookie_dir)
+        self.auth_manager = AuthManager(bite_id, self.cookie_dir)
 
     def build_daily_tasks(
         self,

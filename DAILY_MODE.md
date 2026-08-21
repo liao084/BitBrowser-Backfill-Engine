@@ -36,6 +36,14 @@ Daily-mode 使用以下字段：
 
 JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`。建议将 `.env` 保存为 UTF-8。
 
+天猫超市后台当前需要在 Launcher 生成 `.env` 后，人工把对应平台配置为：
+
+```dotenv
+PLATFORMS='[{"name":"天猫超市后台","home_url":"https://web.txcs.tmall.com/pages/chaoshi/merchandise_sc_item_list_rex?fromSC=1","auth_mode":"tmall_supermarket_active_login","auth_params":{"username":"实际账号","password":"实际密码"}}]'
+```
+
+如果同一客户还有其他平台，应将这个对象追加到原有 `PLATFORMS` 数组，而不是覆盖其他平台。再次通过 Launcher 保存该客户时，当前人工添加的 `auth_params` 可能被平台模板覆盖，需要重新核对。
+
 任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
 `target_date_offset_days`、全局 `TARGET_DATE_OFFSET_DAYS`。因此旧 `.env`
 可以继续运行，新 Launcher 保存后则会为每个任务写入各自的日期偏移。
@@ -52,7 +60,7 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 - `auth_manager.py` 负责预检顺序、共享登录环境和结果汇总；`login_flows.py` 保存各 `auth_mode` 的完整页面操作。
 - 登录预检不再全局清空 `BrowserContext` Cookie；`pkl_cookie` 流程先完整加载并格式化 pkl，再只清理其中涉及的精确 domain，随后注入并验证。
 - 同一轮预检的所有流程共用一个 `LoginRuntime`；已经清理过的 domain 会被记录，后续平台遇到相同 domain 时只注入自己的 Cookie，不再重复清理。
-- 天猫超市后台使用 `tmall_supermarket_active_login`：流程访问固定登录入口，通过浏览器密码管理器选择已保存账号，依次点击“登录”和“进入商家”，最后以 `home_url` 的域名与路径确认进入目标业务页。
+- 天猫超市后台使用 `tmall_supermarket_active_login`：流程从该平台的 `auth_params.username` 和 `auth_params.password` 读取帐密，在登录 iframe 内填写后依次点击“登录”和“进入商家”，最后以 `home_url` 的域名与路径确认进入目标业务页。帐密以明文保存在部署环境的 `.env` 中，不要写入 Launcher 配置或提交到 Git。
 - 登录态重建全部失败时不会创建任务池；失败平台页面会保留供人工登录。
 - `daily_run_status.json` 在任务配置校验完成后先以 `ledger_reset=false` 创建，登录预检后写入平台结果，Worker 稳定且账本重置成功后改为 `true`，最外层退出时将阶段改为 `finished`。新进程启动后拥有状态文件，旧进程不能再覆盖它。
 - 任务失败且未达到 `MAX_ATTEMPTS` 时，会立即以 `attempt + 1` 放回共享队列尾部，不再等待其他任务全部结束后进行总体重试。

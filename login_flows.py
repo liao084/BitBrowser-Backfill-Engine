@@ -382,10 +382,24 @@ async def login_tmall_supermarket(
     runtime: LoginRuntime,
     platform: Dict[str, Any],
 ) -> bool:
-    """使用浏览器密码管理器主动登录天猫超市后台。"""
+    """使用平台 auth_params 中的帐密主动登录天猫超市后台。"""
     platform_name = platform["name"]
     home_url = platform["home_url"]
     success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+
     page = await runtime.context.new_page()
     succeeded = False
 
@@ -412,11 +426,14 @@ async def login_tmall_supermarket(
 
         login_frame = page.frame_locator("iframe#alibaba-login-box")
         username_input = login_frame.locator("#fm-login-id")
-        await username_input.wait_for(state="visible", timeout=10000)
-        await username_input.click(timeout=10000)
-        await page.keyboard.press("ArrowDown")
-        await page.keyboard.press("Enter")
-        await page.wait_for_timeout(1000)
+        password_input = login_frame.locator("#fm-login-password")
+        try:
+            await username_input.fill(username, timeout=10000)
+            await password_input.fill(password, timeout=10000)
+        except Exception as error:
+            raise RuntimeError(
+                f"{platform_name} 登录帐密填写失败"
+            ) from error
 
         login_button = login_frame.get_by_role(
             "button",

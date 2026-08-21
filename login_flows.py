@@ -21,6 +21,13 @@ from playwright.async_api import (
 logger = logging.getLogger("BackfillEngine")
 
 
+TMALL_SUPERMARKET_LOGIN_URL = (
+    "https://web.txcs.tmall.com/login?"
+    "from=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2F"
+    "merchandise_sc_item_list_rex%3FfromSC%3D1"
+)
+
+
 @dataclass(frozen=True)
 class LoginRuntime:
     """具体登录流程运行时需要的外部资源。"""
@@ -38,6 +45,12 @@ def _is_login_page(url: str, platform: Dict[str, Any]) -> bool:
     normalized_url = url.lower()
     markers = platform.get("login_url_markers", ["/login"])
     return any(str(marker).lower() in normalized_url for marker in markers)
+
+
+def _business_url_marker(home_url: str) -> str:
+    """生成不含协议和查询参数的业务页 URL 标记。"""
+    parsed = urlparse(home_url)
+    return f"{parsed.netloc}{parsed.path}".lower()
 
 
 def _cookie_candidates(
@@ -363,9 +376,82 @@ async def login_1688(
                 await page.close()
             except Exception as error:
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
+async def login_tmall_supermarket(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """使用浏览器密码管理器主动登录天猫超市后台。"""
+    platform_name = platform["name"]
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {TMALL_SUPERMARKET_LOGIN_URL}")
+        try:
+            await page.goto(
+                TMALL_SUPERMARKET_LOGIN_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
+            )
+        await page.wait_for_timeout(2000)
+
+        if success_url_marker in page.url.lower():
+            logger.info(
+                f"✓ {platform_name} 已直接进入目标业务页，最终 URL: {page.url}"
+            )
+            succeeded = True
+            return True
+
+        username_input = page.locator("#fm-login-id")
+        await username_input.wait_for(state="visible", timeout=10000)
+        await username_input.click(timeout=10000)
+        await page.keyboard.press("ArrowDown")
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(1000)
+
+        login_button = page.get_by_role("button", name="登录", exact=True)
+        await login_button.click(timeout=10000)
+        await page.wait_for_timeout(3000)
+
+        enter_merchant_button = page.get_by_role(
+            "button",
+            name="进入商家",
+            exact=True,
+        )
+        await enter_merchant_button.click(timeout=10000)
+        await page.wait_for_url(
+            lambda url: success_url_marker in str(url).lower(),
+            timeout=30000,
+        )
+
+        logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
 LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
+    "tmall_supermarket_active_login": login_tmall_supermarket,
 }
 
 

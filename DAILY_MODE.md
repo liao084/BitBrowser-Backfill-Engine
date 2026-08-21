@@ -52,6 +52,7 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 - `auth_manager.py` 负责预检顺序、共享登录环境和结果汇总；`login_flows.py` 保存各 `auth_mode` 的完整页面操作。
 - 登录预检不再全局清空 `BrowserContext` Cookie；`pkl_cookie` 流程先完整加载并格式化 pkl，再只清理其中涉及的精确 domain，随后注入并验证。
 - 同一轮预检的所有流程共用一个 `LoginRuntime`；已经清理过的 domain 会被记录，后续平台遇到相同 domain 时只注入自己的 Cookie，不再重复清理。
+- 天猫超市后台使用 `tmall_supermarket_active_login`：流程访问固定登录入口，通过浏览器密码管理器选择已保存账号，依次点击“登录”和“进入商家”，最后以 `home_url` 的域名与路径确认进入目标业务页。
 - 登录态重建全部失败时不会创建任务池；失败平台页面会保留供人工登录。
 - `daily_run_status.json` 在任务配置校验完成后先以 `ledger_reset=false` 创建，登录预检后写入平台结果，Worker 稳定且账本重置成功后改为 `true`，最外层退出时将阶段改为 `finished`。新进程启动后拥有状态文件，旧进程不能再覆盖它。
 - 任务失败且未达到 `MAX_ATTEMPTS` 时，会立即以 `attempt + 1` 放回共享队列尾部，不再等待其他任务全部结束后进行总体重试。

@@ -443,7 +443,8 @@ async def login_tmall_supermarket(
         await login_button.click(timeout=10000)
         await page.wait_for_timeout(3000)
 
-        enter_merchant_button = page.get_by_role(
+        merchant_frame = page.frame_locator("iframe").nth(2)
+        enter_merchant_button = merchant_frame.get_by_role(
             "button",
             name="进入商家",
             exact=True,

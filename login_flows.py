@@ -469,15 +469,33 @@ async def login_tmall_supermarket(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
-async def login_taobao(
+async def login_qianniu_workbench(
     runtime: LoginRuntime,
     platform: Dict[str, Any],
 ) -> bool:
-    """通过淘宝统一登录页主动建立淘系平台登录态。"""
+    """使用平台 auth_params 中的帐密主动登录千牛工作台。"""
     platform_name = platform["name"]
-    login_url = "https://login.taobao.com/havanaone/login/login.htm"
+    login_url = (
+        "https://loginmyseller.taobao.com/?from=&f=top&style=&sub=true&"
+        "redirect_url=https%3A%2F%2Fmyseller.taobao.com%2Fhome.htm%2F"
+        "QnworkbenchHome%2F"
+    )
     home_url = platform["home_url"]
     success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+
     page = await runtime.context.new_page()
     succeeded = False
 
@@ -502,11 +520,18 @@ async def login_taobao(
             succeeded = True
             return True
 
-        agreement_checkbox = page.locator("#fm-agreement-checkbox")
-        if not await agreement_checkbox.is_checked():
-            await agreement_checkbox.click(timeout=10000)
+        login_frame = page.frame_locator("iframe").nth(0)
+        username_input = login_frame.locator("#fm-login-id")
+        password_input = login_frame.locator("#fm-login-password")
+        try:
+            await username_input.fill(username, timeout=10000)
+            await password_input.fill(password, timeout=10000)
+        except Exception as error:
+            raise RuntimeError(
+                f"{platform_name} 登录帐密填写失败"
+            ) from error
 
-        login_button = page.get_by_role(
+        login_button = login_frame.get_by_role(
             "button",
             name="登录",
             exact=True,
@@ -538,7 +563,7 @@ LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
     "tmall_supermarket_active_login": login_tmall_supermarket,
-    "taobao_active_login": login_taobao,
+    "qianniu_workbench_active_login": login_qianniu_workbench,
 }
 
 

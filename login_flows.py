@@ -26,6 +26,10 @@ TMALL_SUPERMARKET_LOGIN_URL = (
     "from=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2F"
     "merchandise_sc_item_list_rex%3FfromSC%3D1"
 )
+TAOBAO_LOGIN_URL = "https://login.taobao.com/havanaone/login/login.htm"
+TAOBAO_SELLER_HOME_URL = (
+    "https://myseller.taobao.com/home.htm/QnworkbenchHome/"
+)
 
 
 @dataclass(frozen=True)
@@ -471,10 +475,74 @@ async def login_tmall_supermarket(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
+async def login_taobao(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """通过淘宝统一登录页主动建立淘系平台登录态。"""
+    platform_name = platform["name"]
+    success_url_marker = _business_url_marker(TAOBAO_SELLER_HOME_URL)
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {TAOBAO_LOGIN_URL}")
+        try:
+            await page.goto(
+                TAOBAO_LOGIN_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
+            )
+        await page.wait_for_timeout(2000)
+
+        if success_url_marker in page.url.lower():
+            logger.info(
+                f"✓ {platform_name} 已直接进入天猫商家中心，最终 URL: {page.url}"
+            )
+            succeeded = True
+            return True
+
+        agreement_checkbox = page.locator("#fm-agreement-checkbox")
+        if not await agreement_checkbox.is_checked():
+            await agreement_checkbox.click(timeout=10000)
+
+        login_button = page.get_by_role(
+            "button",
+            name="登录",
+            exact=True,
+        )
+        await login_button.click(timeout=10000)
+        await page.wait_for_url(
+            lambda url: success_url_marker in str(url).lower(),
+            timeout=30000,
+        )
+        await page.wait_for_load_state("domcontentloaded", timeout=30000)
+
+        logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
 LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
     "tmall_supermarket_active_login": login_tmall_supermarket,
+    "taobao_active_login": login_taobao,
 }
 
 

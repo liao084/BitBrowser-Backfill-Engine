@@ -21,17 +21,6 @@ from playwright.async_api import (
 logger = logging.getLogger("BackfillEngine")
 
 
-TMALL_SUPERMARKET_LOGIN_URL = (
-    "https://web.txcs.tmall.com/login?"
-    "from=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2F"
-    "merchandise_sc_item_list_rex%3FfromSC%3D1"
-)
-TAOBAO_LOGIN_URL = "https://login.taobao.com/havanaone/login/login.htm"
-TAOBAO_SELLER_HOME_URL = (
-    "https://myseller.taobao.com/home.htm/QnworkbenchHome/"
-)
-
-
 @dataclass(frozen=True)
 class LoginRuntime:
     """具体登录流程运行时需要的外部资源。"""
@@ -388,6 +377,11 @@ async def login_tmall_supermarket(
 ) -> bool:
     """使用平台 auth_params 中的帐密主动登录天猫超市后台。"""
     platform_name = platform["name"]
+    login_url = (
+        "https://web.txcs.tmall.com/login?"
+        "from=https%3A%2F%2Fweb.txcs.tmall.com%2Fpages%2Fchaoshi%2F"
+        "merchandise_sc_item_list_rex%3FfromSC%3D1"
+    )
     home_url = platform["home_url"]
     success_url_marker = _business_url_marker(home_url)
     auth_params = platform.get("auth_params")
@@ -408,10 +402,10 @@ async def login_tmall_supermarket(
     succeeded = False
 
     try:
-        logger.info(f"开始主动登录 {platform_name}: {TMALL_SUPERMARKET_LOGIN_URL}")
+        logger.info(f"开始主动登录 {platform_name}: {login_url}")
         try:
             await page.goto(
-                TMALL_SUPERMARKET_LOGIN_URL,
+                login_url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
@@ -481,15 +475,17 @@ async def login_taobao(
 ) -> bool:
     """通过淘宝统一登录页主动建立淘系平台登录态。"""
     platform_name = platform["name"]
-    success_url_marker = _business_url_marker(TAOBAO_SELLER_HOME_URL)
+    login_url = "https://login.taobao.com/havanaone/login/login.htm"
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
     page = await runtime.context.new_page()
     succeeded = False
 
     try:
-        logger.info(f"开始主动登录 {platform_name}: {TAOBAO_LOGIN_URL}")
+        logger.info(f"开始主动登录 {platform_name}: {login_url}")
         try:
             await page.goto(
-                TAOBAO_LOGIN_URL,
+                login_url,
                 wait_until="domcontentloaded",
                 timeout=30000,
             )
@@ -497,7 +493,7 @@ async def login_taobao(
             logger.warning(
                 f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
             )
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(3000)
 
         if success_url_marker in page.url.lower():
             logger.info(

@@ -43,6 +43,10 @@ class WorkerUnresponsiveError(RuntimeError):
     """页面仍连接但已无法在限定时间内响应，当前Worker必须退出。"""
 
 
+class PageProbeTimeoutError(RuntimeError):
+    """单次页面探针超时；当前任务失败，但不足以判定Worker失效。"""
+
+
 class TaskPageInitializationError(RuntimeError):
     """单次任务页面初始化失败；连续发生时触发Worker熔断。"""
 
@@ -130,9 +134,12 @@ class BackfillEngine:
         # 红色错误提示保留时间：既给人工观察留出窗口，也避免长期堆积遮挡页面。
         self.error_toast_grace_seconds = 30
         # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。
-        self.page_probe_timeout_seconds = 10
+        self.page_probe_timeout_seconds = 20
+        # 探针超时通常来自浏览器高负载，冷却后保留Worker并重试队列任务。
+        self.page_probe_cooldown_seconds = 10
         # 普通初始化异常允许短暂恢复，连续达到阈值后隔离当前Worker。
-        self.max_consecutive_initialization_failures = 3
+        self.initialization_failure_cooldown_seconds = 20
+        self.max_consecutive_initialization_failures = 5
         self._error_toast_close_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -168,7 +175,7 @@ class BackfillEngine:
         try:
             return await asyncio.wait_for(operation, timeout=timeout)
         except asyncio.TimeoutError as error:
-            raise WorkerUnresponsiveError(
+            raise PageProbeTimeoutError(
                 f"Worker-{worker_id} {operation_name}超过 {timeout:g} 秒无响应"
             ) from error
 
@@ -1184,13 +1191,21 @@ class BackfillEngine:
             logger.info(f"Worker-{worker_id} 初始化完成，已成功进入补采专属弹窗！")
             
             # 不需要记录基准线，依靠锚点即可
+        except PageProbeTimeoutError as e:
+            logger.warning(
+                f"Worker-{worker_id} 初始化期间页面探针超时，"
+                f"等待 {self.page_probe_cooldown_seconds} 秒后将当前任务记为失败；"
+                f"Worker保持运行: {e}"
+            )
+            await asyncio.sleep(self.page_probe_cooldown_seconds)
+            return False
         except Exception as e:
             fatal_reason = self._fatal_page_error_reason(e)
             if fatal_reason:
                 logger.error(f"Worker-{worker_id} 初始化期间检测到致命页面异常（{fatal_reason}），停止该Worker: {e}")
                 raise
             logger.error(f"Worker-{worker_id} 任务页面初始化失败: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.initialization_failure_cooldown_seconds)
             raise TaskPageInitializationError(
                 f"Worker-{worker_id} 任务页面初始化失败"
             ) from e
@@ -1339,6 +1354,20 @@ class BackfillEngine:
                     )
                 return completed_normally
                 
+            except PageProbeTimeoutError as e:
+                current_state = (
+                    "已经提交【全店补齐】，但最终结果未知"
+                    if task_submitted
+                    else "尚未完成【全店补齐】提交"
+                )
+                logger.warning(
+                    f"Worker-{worker_id} 在执行 {start_date} 至 {end_date} "
+                    f"期间页面探针超时（{current_state}），等待 "
+                    f"{self.page_probe_cooldown_seconds} 秒后将当前任务记为失败；"
+                    f"Worker保持运行: {e}"
+                )
+                await asyncio.sleep(self.page_probe_cooldown_seconds)
+                return False
             except Exception as e:
                 fatal_reason = self._fatal_page_error_reason(e)
                 if fatal_reason:

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import pickle
 from dataclasses import dataclass, field
@@ -13,6 +14,7 @@ from urllib.parse import urlparse
 
 from playwright.async_api import (
     BrowserContext,
+    Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
 )
@@ -224,7 +226,6 @@ async def _goto_home(page: Page, home_url: str) -> None:
     except PlaywrightTimeoutError:
         logger.warning(f"访问平台主页等待超时，将根据当前 URL 继续判断: {home_url}")
     await page.wait_for_timeout(2000)
-
 
 async def login_with_pkl_cookie(
     runtime: LoginRuntime,
@@ -559,11 +560,158 @@ async def login_qianniu_workbench(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
+async def login_dou_shop(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """主动登录抖店、选择目标店铺并准备后续业务页面。"""
+    platform_name = platform["name"]
+    login_url = "https://fxg.jinritemai.com/login/common?from=buyin"
+    login_success_url_marker = "/ffa/mshop/homepage/index"
+    captcha_selector = "div.vc-captcha-verify-visibility"
+    home_url = platform["home_url"]
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    shop_name = auth_params.get("shop_name")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+    if not isinstance(shop_name, str) or not shop_name.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 shop_name。")
+        return False
+
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {login_url}")
+        try:
+            await page.goto(
+                login_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
+            )
+        await page.wait_for_timeout(3000)
+
+        if login_success_url_marker in page.url:
+            logger.info(f"✓ {platform_name} 当前会话已经登录: {page.url}")
+        else:
+            # 会话未登录时直接执行邮箱登录，不提前查找店铺容器。
+            mail_login = page.get_by_text("邮箱登录", exact=True)
+            await mail_login.click(timeout=30000)
+
+            username_input = page.locator("input.ace-input").nth(0)
+            password_input = page.locator("input.ace-input").nth(1)
+            try:
+                await username_input.fill(username, timeout=10000)
+                await password_input.fill(password, timeout=10000)
+            except Exception as error:
+                raise RuntimeError(
+                    f"{platform_name} 登录帐密填写失败"
+                ) from error
+
+            agreement = page.locator("input.auxo-checkbox-input")
+            await agreement.check(timeout=10000)
+
+            # 当前页面勾选协议后会自动提交；如页面行为变化，可启用以下两行。
+            # login_button = page.get_by_role("button", name="登录", exact=True)
+            # await login_button.click(timeout=10000)
+
+            await page.wait_for_timeout(2000)
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 30
+            target_shop: Optional[Locator] = None
+            while loop.time() < deadline:
+                if login_success_url_marker in page.url:
+                    break
+
+                sliders = page.locator(captcha_selector)
+                slider_visible = False
+                for index in range(await sliders.count()):
+                    if await sliders.nth(index).is_visible():
+                        slider_visible = True
+                        break
+                if slider_visible:
+                    logger.error(
+                        f"{platform_name} 检测到登录滑块，"
+                        "当前版本暂不处理，本轮登录预检失败。"
+                    )
+                    return False
+
+                shops = page.get_by_text(shop_name, exact=True)
+                for index in range(await shops.count()):
+                    shop = shops.nth(index)
+                    if await shop.is_visible():
+                        target_shop = shop
+                        break
+                if target_shop is not None:
+                    break
+
+                await page.wait_for_timeout(500)
+            else:
+                raise PlaywrightTimeoutError(
+                    f"等待 {platform_name} 登录结果超过 30 秒"
+                )
+
+            if target_shop is not None:
+                logger.info(f"正在选择目标店铺: {shop_name}")
+                await target_shop.click(timeout=30000)
+                await page.wait_for_url(
+                    lambda url: login_success_url_marker in str(url),
+                    timeout=30000,
+                )
+                await page.wait_for_timeout(2000)
+                logger.info(
+                    f"✓ 已选择店铺 [{shop_name}]，当前页面: {page.url}"
+                )
+            else:
+                logger.info(f"✓ {platform_name} 主动登录完成: {page.url}")
+
+        logger.info(f"正在打开 {platform_name} 业务页: {home_url}")
+        await page.goto(
+            home_url,
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        await page.wait_for_timeout(3000)
+        await page.reload(wait_until="domcontentloaded", timeout=30000)
+        await page.wait_for_timeout(10000)
+
+        logger.info(f"✓ {platform_name} 业务页登录态准备完成: {page.url}")
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
 LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
     "tmall_supermarket_active_login": login_tmall_supermarket,
     "qianniu_workbench_active_login": login_qianniu_workbench,
+    "dou_shop_active_login": login_dou_shop,
 }
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Dailyfill 客户实例管理器：生成 .env、更新通用 EXE 并启动客户实例。"""
+"""Dailyfill 客户实例管理器：生成基础 .env、更新通用 EXE 并启动实例。"""
 
 from __future__ import annotations
 
@@ -81,8 +81,8 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
 
     if not isinstance(config["customers"], list):
         raise ValueError("customers 必须是 JSON 数组")
-    if not isinstance(config["platforms"], list) or not config["platforms"]:
-        raise ValueError("platforms 必须是非空 JSON 数组")
+    if not isinstance(config["platforms"], list):
+        raise ValueError("platforms 必须是 JSON 数组")
     return config
 
 
@@ -94,7 +94,8 @@ def build_env_content(values: dict[str, Any]) -> str:
     """生成 daily_engine 实际读取的客户配置。"""
     return "\n".join(
         [
-            "# 由 dailyfill_launcher 生成；需要调整时请优先使用管理器。",
+            "# 由 dailyfill_launcher 生成基础配置；可在保存后手动补充。",
+            "# 注意：再次通过 Launcher 保存会覆盖手动修改。",
             "",
             f"BITE_ID={json_env_value(values['bite_id'])}",
             f"GC_PAGE_URL_MARKERS={json_env_value(values['markers'])}",
@@ -171,9 +172,6 @@ class DailyfillLauncherWindow(QMainWindow):
             and isinstance(platform.get("markers"), list)
             and str(platform.get("home_url", "")).strip()
         ]
-        if not self.platforms:
-            raise ValueError("platforms 中没有可用的平台配置")
-
         self.platform_checks: dict[str, QCheckBox] = {}
         self.customer_dirs: dict[str, Path] = {}
         self.cookie_dir = ""
@@ -258,7 +256,7 @@ class DailyfillLauncherWindow(QMainWindow):
         return group
 
     def _build_platform_group(self) -> QGroupBox:
-        group = QGroupBox("业务平台")
+        group = QGroupBox("业务平台（可留空，保存后手动补充）")
         group.setMaximumWidth(210)
         layout = QVBoxLayout(group)
 
@@ -612,10 +610,6 @@ class DailyfillLauncherWindow(QMainWindow):
             raise ValueError("BITE_ID 不能为空")
 
         markers, platforms = self._selected_platform_values()
-        if not platforms:
-            raise ValueError("请至少选择一个业务平台")
-        if not markers:
-            raise ValueError("业务执行页 URL 标识不能为空")
 
         tasks = self._all_tasks()
         if not tasks:

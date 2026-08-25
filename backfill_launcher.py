@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Backfill 客户实例管理器：生成 .env、更新通用 EXE 并启动客户实例。"""
+"""Backfill 客户实例管理器：生成基础 .env、更新通用 EXE 并启动实例。"""
 
 from __future__ import annotations
 
@@ -82,8 +82,8 @@ def load_launcher_config(config_path: Path) -> dict[str, Any]:
 
     if not isinstance(config["customers"], list):
         raise ValueError("customers 必须是 JSON 数组")
-    if not isinstance(config["platforms"], list) or not config["platforms"]:
-        raise ValueError("platforms 必须是非空 JSON 数组")
+    if not isinstance(config["platforms"], list):
+        raise ValueError("platforms 必须是 JSON 数组")
     return config
 
 
@@ -95,7 +95,8 @@ def build_env_content(values: dict[str, Any]) -> str:
     """只生成历史补采实际读取的配置。"""
     return "\n".join(
         [
-            "# 由 backfill_launcher 生成；需要调整时请优先使用管理器。",
+            "# 由 backfill_launcher 生成基础配置；可在保存后手动补充。",
+            "# 注意：再次通过 Launcher 保存会覆盖手动修改。",
             "",
             f"BROWSER_TYPE={values['browser_type']}",
             f"BITE_ID={json_env_value(values['bite_id'])}",
@@ -256,7 +257,7 @@ class BackfillLauncherWindow(QMainWindow):
         return group
 
     def _build_platform_group(self) -> QGroupBox:
-        group = QGroupBox("业务平台（用于识别业务执行页）")
+        group = QGroupBox("业务平台（可留空，保存后手动补充）")
         group.setMaximumWidth(210)
         layout = QVBoxLayout(group)
 
@@ -624,8 +625,6 @@ class BackfillLauncherWindow(QMainWindow):
             raise ValueError("外部浏览器模式必须填写 CDP 地址")
 
         markers = self._selected_markers()
-        if not markers:
-            raise ValueError("请至少选择一个业务平台或填写一个 URL 标识")
 
         tasks = self._all_tasks()
         if not tasks:

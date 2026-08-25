@@ -706,12 +706,61 @@ async def login_dou_shop(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
+async def login_pdd_manually(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """检查拼多多商家后台登录态，掉登录时保留页面供人工处理。"""
+    platform_name = platform["name"]
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始检查 {platform_name} 登录状态: {home_url}")
+        try:
+            await page.goto(
+                home_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 商家后台等待超时，将根据当前 URL 继续判断。"
+            )
+        await page.wait_for_timeout(5000)
+
+        if success_url_marker in page.url.lower():
+            logger.info(f"✓ {platform_name} 登录状态正常，当前 URL: {page.url}")
+            succeeded = True
+            return True
+
+        logger.error(
+            f"{platform_name} 当前未登录，请在保留页面中人工完成验证；"
+            f"当前 URL: {page.url}"
+        )
+        return False
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 登录状态检查失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
 LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
     "tmall_supermarket_active_login": login_tmall_supermarket,
     "qianniu_workbench_active_login": login_qianniu_workbench,
     "dou_shop_active_login": login_dou_shop,
+    "pdd_manual_login": login_pdd_manually,
 }
 
 

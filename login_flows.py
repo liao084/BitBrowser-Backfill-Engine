@@ -14,7 +14,6 @@ from urllib.parse import urlparse
 
 from playwright.async_api import (
     BrowserContext,
-    Locator,
     Page,
     TimeoutError as PlaywrightTimeoutError,
 )
@@ -633,7 +632,7 @@ async def login_dou_shop(
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + 30
-            target_shop: Optional[Locator] = None
+            target_shop = page.get_by_text(shop_name, exact=True)
             while loop.time() < deadline:
                 if login_success_url_marker in page.url:
                     break
@@ -651,13 +650,7 @@ async def login_dou_shop(
                     )
                     return False
 
-                shops = page.get_by_text(shop_name, exact=True)
-                for index in range(await shops.count()):
-                    shop = shops.nth(index)
-                    if await shop.is_visible():
-                        target_shop = shop
-                        break
-                if target_shop is not None:
+                if await target_shop.is_visible():
                     break
 
                 await page.wait_for_timeout(500)
@@ -666,7 +659,7 @@ async def login_dou_shop(
                     f"等待 {platform_name} 登录结果超过 30 秒"
                 )
 
-            if target_shop is not None:
+            if login_success_url_marker not in page.url:
                 logger.info(f"正在选择目标店铺: {shop_name}")
                 await target_shop.click(timeout=30000)
                 await page.wait_for_url(
@@ -691,6 +684,108 @@ async def login_dou_shop(
         await page.wait_for_timeout(10000)
 
         logger.info(f"✓ {platform_name} 业务页登录态准备完成: {page.url}")
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
+async def login_kuaishou_xiaodian(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """主动登录快手小店并选择目标店铺。"""
+    platform_name = platform["name"]
+    login_url = (
+        "https://login.kwaixiaodian.com/?biz=zone&redirect_url="
+        "https%3A%2F%2Fs.kwaixiaodian.com%2Fzone%2Fgoods%2Fmanage%2F"
+        "comment%2Flist%3FfromSC%3D1"
+    )
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    shop_name = auth_params.get("shop_name")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+    if not isinstance(shop_name, str) or not shop_name.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 shop_name。")
+        return False
+
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {login_url}")
+        try:
+            await page.goto(
+                login_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
+            )
+
+        if success_url_marker in page.url.lower():
+            logger.info(f"✓ {platform_name} 当前会话已经登录: {page.url}")
+        else:
+            username_input = page.get_by_role(
+                "textbox",
+                name="请输入手机号",
+                exact=True,
+            )
+            password_input = page.get_by_role(
+                "textbox",
+                name="请输入密码",
+                exact=True,
+            )
+            try:
+                await username_input.fill(username, timeout=10000)
+                await password_input.fill(password, timeout=10000)
+            except Exception as error:
+                raise RuntimeError(
+                    f"{platform_name} 登录帐密填写失败"
+                ) from error
+
+            login_button = page.get_by_role(
+                "button",
+                name="快手商家账号登录",
+                exact=True,
+            )
+            await login_button.click(timeout=10000)
+            await page.wait_for_timeout(3000)
+
+            if success_url_marker not in page.url.lower():
+                target_shop = page.get_by_text(shop_name, exact=True)
+                logger.info(f"正在选择目标店铺: {shop_name}")
+                await target_shop.click(timeout=30000)
+                await page.wait_for_url(
+                    lambda url: success_url_marker in str(url).lower(),
+                    timeout=30000,
+                )
+
+            logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+
         succeeded = True
         return True
     except Exception as error:
@@ -760,6 +855,7 @@ LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "tmall_supermarket_active_login": login_tmall_supermarket,
     "qianniu_workbench_active_login": login_qianniu_workbench,
     "dou_shop_active_login": login_dou_shop,
+    "kuaishou_xiaodian_active_login": login_kuaishou_xiaodian,
     "pdd_manual_login": login_pdd_manually,
 }
 

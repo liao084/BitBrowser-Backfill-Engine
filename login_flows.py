@@ -801,14 +801,28 @@ async def login_kuaishou_xiaodian(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
-async def login_pdd_manually(
+async def login_pdd(
     runtime: LoginRuntime,
     platform: Dict[str, Any],
 ) -> bool:
-    """检查拼多多商家后台登录态，掉登录时保留页面供人工处理。"""
+    """主动尝试登录拼多多商家后台，未完成时保留页面供人工处理。"""
     platform_name = platform["name"]
     home_url = platform["home_url"]
     success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+
     page = await runtime.context.new_page()
     succeeded = False
 
@@ -824,21 +838,64 @@ async def login_pdd_manually(
             logger.warning(
                 f"访问 {platform_name} 商家后台等待超时，将根据当前 URL 继续判断。"
             )
-        await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(3000)
 
         if success_url_marker in page.url.lower():
             logger.info(f"✓ {platform_name} 登录状态正常，当前 URL: {page.url}")
             succeeded = True
             return True
 
-        logger.error(
-            f"{platform_name} 当前未登录，请在保留页面中人工完成验证；"
-            f"当前 URL: {page.url}"
+        logger.info(f"{platform_name} 当前未登录，开始主动登录流程。")
+
+        switch_login = page.get_by_text("账号登录", exact=True)
+        await switch_login.click(timeout=10000)
+
+        username_input = page.get_by_role(
+            "textbox",
+            name="请输入账号名/手机号",
+            exact=True,
         )
-        return False
+        password_input = page.get_by_role(
+            "textbox",
+            name="请输入密码",
+            exact=True,
+        )
+        try:
+            await username_input.fill(username, timeout=10000)
+            await password_input.fill(password, timeout=10000)
+        except Exception as error:
+            raise RuntimeError(
+                f"{platform_name} 登录帐密填写失败"
+            ) from error
+
+        login_button = page.get_by_role(
+            "button",
+            name="登录",
+            exact=True,
+        )
+        await login_button.click(timeout=10000)
+        logger.info(f"{platform_name} 已提交账号密码，等待登录结果。")
+        await page.wait_for_timeout(3000)
+
+        if success_url_marker not in page.url.lower():
+            try:
+                await page.wait_for_url(
+                    lambda url: success_url_marker in str(url).lower(),
+                    timeout=60000,
+                )
+            except PlaywrightTimeoutError:
+                logger.error(
+                    f"{platform_name} 主动登录等待超过 60 秒，"
+                    f"请在保留页面中人工检查；当前 URL: {page.url}"
+                )
+                return False
+
+        logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+        succeeded = True
+        return True
     except Exception as error:
         logger.error(
-            f"{platform_name} 登录状态检查失败，保留当前页面供人工处理: {error}"
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
         )
         return False
     finally:
@@ -856,7 +913,7 @@ LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "qianniu_workbench_active_login": login_qianniu_workbench,
     "dou_shop_active_login": login_dou_shop,
     "kuaishou_xiaodian_active_login": login_kuaishou_xiaodian,
-    "pdd_manual_login": login_pdd_manually,
+    "pdd_active_login": login_pdd,
 }
 
 

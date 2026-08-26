@@ -131,8 +131,10 @@ class BackfillEngine:
         self.gc_page_url_markers = tuple(
             marker.strip() for marker in gc_page_url_markers
         )
-        # 红色错误提示保留时间：既给人工观察留出窗口，也避免长期堆积遮挡页面。
-        self.error_toast_grace_seconds = 30
+        # 红色错误提示短暂保留后自动关闭，避免堆积遮挡后续业务按钮。
+        self.error_toast_grace_seconds = 8
+        # 一级【启动检测】按钮可能正等待错误提示完成退出动画，适当延长可点击性检查。
+        self.primary_actionability_timeout_ms = 15000
         # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。
         self.page_probe_timeout_seconds = 20
         # 探针超时通常来自浏览器高负载，冷却后保留Worker并重试队列任务。
@@ -645,7 +647,10 @@ class BackfillEngine:
         )
         # trial 只做完整可点击性检查，不触发实际检测。
         try:
-            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+            await primary_drawer.locator("#checkbutn").click(
+                trial=True,
+                timeout=self.primary_actionability_timeout_ms,
+            )
         except PlaywrightTimeoutError as error:
             await self._assert_page_healthy(page, worker_id)
             raise WorkerUnresponsiveError(
@@ -1187,7 +1192,10 @@ class BackfillEngine:
                 state="visible",
                 timeout=30000,
             )
-            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+            await primary_drawer.locator("#checkbutn").click(
+                trial=True,
+                timeout=self.primary_actionability_timeout_ms,
+            )
             logger.info(f"Worker-{worker_id} 初始化完成，已成功进入补采专属弹窗！")
             
             # 不需要记录基准线，依靠锚点即可

@@ -1050,7 +1050,9 @@ async def login_jingzuanke(
             name="重新登录",
             exact=True,
         )
-        await relogin_button.click(timeout=10000)
+
+        if await relogin_button.count() > 0:
+            await relogin_button.click(timeout=10000)
 
         account_login = page.get_by_role(
             "button",

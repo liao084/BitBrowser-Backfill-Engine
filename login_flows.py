@@ -906,6 +906,204 @@ async def login_pdd(
                 logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
 
 
+async def login_reduyun(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """使用平台 auth_params 中的帐密主动登录热度云。"""
+    platform_name = platform["name"]
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {home_url}")
+        try:
+            await page.goto(
+                home_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 商家后台等待超时，将根据当前页面继续判断。"
+            )
+        await page.wait_for_timeout(3000)
+
+        if success_url_marker in page.url.lower():
+            logger.info(f"✓ {platform_name} 当前会话已经登录: {page.url}")
+        else:
+            password_login = page.get_by_role(
+                "tab",
+                name="密码登录",
+                exact=True,
+            )
+            await password_login.click(timeout=10000)
+
+            username_input = page.get_by_role(
+                "textbox",
+                name="请输入11位手机号",
+                exact=True,
+            )
+            password_input = page.get_by_role(
+                "textbox",
+                name="请输入密码",
+                exact=True,
+            )
+            try:
+                await username_input.fill(username, timeout=10000)
+                await password_input.fill(password, timeout=10000)
+            except Exception as error:
+                raise RuntimeError(
+                    f"{platform_name} 登录帐密填写失败"
+                ) from error
+
+            login_button = page.get_by_role(
+                "button",
+                name="登录",
+                exact=True,
+            )
+            await login_button.click(timeout=10000)
+            await page.wait_for_url(
+                lambda url: success_url_marker in str(url).lower(),
+                timeout=30000,
+            )
+            logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
+async def login_jingzuanke(
+    runtime: LoginRuntime,
+    platform: Dict[str, Any],
+) -> bool:
+    """通过业务页重新登录提示进入鲸钻客帐密登录流程。"""
+    platform_name = platform["name"]
+    home_url = platform["home_url"]
+    success_url_marker = _business_url_marker(home_url)
+    auth_params = platform.get("auth_params")
+    if not isinstance(auth_params, dict):
+        logger.error(f"{platform_name} 缺少有效的 auth_params 配置。")
+        return False
+
+    username = auth_params.get("username")
+    password = auth_params.get("password")
+    if not isinstance(username, str) or not username.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 username。")
+        return False
+    if not isinstance(password, str) or not password:
+        logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+
+    page = await runtime.context.new_page()
+    succeeded = False
+
+    try:
+        logger.info(f"开始主动登录 {platform_name}: {home_url}")
+        try:
+            await page.goto(
+                home_url,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except PlaywrightTimeoutError:
+            logger.warning(
+                f"访问 {platform_name} 业务页等待超时，将根据当前页面继续判断。"
+            )
+        await page.wait_for_timeout(3000)
+
+        if success_url_marker in page.url.lower():
+            logger.info(f"✓ {platform_name} 当前会话已经登录: {page.url}")
+            succeeded = True
+            return True
+
+        logger.info(f"{platform_name} 当前 URL 未匹配业务页，进入帐密登录流程。")
+        relogin_button = page.get_by_role(
+            "button",
+            name="重新登录",
+            exact=True,
+        )
+        await relogin_button.click(timeout=10000)
+
+        account_login = page.get_by_role(
+            "button",
+            name="账号密码登录",
+            exact=True,
+        )
+        await account_login.click(timeout=10000)
+
+        username_input = page.get_by_role(
+            "textbox",
+            name="请输入手机号",
+            exact=True,
+        )
+        password_input = page.get_by_role(
+            "textbox",
+            name="请输入密码",
+            exact=True,
+        )
+        try:
+            await username_input.fill(username, timeout=10000)
+            await password_input.fill(password, timeout=10000)
+        except Exception as error:
+            raise RuntimeError(
+                f"{platform_name} 登录帐密填写失败"
+            ) from error
+
+        login_button = page.get_by_role(
+            "button",
+            name="登录",
+            exact=True,
+        )
+        await login_button.click(timeout=10000)
+        await page.wait_for_url(
+            lambda url: success_url_marker in str(url).lower(),
+            timeout=30000,
+        )
+
+        logger.info(f"✓ {platform_name} 主动登录成功，最终 URL: {page.url}")
+        succeeded = True
+        return True
+    except Exception as error:
+        logger.error(
+            f"{platform_name} 主动登录失败，保留当前页面供人工处理: {error}"
+        )
+        return False
+    finally:
+        if succeeded and not page.is_closed():
+            try:
+                await page.close()
+            except Exception as error:
+                logger.warning(f"关闭 {platform_name} 成功预检页失败: {error}")
+
+
 LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "pkl_cookie": login_with_pkl_cookie,
     "1688_button_login": login_1688,
@@ -914,6 +1112,8 @@ LOGIN_FLOW_REGISTRY: Dict[str, LoginFlow] = {
     "dou_shop_active_login": login_dou_shop,
     "kuaishou_xiaodian_active_login": login_kuaishou_xiaodian,
     "pdd_active_login": login_pdd,
+    "reduyun_active_login": login_reduyun,
+    "jingzuanke_active_login": login_jingzuanke,
 }
 
 

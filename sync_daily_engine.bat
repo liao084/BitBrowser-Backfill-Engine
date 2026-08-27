@@ -2,6 +2,7 @@
 chcp 65001 >nul
 setlocal EnableExtensions EnableDelayedExpansion
 
+rem 本脚本放在 dailyfill 目录中。
 rem 将 _release\daily_engine.exe 同步到三个分类下包含 .env 的客户目录。
 set "ROOT=%~dp0"
 set "SOURCE=%ROOT%_release\daily_engine.exe"

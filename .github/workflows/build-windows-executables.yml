@@ -20,6 +20,8 @@ on:
       - "login_flows.py"
       - "browser_manager.py"
       - "task_ledger.py"
+      - "sync_backfill_engine.bat"
+      - "sync_daily_engine.bat"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/build-windows-executables.yml"
@@ -109,11 +111,13 @@ jobs:
           Copy-Item dist\backfill_launcher.exe backfill-deployment-package\
           Copy-Item dist\backfill_engine.exe backfill-deployment-package\backfill\_release\
           Copy-Item backfill_launcher_config.example.json backfill-deployment-package\backfill\_release\backfill_launcher_config.json
+          Copy-Item sync_backfill_engine.bat backfill-deployment-package\backfill\
 
           New-Item -ItemType Directory -Path dailyfill-deployment-package\dailyfill\_release -Force
           Copy-Item dist\dailyfill_launcher.exe dailyfill-deployment-package\
           Copy-Item dist\daily_engine.exe dailyfill-deployment-package\dailyfill\_release\
           Copy-Item dailyfill_launcher_config.example.json dailyfill-deployment-package\dailyfill\_release\dailyfill_launcher_config.json
+          Copy-Item sync_daily_engine.bat dailyfill-deployment-package\dailyfill\
 
       - name: Upload Backfill EXE
         uses: actions/upload-artifact@v7

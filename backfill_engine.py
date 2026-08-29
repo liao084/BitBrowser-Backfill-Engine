@@ -33,6 +33,7 @@ from browser_connector import (
     ExternalCdpConnector,
     normalize_cdp_address,
 )
+from github_info import GIT_SHA
 from task_ledger import TaskLedger
 
 
@@ -218,20 +219,43 @@ class BackfillEngine:
 
     async def _delayed_check(self, page: Page):
         """延迟检测新网页 URL 并部署后台监控任务"""
+        managed_page = False
+        url_suffix = "<unknown>"
         try:
             # 等待最多 10 秒，让网页跳转到真实的 URL
             for _ in range(10):
                 if page.is_closed():
                     return
-                if self._is_gc_managed_page_url(page.url):
+                current_url = page.url
+                url_suffix = (
+                    current_url[-25:] if len(current_url) > 25 else current_url
+                )
+                if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
-                    url_suffix = page.url[-25:] if len(page.url) > 25 else page.url
+                    managed_page = True
                     logger.info(f"[GC Daemon] 发现业务执行网页，开始后台监控: {url_suffix}")
                     asyncio.create_task(self._monitor_and_gc_page(page))
                     return
                 await asyncio.sleep(1)
-        except Exception:
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if page.is_closed():
+                logger.debug(
+                    f"[GC Daemon] 新网页 {url_suffix} 在延迟识别期间已关闭。"
+                )
+                return
+            logger.exception(
+                f"[GC Daemon] 新网页 {url_suffix} 延迟识别发生异常: "
+                f"{type(error).__name__}: {error}"
+            )
+            # 只有已经确认属于 GC 管理范围的业务页才关闭，避免误伤未知页面。
+            if managed_page:
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "延迟识别",
+                )
 
     def _on_new_page(self, page: Page):
         """拦截浏览器新建标签页的事件"""
@@ -252,6 +276,40 @@ class BackfillEngine:
             for page in context.pages
             if not page.is_closed() and self._is_gc_managed_page_url(page.url)
         ]
+
+    async def _close_gc_page_after_exception(
+        self,
+        page: Page,
+        url_suffix: str,
+        stage: str,
+    ) -> None:
+        """GC 监控发生异常后，限时关闭已确认的业务执行页面。"""
+        if page.is_closed():
+            logger.info(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后已关闭。"
+            )
+            return
+
+        logger.warning(
+            f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}发生异常，"
+            "执行强制关闭。"
+        )
+        try:
+            await asyncio.wait_for(page.close(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后，"
+                "强制关闭超过 10 秒仍未完成。"
+            )
+        except Exception as close_error:
+            logger.warning(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后关闭失败: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        else:
+            logger.info(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后已关闭。"
+            )
 
     async def _cleanup_remaining_gc_pages(
         self,
@@ -495,8 +553,23 @@ class BackfillEngine:
                     except Exception as e:
                         logger.warning(f"[GC Daemon] 关闭网页发生异常: {e}")
                 break
-            except Exception:
-                # 网页可能在这期间被正常关闭了
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if page.is_closed():
+                    logger.debug(
+                        f"[GC Daemon] 业务执行网页 {url_suffix} 在等待心跳期间已关闭。"
+                    )
+                    break
+                logger.exception(
+                    f"[GC Daemon] 业务执行网页 {url_suffix} 等待同步成功心跳时发生异常: "
+                    f"{type(error).__name__}: {error}"
+                )
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "等待同步成功心跳",
+                )
                 break
 
             if toast_handle is None:
@@ -514,7 +587,23 @@ class BackfillEngine:
                     except Exception as e:
                         logger.warning(f"[GC Daemon] 关闭网页发生异常: {e}")
                 break
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if page.is_closed():
+                    logger.debug(
+                        f"[GC Daemon] 业务执行网页 {url_suffix} 在等待心跳提示隐藏期间已关闭。"
+                    )
+                    break
+                logger.exception(
+                    f"[GC Daemon] 业务执行网页 {url_suffix} 等待心跳提示隐藏时发生异常: "
+                    f"{type(error).__name__}: {error}"
+                )
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "等待心跳提示隐藏",
+                )
                 break
             finally:
                 try:
@@ -1775,6 +1864,10 @@ def load_runtime_config() -> BackfillRuntimeConfig:
 
 
 if __name__ == "__main__":
+    logger.info(
+        "程序版本: app=backfill_engine, git_sha=%s",
+        GIT_SHA,
+    )
     try:
         config = load_runtime_config()
     except (OSError, ValueError) as error:

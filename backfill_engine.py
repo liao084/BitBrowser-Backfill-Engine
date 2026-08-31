@@ -134,7 +134,7 @@ class BackfillEngine:
             marker.strip() for marker in gc_page_url_markers
         )
         # 红色错误提示短暂保留后自动关闭，避免堆积遮挡后续业务按钮。
-        self.error_toast_grace_seconds = 8
+        self.error_toast_grace_seconds = 2
         # 一级【启动检测】按钮可能正等待错误提示完成退出动画，适当延长可点击性检查。
         self.primary_actionability_timeout_ms = 15000
         # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。

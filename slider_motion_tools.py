@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import logging
 import math
 import random
 from functools import lru_cache
@@ -16,6 +17,8 @@ from typing import Any, NamedTuple
 from PIL import Image, UnidentifiedImageError
 from playwright.async_api import Page
 
+
+logger = logging.getLogger("BackfillEngine")
 
 RenderedSize = tuple[float, float]
 _SAMPLE_INTERVAL_SECONDS = 0.0167
@@ -476,75 +479,122 @@ async def solve_closed_shadow_slider(
     *,
     ready_timeout_seconds: float = 10.0,
     success_timeout_seconds: float = 8.0,
+    max_attempts: int = 5,
 ) -> bool:
     """识别并拖动拼多多 closed Shadow DOM 滑块。
 
     验证通过后的页面仍可能保留 ``mobile.yangkeduo.com`` URL 前缀，
-    因此成功条件是滑块按钮连续三次未出现在 CDP DOM 树中。
+    因此成功条件是滑块按钮连续三次未出现在 CDP DOM 树中。单个
+    滑块页面最多重新识别并拖动 ``max_attempts`` 次；失败后优先等待
+    页面换出新图片，再重新读取坐标和计算距离。
     """
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
+        raise TypeError("max_attempts 必须是整数")
+    if max_attempts < 1:
+        raise ValueError("max_attempts 必须大于等于 1")
+
     cdp_session = await page.context.new_cdp_session(page)
     mouse_is_down = False
     try:
         await cdp_session.send("DOM.enable")
         loop = asyncio.get_running_loop()
-        ready_deadline = loop.time() + ready_timeout_seconds
-        last_ready_error: Exception | None = None
-        while True:
-            if page.is_closed():
-                return False
-            try:
-                snapshot = await _read_slider_snapshot(cdp_session)
-                break
-            except Exception as error:
-                last_ready_error = error
-                if loop.time() >= ready_deadline:
-                    raise RuntimeError(
-                        "等待 closed Shadow DOM 滑块渲染超时"
-                    ) from last_ready_error
+        previous_snapshot: _SliderSnapshot | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            ready_deadline = loop.time() + ready_timeout_seconds
+            last_ready_error: Exception | None = None
+            snapshot: _SliderSnapshot | None = None
+            image_refreshed = previous_snapshot is None
+
+            while True:
+                if page.is_closed():
+                    return False
+                try:
+                    snapshot = await _read_slider_snapshot(cdp_session)
+                    image_refreshed = previous_snapshot is None or (
+                        snapshot.target_data_url
+                        != previous_snapshot.target_data_url
+                        or snapshot.background_data_url
+                        != previous_snapshot.background_data_url
+                    )
+                    if image_refreshed or loop.time() >= ready_deadline:
+                        break
+                except Exception as error:
+                    last_ready_error = error
+                    if loop.time() >= ready_deadline:
+                        raise RuntimeError(
+                            "等待 closed Shadow DOM 滑块渲染超时"
+                        ) from last_ready_error
                 await asyncio.sleep(0.5)
 
-        distance_x = await calculate_slider_drag_distance_async(
-            snapshot.target_data_url,
-            snapshot.background_data_url,
-            snapshot.target_rendered_size,
-            snapshot.background_rendered_size,
-        )
-        trajectory = generate_drag_trajectory(distance_x)
-        start_x, start_y = snapshot.button_center
+            if snapshot is None:
+                raise RuntimeError("未能读取 closed Shadow DOM 滑块快照")
+            if previous_snapshot is not None and not image_refreshed:
+                logger.warning(
+                    f"[Slider] 第 {attempt}/{max_attempts} 次尝试前图片未刷新，"
+                    "仍使用当前图片重新识别。"
+                )
 
-        await page.mouse.move(start_x, start_y)
-        await page.mouse.down()
-        mouse_is_down = True
+            distance_x = await calculate_slider_drag_distance_async(
+                snapshot.target_data_url,
+                snapshot.background_data_url,
+                snapshot.target_rendered_size,
+                snapshot.background_rendered_size,
+            )
+            logger.info(
+                f"[Slider] 开始第 {attempt}/{max_attempts} 次拖动，"
+                f"识别距离 {distance_x:.2f} CSS 像素。"
+            )
+            trajectory = generate_drag_trajectory(distance_x)
+            start_x, start_y = snapshot.button_center
 
-        started_at = loop.time()
-        for point in trajectory[1:]:
-            remaining_seconds = started_at + point.elapsed_seconds - loop.time()
-            if remaining_seconds > 0:
-                await asyncio.sleep(remaining_seconds)
-            await page.mouse.move(start_x + point.x, start_y + point.y)
+            await page.mouse.move(start_x, start_y)
+            await page.mouse.down()
+            mouse_is_down = True
 
-        await page.mouse.up()
-        mouse_is_down = False
+            started_at = loop.time()
+            for point in trajectory[1:]:
+                remaining_seconds = (
+                    started_at + point.elapsed_seconds - loop.time()
+                )
+                if remaining_seconds > 0:
+                    await asyncio.sleep(remaining_seconds)
+                await page.mouse.move(start_x + point.x, start_y + point.y)
 
-        deadline = loop.time() + success_timeout_seconds
-        consecutive_absent_checks = 0
-        while loop.time() < deadline:
-            if page.is_closed():
-                return False
-            try:
-                slider_exists = await _slider_button_exists(cdp_session)
-            except Exception:
-                consecutive_absent_checks = 0
+            await page.mouse.up()
+            mouse_is_down = False
+
+            deadline = loop.time() + success_timeout_seconds
+            consecutive_absent_checks = 0
+            while loop.time() < deadline:
+                if page.is_closed():
+                    return False
+                try:
+                    slider_exists = await _slider_button_exists(cdp_session)
+                except Exception:
+                    consecutive_absent_checks = 0
+                    await asyncio.sleep(1)
+                    continue
+
+                if slider_exists:
+                    consecutive_absent_checks = 0
+                else:
+                    consecutive_absent_checks += 1
+                    if consecutive_absent_checks >= 3:
+                        logger.info(
+                            f"[Slider] 第 {attempt}/{max_attempts} 次拖动通过。"
+                        )
+                        return True
                 await asyncio.sleep(1)
-                continue
 
-            if slider_exists:
-                consecutive_absent_checks = 0
-            else:
-                consecutive_absent_checks += 1
-                if consecutive_absent_checks >= 3:
-                    return True
-            await asyncio.sleep(1)
+            previous_snapshot = snapshot
+            if attempt < max_attempts:
+                logger.warning(
+                    f"[Slider] 第 {attempt}/{max_attempts} 次拖动未通过，"
+                    "等待验证码图片刷新后重试。"
+                )
+
+        logger.error(f"[Slider] 连续 {max_attempts} 次拖动均未通过。")
         return False
     finally:
         if mouse_is_down:

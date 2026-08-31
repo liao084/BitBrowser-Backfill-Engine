@@ -34,6 +34,7 @@ from browser_connector import (
     normalize_cdp_address,
 )
 from github_info import GIT_SHA
+from slider_motion_tools import solve_closed_shadow_slider
 from task_ledger import TaskLedger
 
 
@@ -230,6 +231,34 @@ class BackfillEngine:
                 url_suffix = (
                     current_url[-25:] if len(current_url) > 25 else current_url
                 )
+                if self._is_slider_page_url(current_url):
+                    logger.info(
+                        f"[Slider] 发现滑块验证网页，开始处理: {url_suffix}"
+                    )
+                    try:
+                        solved = await self._solve_slider_page(page)
+                    except Exception as error:
+                        logger.exception(
+                            f"[Slider] 滑块验证处理异常，将继续按 GC 规则判断: "
+                            f"{error}"
+                        )
+                        solved = False
+
+                    if solved:
+                        logger.info(f"[Slider] 滑块验证处理完成: {url_suffix}")
+                        return
+                    if page.is_closed():
+                        return
+                    logger.warning(
+                        f"[Slider] 滑块验证未通过，继续按 GC 规则判断: "
+                        f"{url_suffix}"
+                    )
+                    current_url = page.url
+                    url_suffix = (
+                        current_url[-25:]
+                        if len(current_url) > 25
+                        else current_url
+                    )
                 if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
                     managed_page = True
@@ -268,6 +297,19 @@ class BackfillEngine:
             marker.lower() in normalized_url
             for marker in self.gc_page_url_markers
         )
+
+    def _is_slider_page_url(self, url: str) -> bool:
+        """判断 URL 是否属于需要自动处理的独立滑块页面。"""
+        SLIDER_PAGE_URL_MARKERS = ("mobile.yangkeduo.com",)
+        normalized_url = url.lower()
+        return any(
+            marker.lower() in normalized_url
+            for marker in SLIDER_PAGE_URL_MARKERS
+        )
+
+    async def _solve_slider_page(self, page: Page) -> bool:
+        """处理独立滑块页，并根据滑块控件状态判断是否通过。"""
+        return await solve_closed_shadow_slider(page)
 
     def _remaining_gc_pages(self, context: BrowserContext) -> List[Page]:
         """返回 Context 中尚未关闭、且符合 GC URL 规则的业务执行页面。"""

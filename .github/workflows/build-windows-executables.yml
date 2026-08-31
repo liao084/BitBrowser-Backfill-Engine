@@ -20,6 +20,7 @@ on:
       - "auth_manager.py"
       - "login_flows.py"
       - "browser_manager.py"
+      - "slider_motion_tools.py"
       - "task_ledger.py"
       - "sync_backfill_engine.bat"
       - "sync_daily_engine.bat"
@@ -75,6 +76,7 @@ jobs:
           auth_manager.py
           login_flows.py
           browser_manager.py
+          slider_motion_tools.py
           task_ledger.py
 
       - name: Build Backfill EXE

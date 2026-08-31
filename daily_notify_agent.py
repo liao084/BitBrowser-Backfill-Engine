@@ -596,16 +596,48 @@ def send_feishu(card: dict[str, Any], webhook_url: str) -> None:
 
 
 def run_once(config: dict[str, Any]) -> None:
+    run_started_at = time.perf_counter()
+
+    discovery_started_at = time.perf_counter()
     env_files = sorted(config["clients_root"].rglob(".env"))
+    discovery_elapsed = time.perf_counter() - discovery_started_at
+
+    inspection_started_at = time.perf_counter()
     items = [
         item
         for env_path in env_files
         if (item := inspect_client_safe(env_path, config)) is not None
     ]
+    inspection_elapsed = time.perf_counter() - inspection_started_at
+    traversal_elapsed = time.perf_counter() - discovery_started_at
+    logger.info(
+        "客户目录巡检完成：发现 %d 个客户配置，纳入本次通知 %d 个；"
+        "目录发现 %.3f 秒，客户读取与汇总 %.3f 秒，巡检合计 %.3f 秒。",
+        len(env_files),
+        len(items),
+        discovery_elapsed,
+        inspection_elapsed,
+        traversal_elapsed,
+    )
+
+    rendering_started_at = time.perf_counter()
     card = build_card(items, config["title"])
-    send_feishu(card, config["webhook_url"])
     message = build_message(items, config["title"])
-    logger.info("飞书通知发送成功。\n%s", message)
+    rendering_elapsed = time.perf_counter() - rendering_started_at
+
+    sending_started_at = time.perf_counter()
+    send_feishu(card, config["webhook_url"])
+    sending_elapsed = time.perf_counter() - sending_started_at
+    total_elapsed = time.perf_counter() - run_started_at
+    logger.info(
+        "飞书通知发送成功：巡检 %.3f 秒，内容构建 %.3f 秒，"
+        "网络发送 %.3f 秒，整轮合计 %.3f 秒。\n%s",
+        traversal_elapsed,
+        rendering_elapsed,
+        sending_elapsed,
+        total_elapsed,
+        message,
+    )
 
 
 def next_notify_time(config: dict[str, Any]) -> datetime:

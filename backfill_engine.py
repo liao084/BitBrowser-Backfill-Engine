@@ -33,6 +33,7 @@ from browser_connector import (
     ExternalCdpConnector,
     normalize_cdp_address,
 )
+from github_info import GIT_SHA
 from task_ledger import TaskLedger
 
 
@@ -41,6 +42,10 @@ T = TypeVar("T")
 
 class WorkerUnresponsiveError(RuntimeError):
     """页面仍连接但已无法在限定时间内响应，当前Worker必须退出。"""
+
+
+class PageProbeTimeoutError(RuntimeError):
+    """单次页面探针超时；当前任务失败，但不足以判定Worker失效。"""
 
 
 class TaskPageInitializationError(RuntimeError):
@@ -127,12 +132,17 @@ class BackfillEngine:
         self.gc_page_url_markers = tuple(
             marker.strip() for marker in gc_page_url_markers
         )
-        # 红色错误提示保留时间：既给人工观察留出窗口，也避免长期堆积遮挡页面。
-        self.error_toast_grace_seconds = 30
+        # 红色错误提示短暂保留后自动关闭，避免堆积遮挡后续业务按钮。
+        self.error_toast_grace_seconds = 8
+        # 一级【启动检测】按钮可能正等待错误提示完成退出动画，适当延长可点击性检查。
+        self.primary_actionability_timeout_ms = 15000
         # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。
-        self.page_probe_timeout_seconds = 10
+        self.page_probe_timeout_seconds = 20
+        # 探针超时通常来自浏览器高负载，冷却后保留Worker并重试队列任务。
+        self.page_probe_cooldown_seconds = 10
         # 普通初始化异常允许短暂恢复，连续达到阈值后隔离当前Worker。
-        self.max_consecutive_initialization_failures = 3
+        self.initialization_failure_cooldown_seconds = 20
+        self.max_consecutive_initialization_failures = 5
         self._error_toast_close_tasks: set[asyncio.Task] = set()
 
     @staticmethod
@@ -168,7 +178,7 @@ class BackfillEngine:
         try:
             return await asyncio.wait_for(operation, timeout=timeout)
         except asyncio.TimeoutError as error:
-            raise WorkerUnresponsiveError(
+            raise PageProbeTimeoutError(
                 f"Worker-{worker_id} {operation_name}超过 {timeout:g} 秒无响应"
             ) from error
 
@@ -209,20 +219,43 @@ class BackfillEngine:
 
     async def _delayed_check(self, page: Page):
         """延迟检测新网页 URL 并部署后台监控任务"""
+        managed_page = False
+        url_suffix = "<unknown>"
         try:
             # 等待最多 10 秒，让网页跳转到真实的 URL
             for _ in range(10):
                 if page.is_closed():
                     return
-                if self._is_gc_managed_page_url(page.url):
+                current_url = page.url
+                url_suffix = (
+                    current_url[-25:] if len(current_url) > 25 else current_url
+                )
+                if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
-                    url_suffix = page.url[-25:] if len(page.url) > 25 else page.url
+                    managed_page = True
                     logger.info(f"[GC Daemon] 发现业务执行网页，开始后台监控: {url_suffix}")
                     asyncio.create_task(self._monitor_and_gc_page(page))
                     return
                 await asyncio.sleep(1)
-        except Exception:
-            pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if page.is_closed():
+                logger.debug(
+                    f"[GC Daemon] 新网页 {url_suffix} 在延迟识别期间已关闭。"
+                )
+                return
+            logger.exception(
+                f"[GC Daemon] 新网页 {url_suffix} 延迟识别发生异常: "
+                f"{type(error).__name__}: {error}"
+            )
+            # 只有已经确认属于 GC 管理范围的业务页才关闭，避免误伤未知页面。
+            if managed_page:
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "延迟识别",
+                )
 
     def _on_new_page(self, page: Page):
         """拦截浏览器新建标签页的事件"""
@@ -243,6 +276,40 @@ class BackfillEngine:
             for page in context.pages
             if not page.is_closed() and self._is_gc_managed_page_url(page.url)
         ]
+
+    async def _close_gc_page_after_exception(
+        self,
+        page: Page,
+        url_suffix: str,
+        stage: str,
+    ) -> None:
+        """GC 监控发生异常后，限时关闭已确认的业务执行页面。"""
+        if page.is_closed():
+            logger.info(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后已关闭。"
+            )
+            return
+
+        logger.warning(
+            f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}发生异常，"
+            "执行强制关闭。"
+        )
+        try:
+            await asyncio.wait_for(page.close(), timeout=10)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后，"
+                "强制关闭超过 10 秒仍未完成。"
+            )
+        except Exception as close_error:
+            logger.warning(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后关闭失败: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+        else:
+            logger.info(
+                f"[GC Daemon] 业务执行网页 {url_suffix} 在{stage}异常后已关闭。"
+            )
 
     async def _cleanup_remaining_gc_pages(
         self,
@@ -486,8 +553,23 @@ class BackfillEngine:
                     except Exception as e:
                         logger.warning(f"[GC Daemon] 关闭网页发生异常: {e}")
                 break
-            except Exception:
-                # 网页可能在这期间被正常关闭了
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if page.is_closed():
+                    logger.debug(
+                        f"[GC Daemon] 业务执行网页 {url_suffix} 在等待心跳期间已关闭。"
+                    )
+                    break
+                logger.exception(
+                    f"[GC Daemon] 业务执行网页 {url_suffix} 等待同步成功心跳时发生异常: "
+                    f"{type(error).__name__}: {error}"
+                )
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "等待同步成功心跳",
+                )
                 break
 
             if toast_handle is None:
@@ -505,7 +587,23 @@ class BackfillEngine:
                     except Exception as e:
                         logger.warning(f"[GC Daemon] 关闭网页发生异常: {e}")
                 break
-            except Exception:
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                if page.is_closed():
+                    logger.debug(
+                        f"[GC Daemon] 业务执行网页 {url_suffix} 在等待心跳提示隐藏期间已关闭。"
+                    )
+                    break
+                logger.exception(
+                    f"[GC Daemon] 业务执行网页 {url_suffix} 等待心跳提示隐藏时发生异常: "
+                    f"{type(error).__name__}: {error}"
+                )
+                await self._close_gc_page_after_exception(
+                    page,
+                    url_suffix,
+                    "等待心跳提示隐藏",
+                )
                 break
             finally:
                 try:
@@ -690,7 +788,10 @@ class BackfillEngine:
         )
         # trial 只做完整可点击性检查，不触发实际检测。
         try:
-            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+            await primary_drawer.locator("#checkbutn").click(
+                trial=True,
+                timeout=self.primary_actionability_timeout_ms,
+            )
         except PlaywrightTimeoutError as error:
             await self._assert_page_healthy(page, worker_id)
             raise WorkerUnresponsiveError(
@@ -1233,17 +1334,28 @@ class BackfillEngine:
                 state="visible",
                 timeout=30000,
             )
-            await primary_drawer.locator("#checkbutn").click(trial=True, timeout=5000)
+            await primary_drawer.locator("#checkbutn").click(
+                trial=True,
+                timeout=self.primary_actionability_timeout_ms,
+            )
             logger.info(f"Worker-{worker_id} 初始化完成，已成功进入补采专属弹窗！")
             
             # 不需要记录基准线，依靠锚点即可
+        except PageProbeTimeoutError as e:
+            logger.warning(
+                f"Worker-{worker_id} 初始化期间页面探针超时，"
+                f"等待 {self.page_probe_cooldown_seconds} 秒后将当前任务记为失败；"
+                f"Worker保持运行: {e}"
+            )
+            await asyncio.sleep(self.page_probe_cooldown_seconds)
+            return False
         except Exception as e:
             fatal_reason = self._fatal_page_error_reason(e)
             if fatal_reason:
                 logger.error(f"Worker-{worker_id} 初始化期间检测到致命页面异常（{fatal_reason}），停止该Worker: {e}")
                 raise
             logger.error(f"Worker-{worker_id} 任务页面初始化失败: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(self.initialization_failure_cooldown_seconds)
             raise TaskPageInitializationError(
                 f"Worker-{worker_id} 任务页面初始化失败"
             ) from e
@@ -1392,6 +1504,20 @@ class BackfillEngine:
                     )
                 return completed_normally
                 
+            except PageProbeTimeoutError as e:
+                current_state = (
+                    "已经提交【全店补齐】，但最终结果未知"
+                    if task_submitted
+                    else "尚未完成【全店补齐】提交"
+                )
+                logger.warning(
+                    f"Worker-{worker_id} 在执行 {start_date} 至 {end_date} "
+                    f"期间页面探针超时（{current_state}），等待 "
+                    f"{self.page_probe_cooldown_seconds} 秒后将当前任务记为失败；"
+                    f"Worker保持运行: {e}"
+                )
+                await asyncio.sleep(self.page_probe_cooldown_seconds)
+                return False
             except Exception as e:
                 fatal_reason = self._fatal_page_error_reason(e)
                 if fatal_reason:
@@ -1791,6 +1917,10 @@ def load_runtime_config() -> BackfillRuntimeConfig:
 
 
 if __name__ == "__main__":
+    logger.info(
+        "程序版本: app=backfill_engine, git_sha=%s",
+        GIT_SHA,
+    )
     try:
         config = load_runtime_config()
     except (OSError, ValueError) as error:

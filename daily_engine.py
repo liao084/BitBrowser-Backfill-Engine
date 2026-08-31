@@ -30,6 +30,7 @@ from backfill_engine import (
 )
 from browser_manager import BitBrowserManager
 from daily_run_status import DailyRunStatus
+from github_info import GIT_SHA
 from task_ledger import TaskLedger
 
 
@@ -781,6 +782,10 @@ class DailyEngine(BackfillEngine):
 
 
 if __name__ == "__main__":
+    logger.info(
+        "程序版本: app=daily_engine, git_sha=%s",
+        GIT_SHA,
+    )
     try:
         config = load_daily_runtime_config()
     except (OSError, ValueError) as error:

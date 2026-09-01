@@ -38,6 +38,13 @@ DEFAULT_TASK_URL = (
     "https://datatoolcenter.com/web/dateCenter.html?"
     "activeName=selfitemkeyShop&menuplat=%E5%B7%A5%E4%BD%9C%E5%8F%B0"
 )
+TIME_TYPE_INDEX = {
+    "日": 0,
+    "周": 1,
+    "近7天": 2,
+    "近30天": 3,
+    "月": 4,
+}
 
 
 def _format_duration(seconds: float) -> str:
@@ -65,6 +72,7 @@ class DailyRuntimeConfig:
     max_attempts: int
     target_date_offset_days: int
     target_date: Optional[str]
+    time_type: str
     cookie_dir: Path
     task_url: str
     daily_tasks: List[Dict[str, Any]]
@@ -192,6 +200,11 @@ def load_daily_runtime_config(
         if target_date_raw
         else None
     )
+    time_type = (os.getenv("TIME_TYPE") or "").strip() or "日"
+    if time_type not in TIME_TYPE_INDEX:
+        raise ValueError(
+            "TIME_TYPE 仅支持：" + "、".join(TIME_TYPE_INDEX)
+        )
     task_url = (os.getenv("TASK_URL") or DEFAULT_TASK_URL).strip()
     if not task_url:
         raise ValueError("TASK_URL 不能为空")
@@ -202,6 +215,7 @@ def load_daily_runtime_config(
         max_attempts=_load_int_env("MAX_ATTEMPTS", 1),
         target_date_offset_days=_load_int_env("TARGET_DATE_OFFSET_DAYS", 0),
         target_date=target_date,
+        time_type=time_type,
         cookie_dir=Path(_require_env("COOKIE_DIR")),
         task_url=task_url,
         daily_tasks=daily_tasks_raw,
@@ -221,6 +235,7 @@ class DailyEngine(BackfillEngine):
         worker_count: int = 4,
         max_attempts: int = 5,
         target_date_offset_days: int = 1,
+        time_type: str = "日",
         cookie_dir: Optional[Path] = None,
         task_url: str = DEFAULT_TASK_URL,
         keep_browser_after_run: bool = True,
@@ -235,10 +250,15 @@ class DailyEngine(BackfillEngine):
             raise ValueError("max_attempts 必须大于 0")
         if target_date_offset_days < 0:
             raise ValueError("target_date_offset_days 不能小于 0")
+        if time_type not in TIME_TYPE_INDEX:
+            raise ValueError(
+                "time_type 仅支持：" + "、".join(TIME_TYPE_INDEX)
+            )
 
         self.worker_count = worker_count
         self.max_attempts = max_attempts
         self.target_date_offset_days = target_date_offset_days
+        self.time_type = time_type
         self.cookie_dir = Path(cookie_dir) if cookie_dir else runtime_dir / "COOKIE"
         self.task_url = task_url
         self.keep_browser_after_run = keep_browser_after_run
@@ -320,6 +340,30 @@ class DailyEngine(BackfillEngine):
             logger.info(
                 f"✓ Worker-页面-{index + 1} 已完成 datatoolcenter 自动登录和稳定性检查。"
             )
+
+            if self.time_type != "日":
+                dimension_buttons = page.locator(
+                    "span.el-radio-button__inner:visible"
+                )
+                dimension_count = await dimension_buttons.count()
+                if dimension_count != len(TIME_TYPE_INDEX):
+                    raise RuntimeError(
+                        "时间维度按钮预期找到 "
+                        f"{len(TIME_TYPE_INDEX)} 个，实际找到 {dimension_count} 个"
+                    )
+
+                logger.info(
+                    f"Worker-页面-{index + 1} 正在切换时间维度为"
+                    f"【{self.time_type}】。"
+                )
+                await dimension_buttons.nth(
+                    TIME_TYPE_INDEX[self.time_type]
+                ).click(timeout=15000)
+                await ready_card.click(trial=True, timeout=90000)
+                logger.info(
+                    f"✓ Worker-页面-{index + 1} 已切换到"
+                    f"【{self.time_type}】维度，任务列表加载完成。"
+                )
             return page
         except Exception as error:
             logger.error(f"Worker-页面-{index + 1} 打开失败: {error}")
@@ -798,6 +842,7 @@ if __name__ == "__main__":
         worker_count=config.worker_count,
         max_attempts=config.max_attempts,
         target_date_offset_days=config.target_date_offset_days,
+        time_type=config.time_type,
         cookie_dir=config.cookie_dir,
         task_url=config.task_url,
         keep_browser_after_run=config.keep_browser_after_run,

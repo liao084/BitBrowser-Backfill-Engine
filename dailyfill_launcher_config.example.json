@@ -10,6 +10,7 @@
             "worker_count": 1,
             "max_attempts": 5,
             "target_date_offset_days": 1,
+            "time_type": "日",
             "report_ready_time": "08:45"
         },
         {
@@ -22,6 +23,7 @@
             "worker_count": 4,
             "max_attempts": 5,
             "target_date_offset_days": 1,
+            "time_type": "日",
             "report_ready_time": "10:30"
         }
     ],
@@ -97,6 +99,7 @@
         "worker_count": 1,
         "max_attempts": 5,
         "target_date_offset_days": 1,
+        "time_type": "日",
         "keep_browser_after_run": true,
         "report_ready_time": "10:30",
         "cookie_dir": "C:/Users/Administrator/Desktop/COOKIE",

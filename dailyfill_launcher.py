@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
 
 CONFIG_FILENAME = "dailyfill_launcher_config.json"
 WINDOWS_INVALID_NAME = re.compile(r'[<>:"/\\|?*]')
+TIME_TYPES = ("日", "周", "近7天", "近30天", "月")
 
 if getattr(sys, "frozen", False):
     runtime_dir = Path(sys.executable).resolve().parent
@@ -112,6 +113,7 @@ def build_env_content(values: dict[str, Any]) -> str:
             f"{'true' if values['keep_browser_after_run'] else 'false'}",
             f"TARGET_DATE_OFFSET_DAYS={values['target_date_offset_days']}",
             "TARGET_DATE=",
+            f"TIME_TYPE={values['time_type']}",
             f"COOKIE_DIR={json_env_value(values['cookie_dir'])}",
             f"TASK_URL={json_env_value(values['task_url'])}",
             "DAILY_TASKS='"
@@ -288,6 +290,8 @@ class DailyfillLauncherWindow(QMainWindow):
         self.target_offset_spin = QSpinBox()
         self.target_offset_spin.setRange(0, 365)
         self.target_offset_spin.setSuffix(" 天")
+        self.time_type_combo = QComboBox()
+        self.time_type_combo.addItems(TIME_TYPES)
         self.keep_browser_check = QCheckBox("任务完成后保留浏览器")
 
         add_button = QPushButton("新增任务 ID")
@@ -305,13 +309,15 @@ class DailyfillLauncherWindow(QMainWindow):
         layout.addWidget(self.max_attempts_spin, 1, 3)
         layout.addWidget(QLabel("目标日期偏移"), 2, 0)
         layout.addWidget(self.target_offset_spin, 2, 1)
-        layout.addWidget(self.keep_browser_check, 2, 2, 1, 2)
+        layout.addWidget(QLabel("时间维度"), 2, 2)
+        layout.addWidget(self.time_type_combo, 2, 3)
+        layout.addWidget(self.keep_browser_check, 3, 0, 1, 4)
         actions_layout = QHBoxLayout()
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.addWidget(add_button, 1)
         actions_layout.addWidget(update_button, 1)
         actions_layout.addWidget(delete_button, 1)
-        layout.addLayout(actions_layout, 3, 0, 1, 4)
+        layout.addLayout(actions_layout, 4, 0, 1, 4)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)
         return group
@@ -402,6 +408,12 @@ class DailyfillLauncherWindow(QMainWindow):
             defaults.get("target_date_offset_days", 1)
         )
         self.target_offset_spin.setValue(self.default_target_offset_days)
+        default_time_type = str(defaults.get("time_type", "日")).strip() or "日"
+        if default_time_type not in TIME_TYPES:
+            raise ValueError(
+                "Launcher defaults.time_type 仅支持：" + "、".join(TIME_TYPES)
+            )
+        self.time_type_combo.setCurrentText(default_time_type)
         self.keep_browser_check.setChecked(
             bool(defaults.get("keep_browser_after_run", True))
         )
@@ -434,6 +446,14 @@ class DailyfillLauncherWindow(QMainWindow):
                 customer["target_date_offset_days"]
             )
             self.target_offset_spin.setValue(self.default_target_offset_days)
+        if "time_type" in customer:
+            customer_time_type = str(customer["time_type"]).strip() or "日"
+            if customer_time_type not in TIME_TYPES:
+                raise ValueError(
+                    f"客户 {customer.get('name', '')} 的 time_type 仅支持："
+                    + "、".join(TIME_TYPES)
+                )
+            self.time_type_combo.setCurrentText(customer_time_type)
         if "report_ready_time" in customer:
             self.report_ready_time = str(
                 customer["report_ready_time"]
@@ -650,6 +670,7 @@ class DailyfillLauncherWindow(QMainWindow):
             "worker_count": self.worker_count_spin.value(),
             "max_attempts": self.max_attempts_spin.value(),
             "target_date_offset_days": self.default_target_offset_days,
+            "time_type": self.time_type_combo.currentText(),
             "keep_browser_after_run": self.keep_browser_check.isChecked(),
             "cookie_dir": self.cookie_dir,
             "task_url": self.task_url,
@@ -691,6 +712,12 @@ class DailyfillLauncherWindow(QMainWindow):
                 values.get("TARGET_DATE_OFFSET_DAYS") or 1
             )
             self.target_offset_spin.setValue(self.default_target_offset_days)
+            time_type = str(values.get("TIME_TYPE") or "日").strip() or "日"
+            if time_type not in TIME_TYPES:
+                raise ValueError(
+                    "TIME_TYPE 仅支持：" + "、".join(TIME_TYPES)
+                )
+            self.time_type_combo.setCurrentText(time_type)
             self.keep_browser_check.setChecked(
                 str(values.get("KEEP_BROWSER_AFTER_RUN") or "true").lower()
                 in {"true", "1", "yes"}

@@ -818,24 +818,37 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} 开始注入采集区间: {start_date} 至 {end_date}")
         try:
             primary_drawer = self._primary_drawer(page)
-            inputs = primary_drawer.locator("input.el-range-input")
-
-            input_count = await self._await_page_operation(
-                inputs.count(),
-                worker_id,
-                "查询日期输入框数量",
+            start_input = primary_drawer.get_by_role(
+                "textbox", name="开始", exact=False
             )
-            if input_count < 2:
-                raise RuntimeError(f"一级弹窗内预期至少 2 个日期输入框，实际找到 {input_count} 个")
+            end_input = primary_drawer.get_by_role(
+                "textbox", name="结束", exact=False
+            )
+
+            start_input_count = await self._await_page_operation(
+                start_input.count(),
+                worker_id,
+                "查询可见开始日期输入框数量",
+            )
+            end_input_count = await self._await_page_operation(
+                end_input.count(),
+                worker_id,
+                "查询可见结束日期输入框数量",
+            )
+            if start_input_count != 1 or end_input_count != 1:
+                raise RuntimeError(
+                    "一级弹窗内预期各找到 1 个可见的开始/结束日期输入框，"
+                    f"实际找到 {start_input_count}/{end_input_count} 个"
+                )
             
             # 填充开始日期并按回车确认
-            await inputs.nth(0).fill(start_date)
-            await page.keyboard.press("Enter")
+            await start_input.fill(start_date)
+            await start_input.press("Enter")
             await page.wait_for_timeout(200) # 给 UI 一点反应时间
             
             # 填充结束日期并按回车确认
-            await inputs.nth(1).fill(end_date)
-            await page.keyboard.press("Enter")
+            await end_input.fill(end_date)
+            await end_input.press("Enter")
             await page.wait_for_timeout(200)
             
             # 避免使用直接赋值，以确保 ElementUI 内部的 v-model 能够正确捕捉到数据变更。

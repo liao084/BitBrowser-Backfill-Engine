@@ -2090,10 +2090,18 @@ class BackfillEngine:
                         f"http://{cdp_address}"
                     )
                     connected = True
-                    if rebuild_count > 0 and browser.contexts:
-                        await self._close_remaining_gc_pages(
-                            browser.contexts[0],
-                            "CDP 重建预清理",
+                    if rebuild_count > 0:
+                        if browser.contexts:
+                            await self._close_remaining_gc_pages(
+                                browser.contexts[0],
+                                "CDP 重建预清理",
+                            )
+                        logger.info(
+                            f"CDP 重建连接完成：第 {rebuild_count}/"
+                            f"{self.max_cdp_rebuilds} 次；"
+                            "已重新连接原浏览器，"
+                            f"队列剩余 {task_queue.qsize()} 项，"
+                            "开始校验 Worker 并恢复任务调度。"
                         )
                     session_result = await self._run_cdp_session(
                         browser,

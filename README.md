@@ -67,4 +67,6 @@ CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署�
 - `BROWSER_TYPE=bitbrowser`：读取 `BITE_ID`，通过比特浏览器本地 API 获取 CDP 地址；
 - `BROWSER_TYPE=external_cdp`：读取 `CDP_ADDRESS`，连接已经通过 `--remote-debugging-port` 开启远程调试的 Edge、Chrome 等 Chromium 浏览器。
 
-两种方式都要求浏览器中已经准备好并登录 `datatoolcenter` Worker 页面。历史模式还可通过 `WORKER_HEARTBEAT_SILENCE_SECONDS` 和 `BUSINESS_HEARTBEAT_SILENCE_SECONDS` 调整不同业务速度下的静默阈值；后者必须大于前者。
+两种方式都要求浏览器中已经准备好并登录 `datatoolcenter` Worker 页面。历史模式使用贯穿整次运行的共享队列，失败任务立即进入队尾，最多执行 `MAX_ATTEMPTS` 次。`BACKFILL_CDP_SESSION_LIFETIME_HOURS` 是停止领取新任务的软期限；在途任务收尾后按 `BACKFILL_MAX_CDP_REBUILDS` 重建 Playwright/CDP 会话，但不会例行关闭或重启 BitBrowser。重建前必须确认缓存端点仍属于初次连接的同一个浏览器；重建出的新会话会在 Worker 领取任务前清理残留业务页，初始会话不执行这一步。
+
+历史模式还可通过 `WORKER_HEARTBEAT_SILENCE_SECONDS` 和 `BUSINESS_HEARTBEAT_SILENCE_SECONDS` 调整不同业务速度下的静默阈值；后者必须大于前者。

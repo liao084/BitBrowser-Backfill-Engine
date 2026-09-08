@@ -51,6 +51,9 @@
     "defaults": {
         "cdp_address": "127.0.0.1:9222",
         "worker_heartbeat_seconds": 120,
-        "business_heartbeat_seconds": 180
+        "business_heartbeat_seconds": 180,
+        "max_attempts": 5,
+        "cdp_session_lifetime_hours": 3.5,
+        "max_cdp_rebuilds": 5
     }
 }

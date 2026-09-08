@@ -60,7 +60,7 @@ uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 
 部署时将对应 EXE 与其配置文件放在同一目录：`backfill_engine.exe` 和 `daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。
 
-CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。
+CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。部署包还会分别包含 `backfill\sync_backfill_engine.bat` 和 `dailyfill\sync_daily_engine.bat`，用于把 `_release` 中的新版 Engine 批量同步到已有客户目录。
 
 历史补采的浏览器连接方式由 `.env` 决定：
 

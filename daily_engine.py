@@ -328,7 +328,7 @@ class DailyEngine(BackfillEngine):
                 timeout=30000,
             )
             ready_card = page.locator(
-                "div.workTool_page_card_test_dataCard"
+                "div.workTool_page_card_test_dataCard:visible"
             ).first
             await ready_card.click(trial=True, timeout=90000)
             logger.info(

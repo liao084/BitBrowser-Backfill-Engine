@@ -602,7 +602,14 @@ async def login_dou_shop(
             logger.warning(
                 f"访问 {platform_name} 登录页等待超时，将根据当前页面继续判断。"
             )
-        await page.wait_for_timeout(3000)
+        try:
+            await page.wait_for_url(
+                lambda url: login_success_url_marker in str(url),
+                timeout=10000,
+            )
+        except PlaywrightTimeoutError:
+            # 10 秒内未跳转到业务首页，按尚未登录继续处理。
+            pass
 
         if login_success_url_marker in page.url:
             logger.info(f"✓ {platform_name} 当前会话已经登录: {page.url}")

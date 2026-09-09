@@ -29,6 +29,7 @@ from backfill_engine import (
     runtime_dir,
 )
 from browser_manager import BitBrowserManager
+from data_calibration import run_data_calibration
 from daily_run_status import DailyRunStatus
 from github_info import GIT_SHA
 from task_ledger import TaskLedger
@@ -784,6 +785,16 @@ class DailyEngine(BackfillEngine):
                         await self._stop_error_toast_monitors(
                             error_toast_monitors
                         )
+
+                    if run_succeeded:
+                        try:
+                            await run_data_calibration(
+                                context,
+                                logger=logger,
+                            )
+                        except Exception:
+                            run_succeeded = False
+                            raise
             except Exception as error:
                 logger.exception(f"daily-mode 主流程发生异常: {error}")
                 return False

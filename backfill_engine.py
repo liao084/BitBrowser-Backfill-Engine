@@ -239,26 +239,29 @@ class BackfillEngine:
                         solved = await self._solve_slider_page(page)
                     except Exception as error:
                         logger.exception(
-                            f"[Slider] 滑块验证处理异常，将继续按 GC 规则判断: "
+                            f"[Slider] 滑块验证处理异常，仍将交给 GC 监控: "
                             f"{error}"
                         )
                         solved = False
 
                     if solved:
                         logger.info(f"[Slider] 滑块验证处理完成: {url_suffix}")
-                        return
+                    else:
+                        logger.warning(
+                            f"[Slider] 滑块验证未通过，仍将交给 GC 监控: "
+                            f"{url_suffix}"
+                        )
                     if page.is_closed():
                         return
-                    logger.warning(
-                        f"[Slider] 滑块验证未通过，继续按 GC 规则判断: "
-                        f"{url_suffix}"
+
+                    # 滑块通过后页面内容会变化，但 URL 仍可能保留原前缀；
+                    # 无论验证结果如何，都按业务执行页部署心跳和静默回收。
+                    managed_page = True
+                    logger.info(
+                        f"[GC Daemon] 滑块验证网页开始后台监控: {url_suffix}"
                     )
-                    current_url = page.url
-                    url_suffix = (
-                        current_url[-25:]
-                        if len(current_url) > 25
-                        else current_url
-                    )
+                    asyncio.create_task(self._monitor_and_gc_page(page))
+                    return
                 if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
                     managed_page = True

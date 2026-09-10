@@ -27,6 +27,7 @@ Daily-mode 使用以下字段：
 | `KEEP_BROWSER_AFTER_RUN` | 全部任务成功时是否保留比特浏览器；默认 `true`。失败或未进入有效任务阶段时始终保留现场 |
 | `TARGET_DATE_OFFSET_DAYS` | 旧配置和未填写单任务偏移时使用的默认日期偏移 |
 | `TARGET_DATE` | 可选的统一指定日期；留空时使用日期偏移 |
+| `TIME_TYPE` | 可选时间维度：`日`、`周`、`近7天`、`近30天`、`月`；留空或缺失时默认 `日` |
 | `COOKIE_DIR` | pkl Cookie 文件目录 |
 | `TASK_URL` | datatoolcenter 工作台地址；省略时使用源码默认值 |
 | `DAILY_TASKS` | 每日任务卡片 JSON 数组；`card_id` 表示数仓任务卡片 ID，单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |

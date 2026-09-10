@@ -20,6 +20,8 @@ mindmap
         BITE_ID 或 CDP_ADDRESS
         GC_PAGE_URL_MARKERS
         Worker 与业务页静默阈值
+        MAX_ATTEMPTS
+        CDP 生命周期与重建上限
       TASKS_CONFIG
         任务卡片 ID
         起止日期
@@ -32,7 +34,8 @@ mindmap
       日期切分
       共享任务池
       多 Worker 动态领取
-      健康 Worker 隔离
+      失败 attempt 立即回队尾
+      多 CDP 生命周期持续消费
     单任务业务流
       清理旧弹窗
       按 ID 查询并打开任务卡片
@@ -47,9 +50,9 @@ mindmap
       页面健康探测
     可靠性
       JSONL 任务账本
-      首轮失败统一重试
+      每次真实 attempt 落账
       连续初始化失败熔断
-      页面崩溃与断连隔离
+      单 Page 与全局断连分层隔离
     输出
       backfill_run.log
       backfill_results.jsonl
@@ -68,7 +71,7 @@ flowchart LR
     subgraph Engine["BackfillEngine 总控进程"]
         Builder["任务构建器<br/>generate_date_chunks + build_tasks"]
         Pool["共享 asyncio.Queue"]
-        Scheduler["轮次调度器<br/>_run_task_round"]
+        Scheduler["生命周期调度器<br/>_run_cdp_session"]
         Ledger["TaskLedger<br/>JSONL + asyncio.Lock"]
         Summary["最终结果汇总"]
     end
@@ -122,7 +125,7 @@ flowchart LR
 
 1. **主业务线**：任务池 → Worker → 数仓弹窗 → 业务平台采集；
 2. **页面资源线**：Context 按 URL 标记捕获业务执行页 → 心跳监控 → 僵尸页面回收；
-3. **可观测与恢复线**：日志 + JSONL 账本 → 失败任务重建 → 第二轮重试。
+3. **可观测与恢复线**：日志 + JSONL 账本 → 失败 attempt 立即回队 → 必要时重建 CDP 会话。
 
 ## 三、推荐的代码阅读顺序
 
@@ -130,8 +133,8 @@ flowchart LR
 flowchart TD
     A["1. load_runtime_config + __main__<br/>读取 .env"] --> B["2. BackfillEngine.run<br/>掌握总控流程"]
     B --> C["3. build_tasks<br/>generate_date_chunks"]
-    C --> D["4. _run_task_round<br/>建立共享队列"]
-    D --> E["5. worker<br/>循环领取任务与熔断"]
+    C --> D["4. _run_cdp_session<br/>管理单次 CDP 生命周期"]
+    D --> E["5. worker<br/>持续领取、即时回队与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
     F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成信号、心跳与静默兜底"]
     G --> H["8. _monitor_and_gc_page<br/>理解业务执行页旁路 GC"]
@@ -141,14 +144,14 @@ flowchart TD
 
 | 阅读层级 | 核心函数 | 需要回答的问题 |
 |---|---|---|
-| 总控 | `run()` | 浏览器、Context、Worker、守护协程和两轮执行如何组装？ |
-| 调度 | `_run_task_round()` | 如何建立共享队列，如何筛选健康 Worker？ |
+| 总控 | `run()` | 持久队列、浏览器身份和多次 CDP 会话如何组装？ |
+| 调度 | `_run_cdp_session()` | 如何停止领取、等待在途任务并收束旧会话？ |
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
 | 状态判断 | `wait_for_completion_or_heartbeat()` | 完成弹窗如何触发自动检测结果读取，静默时如何主动复检？ |
 | 页面 GC | `_monitor_and_gc_page()` | 业务执行页为什么独立于 Worker，何时关闭？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
-| 持久化 | `TaskLedger` | 首轮失败项如何变成第二轮任务？ |
+| 持久化 | `TaskLedger` | 每个真实 attempt 如何落账并形成最终汇总？ |
 
 ## 四、程序启动与总控时序
 
@@ -172,27 +175,29 @@ sequenceDiagram
         Connector->>Connector: GET /json/version
     end
     Connector-->>Engine: CDP 调试地址
-    Engine->>PW: connect_over_cdp
-    PW-->>Engine: Browser + Context
-    Engine->>Ctx: context.on("page", _on_new_page)
-    Engine->>Ctx: 扫描已有页面并部署延迟 URL 检查
-    Engine->>Engine: 过滤 datatoolcenter 页面作为 Worker
     Engine->>Engine: 校验 tasks_config
     Engine->>Engine: 切分日期并生成唯一任务
     Engine->>Ledger: reset()
-    Engine->>Workers: 为每个 Worker 启动红色提示监控器
-    Engine->>Workers: 第一轮共享任务池执行
-    Workers->>Ledger: 每个任务 append 一条结果
-    Engine->>Ledger: failed_tasks(attempt=1)
-    alt 存在失败任务且仍有健康 Worker
-        Engine->>Workers: 第二轮统一重试
-        Workers->>Ledger: 写入 attempt=2 结果
-    else 没有失败任务
-        Engine->>Engine: 跳过第二轮
+    Engine->>Engine: 所有唯一任务装入一次持久队列
+    loop 初始会话 + 最多 N 次重建
+        Engine->>PW: 新建 async_playwright + connect_over_cdp
+        PW-->>Engine: Browser + 默认 Context
+        Engine->>Ctx: 挂载页面 GC 并识别 datatoolcenter Worker
+        Engine->>Workers: 持续消费同一队列
+        Workers->>Ledger: 每个真实 attempt append 一条结果
+        Workers->>Workers: 失败且未达上限则 attempt+1 回队尾
+        Engine->>Workers: 到期只停止领取，等待在途任务收尾
+        Engine->>Workers: gather Worker，并取消、gather GC 任务
+        alt 队列仍有任务
+            Engine->>Connector: 只读 /json/version 校验缓存身份
+            Engine->>Ctx: 重连后预清理残留业务页，再启动 Worker
+        else 队列完成
+            Engine->>Ctx: 执行带宽限期的最终 GC 收尾
+            Engine->>Engine: 结束生命周期循环
+        end
     end
     Engine->>Ledger: summary(total_tasks)
-    Ledger-->>Engine: 首轮、重试、最终统计
-    Engine->>Workers: cancel 红色提示监控与延迟关闭任务
+    Ledger-->>Engine: 逐次 attempt 与最终统计
 ```
 
 ## 五、配置如何变成共享任务池
@@ -234,32 +239,37 @@ flowchart TD
 
 日期切分使用 `datetime.strptime()`，因此不存在 `2025-09-31` 这种日期被静默接受的情况：非法日期会在任务池生成阶段直接抛出 `ValueError`，不会先生成第 31 个网页任务。
 
-## 六、一轮共享任务池如何运行
+## 六、跨 CDP 生命周期的共享任务池
 
 ```mermaid
 flowchart TD
-    Start["_run_task_round(tasks, worker_pages)"] --> Fill["将本轮任务全部放入 asyncio.Queue"]
-    Fill --> HasWorker{"存在 Worker?"}
-    HasWorker -->|"否"| AllFail["取出所有任务并写入失败账本"]
-    HasWorker -->|"是"| Gather["为每个页面启动 worker 协程<br/>gather(return_exceptions=True)"]
-    Gather --> Claim["各 Worker 使用 get_nowait 动态领取"]
+    Start["run 启动"] --> Fill["所有唯一任务只装入一次 asyncio.Queue"]
+    Fill --> Session["建立 Playwright/CDP 会话"]
+    Session --> HasWorker{"有默认 Context 和 Worker?"}
+    HasWorker -->|"否"| Stop["停止；队列保留，不伪造失败记录"]
+    HasWorker -->|"是"| Claim["Worker 等待 queue.get / stop / deadline"]
     Claim --> Execute["execute_task"]
     Execute --> Record["TaskLedger.record"]
-    Record --> More{"队列还有任务且 Worker 健康?"}
-    More -->|"是"| Claim
-    More -->|"否"| WorkerResult["Worker 返回 True 或 False"]
-    WorkerResult --> Filter["仅保留返回 True 的健康页面"]
-    Filter --> Drain["兜底清空无人处理的剩余任务并记失败"]
-    Drain --> Return["返回 healthy_pages 给下一轮"]
-    AllFail --> ReturnEmpty["返回空列表"]
+    Record --> Success{"成功或达到上限?"}
+    Success -->|"否"| Retry["复制任务 attempt+1<br/>清空终态详情并放回队尾"]
+    Retry --> Claim
+    Success -->|"是"| Done["当前逻辑任务到达终态"]
+    Done --> QueueDone{"queue.join 完成?"}
+    QueueDone -->|"是"| Finish["停止空闲 Worker 并输出汇总"]
+    QueueDone -->|"否，且会话到期/断连"| Settle["禁止新领取并等待在途任务收尾"]
+    Settle --> Identity{"缓存端点可达且身份一致?"}
+    Identity -->|"是且有额度"| PreClean["重连后预清理残留业务页"]
+    PreClean --> Session
+    Identity -->|"否"| Stop
 ```
 
 共享池没有为任务预先绑定 Worker，所以执行顺序遵循：
 
-- 队列中的任务保持配置展开后的先后顺序；
+- 初始任务保持配置展开后的先后顺序，失败 attempt 进入当时队尾；
 - 哪个 Worker 先空闲，哪个 Worker 就领取下一个任务；
 - 不保证同一卡片始终由同一页面处理；
-- 快 Worker 会自然承担更多任务，避免等待慢 Worker。
+- 队列暂时为空时 Worker 继续等待，因为在途任务仍可能生成重试；
+- 未领取任务在 Worker 全退或浏览器关闭时原样保留，不写虚假 JSONL。
 
 ## 七、Worker 生命周期与熔断状态机
 
@@ -277,7 +287,7 @@ stateDiagram-v2
     Initializing --> Fused: 页面崩溃 / 关闭 / 断连 / 无响应
     Executing --> Fused: WorkerUnresponsiveError 或致命页面异常
     Finished --> [*]: 返回 True
-    Fused --> [*]: 返回 False<br/>不参加下一轮
+    Fused --> [*]: 返回 False<br/>本会话不再领取
 ```
 
 这里有一个关键区分：
@@ -484,6 +494,18 @@ GC_PAGE_URL_MARKERS=["ppzh.jd.com"]
 4. 对仍然残留的业务执行页面执行兜底关闭；
 5. 完成收尾后再退出 Playwright，避免事件循环提前结束导致 GC 被取消。
 
+### CDP 会话轮换时的业务页清理
+
+最终 GC 收尾只属于整个 Backfill 运行的结束阶段。单次 CDP 会话因软生命周期或 Worker 全部退出而准备重建时，不继承旧 GC 计时，也不等待最终收尾宽限：
+
+1. 先停止领取新任务，并等待所有在途 Worker attempt 完成记账、按需回队及 `task_done()`；
+2. 取消并 gather 旧会话的业务页 GC 协程，避免旧 Page 代理继续操作页面；
+3. 退出旧 Playwright/CDP 会话并校验缓存浏览器身份；
+4. 重连成功后，在新 Worker 领取任务前扫描并关闭符合 `GC_PAGE_URL_MARKERS` 的残留业务页，但保留 `datatoolcenter` Worker 页；
+5. 单个页面关闭失败只记录日志，随后继续启动 Worker，不为这项清理增加额外状态机。
+
+初始 CDP 会话没有上一会话遗留，因此不执行预清理。关闭标签页只能整理浏览器现场，不能撤销已经提交给后端的业务请求。
+
 ## 十二、红色错误提示事件回收器
 
 ```mermaid
@@ -539,7 +561,7 @@ flowchart LR
 
 硬超时只包裹理论上应快速完成的页面探针，不包裹完整补采任务，因此不会因为任务实际运行数小时而误杀 Worker。
 
-## 十四、JSONL 账本与统一重试
+## 十四、JSONL 账本与队尾重试
 
 每一次最终任务尝试写入一行：
 
@@ -551,41 +573,36 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Reset["运行开始<br/>TaskLedger.reset"] --> Round1["第一轮任务执行"]
-    Round1 --> Record1["各 Worker 在 asyncio.Lock 内<br/>追加 attempt=1 结果并 flush"]
-    Record1 --> Load["第一轮全部 Worker 收敛后<br/>failed_tasks(attempt=1)"]
-    Load --> Failed{"存在 success=false?"}
-    Failed -->|"否"| Summary["summary"]
-    Failed -->|"是"| Rebuild["复制任务卡片 ID/start/end<br/>attempt 改为 2"]
-    Rebuild --> Healthy{"仍有健康 Worker?"}
-    Healthy -->|"是"| Round2["失败任务进入新的共享池"]
-    Healthy -->|"否"| FinalFail["没有 Worker 可重试"]
-    Round2 --> Record2["追加 attempt=2 结果"]
-    Record2 --> Summary
-    FinalFail --> Summary
+    Reset["运行开始<br/>TaskLedger.reset"] --> Attempt["Worker 领取并真实执行一次 attempt"]
+    Attempt --> Record["asyncio.Lock 内追加结果并 flush"]
+    Record --> Failed{"success=false 且未达 MAX_ATTEMPTS?"}
+    Failed -->|"是"| Requeue["复制任务 attempt+1<br/>重置 missing 详情并放回队尾"]
+    Requeue --> Attempt
+    Failed -->|"否"| Summary["队列完成后 summary"]
     Summary --> Latest["按 task_id 选择最高 attempt 结果"]
-    Latest --> Report["输出首轮、重试、最终成功失败数量"]
+    Latest --> Report["输出逐次 attempt 与最终成功失败数量"]
 ```
 
 当前 Backfill 策略是：
 
-- 首轮所有任务执行完毕后才读取失败项；
-- 失败任务统一进入第二轮；
-- 第二轮只使用第一轮结束后仍健康的 Worker；
-- 只进行一次总体重试；
-- 两轮之间没有额外固定等待，也不是指数退避。
+- 整次运行只创建一个顶层共享队列，跨多个 CDP 生命周期复用；
+- 每次真实执行后才写一条 JSONL，未领取任务绝不批量伪造失败记录；
+- 失败任务立即进入队尾，默认最多执行 5 次；
+- 账本只记录结果，不拥有或重建队列；
+- 最终失败数仍为配置任务总数减最终成功数，因此未完成任务会进入汇总失败数。
 
 ## 十五、异常分类与处理矩阵
 
-| 异常类型 | 典型场景 | 当前任务 | 当前 Worker | 第二轮 |
+| 异常类型 | 典型场景 | 当前任务 | 当前 Worker / 会话 | 后续处理 |
 |---|---|---|---|---|
-| 普通业务失败 | 二级弹窗打不开、全店补齐未提交、任务判定卡死 | 写入失败 | 继续领取 | 任务进入重试 |
-| 单次初始化失败 | 旧弹窗或页面状态暂时异常 | 写入失败 | 累计一次 | 任务进入重试 |
-| 连续 3 次初始化失败 | 页面长期无法恢复到可操作状态 | 第 3 个任务写入失败 | 熔断 | 不参加第二轮 |
-| 页面查询硬超时 | `count()`、`is_visible()`、JS 健康探测无响应 | 写入失败或结果未知 | 立即熔断 | 不参加第二轮 |
-| 页面崩溃或断连 | Page、Target、Context、Browser 关闭 | 结果按提交状态记录说明 | 立即熔断 | 不参加第二轮 |
+| 普通业务失败 | 二级弹窗打不开、全店补齐未提交、任务判定卡死 | 写入失败 | Worker 继续领取 | 未达上限立即回队尾 |
+| 单次初始化失败 | 旧弹窗或页面状态暂时异常 | 写入失败 | 累计一次 | 未达上限立即回队尾 |
+| 连续初始化失败 | 页面长期无法恢复到可操作状态 | 当前 attempt 写入失败 | 当前 Worker 熔断 | 其他 Worker 或新会话继续 |
+| 页面查询硬超时 | `count()`、`is_visible()`、JS 健康探测无响应 | 写入失败或结果未知 | 当前 Worker 熔断 | 其他 Worker 或新会话继续 |
+| 单 Page 关闭或崩溃 | 用户关闭一个 Worker 页、渲染目标 crash | 当前 attempt 写入失败 | 只淘汰当前 Worker | 其他 Worker 继续 |
+| Driver/CDP 全局断连 | Playwright transport 关闭、Browser disconnected | 在途 attempt 正常或异常收尾 | 停止整个会话 | 身份一致才允许重建 |
 | 业务页达到 GC 静默阈值 | 业务执行页成为僵尸页面 | 不直接决定账本结果 | 不绑定 Worker | GC 关闭业务页 |
-| 红色提示遮挡 | 登录失效或接口异常导致提示堆积 | 主业务继续运行 | 监控器延迟回收 | 不直接影响轮次 |
+| 红色提示遮挡 | 登录失效或接口异常导致提示堆积 | 主业务继续运行 | 监控器延迟回收 | 不直接影响队列 |
 
 ## 十六、脚本模块职责说明
 
@@ -599,11 +616,11 @@ flowchart TD
 
 ### 3. 任务构建模块
 
-`generate_date_chunks()` 按 `chunk_days` 切分历史区间；`build_tasks()` 为每个日期区块生成唯一 `task_id`，去除重复配置，然后形成首轮任务列表。
+`generate_date_chunks()` 按 `chunk_days` 切分历史区间；`build_tasks()` 为每个日期区块生成唯一 `task_id`，去除重复配置，然后形成初始任务列表。
 
-### 4. 轮次调度模块
+### 4. 生命周期调度模块
 
-`_run_task_round()` 把一轮任务放入共享 `asyncio.Queue`，为每个可用页面启动一个 `worker()` 协程。任务不预先绑定页面，由先空闲的 Worker 继续领取下一项，实现动态负载均衡。
+`run()` 在整个 Backfill 期间持有唯一 `asyncio.Queue`。`_run_cdp_session()` 和 `_run_task_pool_session()` 只管理当前 Playwright/CDP 生命周期的 Context、Worker 与后台协程；软期限、断连或 Worker 全退后，未领取任务继续保留在顶层队列。
 
 ### 5. Worker 执行与熔断模块
 
@@ -623,7 +640,7 @@ flowchart TD
 
 ### 9. 业务执行页面 GC 模块
 
-`_on_new_page()` 与 `_delayed_check()` 从 BrowserContext 层识别符合 URL 标记的业务执行页面，`_monitor_and_gc_page()` 独立监听每个页面的成功心跳。达到业务页静默阈值或单个心跳节点异常滞留时，GC 关闭该页面；主调度结束后，`_cleanup_remaining_gc_pages()` 按两个静默阈值之差再加 5 秒提供收尾宽限。历史模式默认 Worker/业务页为 120/180 秒。
+`_on_new_page()` 与 `_delayed_check()` 从 BrowserContext 层识别符合 URL 标记的业务执行页面，`_monitor_and_gc_page()` 独立监听每个页面的成功心跳。达到业务页静默阈值或单个心跳节点异常滞留时，GC 关闭该页面。CDP 重建成功后，`_close_remaining_gc_pages()` 在新 Worker 领取任务前清理残留页；整个 Backfill 完成时，`_cleanup_remaining_gc_pages()` 才按两个静默阈值之差再加 5 秒提供最终收尾宽限。历史模式默认 Worker/业务页为 120/180 秒。
 
 ### 10. 红色错误提示回收模块
 
@@ -635,7 +652,7 @@ flowchart TD
 
 ### 12. 任务账本与重试模块
 
-`TaskLedger` 使用 `asyncio.Lock` 串行追加 JSONL 结果。首轮结束后，`failed_tasks(attempt=1)` 从账本重建失败任务并把 `attempt` 改为 2；健康 Worker 统一执行第二轮，最后由 `summary()` 按每个任务的最新结果汇总。
+`TaskLedger` 使用 `asyncio.Lock` 串行追加 JSONL 结果。Worker 在一次真实 attempt 完成后写账本，失败且未达到上限时直接复制任务并放回顶层队尾。`summary()` 按每个任务的最高 attempt 汇总；队列所有权始终属于 Backfill 顶层调度器。
 
 ## 十七、脚本完整运行逻辑摘要
 
@@ -643,21 +660,21 @@ flowchart TD
 2. 使用 `BITE_ID` 启动比特浏览器，或使用 `CDP_ADDRESS` 检查外部 Chromium；
 3. 连接 BrowserContext，识别数仓 Worker 页面；
 4. 在 Context 层挂载业务执行页面 GC，并扫描已有页面；
-5. 把配置日期切分成唯一日期区块，生成首轮任务列表；
+5. 把配置日期切分成唯一日期区块，并一次性装入顶层持久队列；
 6. 重置 JSONL 任务账本，为每个 Worker 启动红色提示监控器；
-7. 把首轮任务全部放入共享任务池，由多个 Worker 动态领取；
+7. 为当前 CDP 生命周期的多个 Worker 启动持续任务池；
 8. 每个 Worker 清理遗留弹窗，按任务卡片 ID 查询、校验并打开唯一结果，再注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
 10. 提交后并发监听心跳和数据补齐完成；完成信号出现后读取自动检测缺失量并据此判定结果，未捕获时在静默后执行主动后端复检兜底；
 11. 业务执行页 GC 使用更长的独立静默阈值回收没有正常关闭的页面；
-12. 每个任务结束后立即把本次尝试结果追加到 JSONL；
-13. Worker 发生普通任务失败时继续领取，发生致命页面异常时退出任务池；
-14. 首轮全部 Worker 收敛后，从 JSONL 读取失败任务；
-15. 仅由仍然健康的 Worker 对失败任务统一重试一次；
-16. 根据每个 `task_id` 的最新尝试结果输出最终成功和失败汇总；
-17. 停止红色提示监控器，并取消尚未完成的30秒延迟关闭协程；
-18. 如果仍有业务执行页面，按两个静默阈值之差加 5 秒交给 GC 自然收尾，再兜底关闭残留页面；
-19. 退出 Playwright 连接，程序结束。
+12. 每次真实 attempt 结束后立即把结果追加到 JSONL，失败且未达上限则复制后放回队尾；
+13. 单 Page 关闭或崩溃只淘汰当前 Worker，全局 Driver/CDP 断连才停止整个会话；
+14. 到达软生命周期后禁止新领取，等待所有在途任务正常或异常收尾；
+15. 停止并 gather 当前会话全部 Worker 和 GC 后台任务；
+16. 队列未完成时，只读校验缓存 `/json/version` 的浏览器身份；
+17. 身份一致且有额度时新建 Playwright/CDP 会话，在 Worker 启动前清理一次残留业务页，再继续消费同一队列；
+18. 整个队列完成后执行一次带宽限期的最终 GC 收尾；
+19. 根据每个 `task_id` 的最新尝试结果输出最终成功和失败汇总。
 
 ## 十八、Daily Mode：登录态重建、动态 Worker 与旁路通知
 
@@ -719,7 +736,7 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 
 ### Daily 专属即时重试
 
-历史补采保留“首轮全部完成后，从账本重建失败项并统一重试”的轮次模型。Daily 的任务只有少量卡片，若继续等待整轮结束，会让提前完成或失败的 Worker 长时间空闲，因此使用独立的持续任务池：
+Daily 继续使用自己的 `_daily_worker()` 与 `_run_daily_task_pool()`，不会被 Backfill 的多 CDP 生命周期调度替换。两者都采用失败立即回队，但 Daily 的浏览器启停、登录预检和任务池收尾语义保持独立：
 
 1. Worker 使用 `await queue.get()` 持续等待任务，不因队列暂时为空立即退出；
 2. 每次尝试都先把结果追加到 `daily_results.jsonl`；
@@ -728,7 +745,7 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 5. `queue.join()` 只会在所有任务到达终态后返回，调度器随后用哨兵统一停止健康 Worker；
 6. 页面无响应、崩溃或断连仍会使当前 Worker 熔断，但其失败任务可以由其他健康 Worker 继续领取。
 
-该分叉只存在于 `DailyEngine`。`BackfillEngine` 的历史区块调度和唯一一次总体重试保持不变。
+Backfill 的队列跨 CDP 生命周期存在；Daily 当前仍在一次由自身管理的浏览器会话内完成任务池。
 
 ### 统一的业务 UI 超时
 

@@ -18,6 +18,30 @@ class BrowserConnector(Protocol):
     def get_cdp_address(self) -> Optional[str]: ...
 
 
+def get_cdp_browser_identity(
+    cdp_address: str,
+    *,
+    timeout: float = 5,
+) -> Optional[str]:
+    """只读获取当前 CDP Browser 标识，不启动或重启外部浏览器。"""
+    try:
+        normalized_address = normalize_cdp_address(cdp_address)
+        response = requests.get(
+            f"http://{normalized_address}/json/version",
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        version_info = response.json()
+        if not isinstance(version_info, dict):
+            return None
+        websocket_url = version_info.get("webSocketDebuggerUrl")
+        if not isinstance(websocket_url, str) or not websocket_url.strip():
+            return None
+        return websocket_url.strip()
+    except (requests.exceptions.RequestException, ValueError):
+        return None
+
+
 def normalize_cdp_address(raw_address: str) -> str:
     """将 host:port 或 http://host:port 统一为 host:port。"""
     value = raw_address.strip()

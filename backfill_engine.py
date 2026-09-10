@@ -9,16 +9,19 @@ RPA 历史数据自动化补采调度引擎 (Playwright Async 版)
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import sys
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional, List, Tuple, TypeVar
 
 from dotenv import load_dotenv
 from playwright.async_api import (
+    Browser,
     BrowserContext,
     ElementHandle,
     Locator,
@@ -31,6 +34,7 @@ from browser_connector import (
     BitBrowserConnector,
     BrowserConnector,
     ExternalCdpConnector,
+    get_cdp_browser_identity,
     normalize_cdp_address,
 )
 from github_info import GIT_SHA
@@ -55,6 +59,45 @@ class TaskPageInitializationError(RuntimeError):
 
 class MissingDataRenderError(RuntimeError):
     """后端检测已触发，但顶部缺失统计文本始终未完成渲染。"""
+
+
+SESSION_END_REASON_PRIORITY = {
+    "tasks_completed": 0,
+    "lifetime_expired": 10,
+    "no_workers": 20,
+    "connection_lost": 30,
+    "session_error": 40,
+    "ledger_error": 50,
+}
+
+
+@dataclass
+class CdpSessionControl:
+    """单次 CDP 会话共享的停止信号、软截止时间和最终退出原因。"""
+
+    deadline: float
+    stop_event: asyncio.Event = field(default_factory=asyncio.Event)
+    end_reason: Optional[str] = None
+
+    def request_stop(self, reason: str) -> None:
+        current_priority = SESSION_END_REASON_PRIORITY.get(
+            self.end_reason or "tasks_completed",
+            -1,
+        )
+        new_priority = SESSION_END_REASON_PRIORITY.get(reason, -1)
+        if self.end_reason is None or new_priority > current_priority:
+            self.end_reason = reason
+        self.stop_event.set()
+
+
+@dataclass(frozen=True)
+class CdpSessionResult:
+    """一次 CDP 会话结束后交给 Backfill 顶层调度器的结果。"""
+
+    reason: str
+    ledger_ready: bool
+    worker_count: int = 0
+    queue_completed: bool = False
 
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
@@ -99,6 +142,9 @@ class BackfillEngine:
         browser_connector: Optional[BrowserConnector] = None,
         worker_heartbeat_silence_seconds: int = 120,
         business_heartbeat_silence_seconds: int = 180,
+        max_attempts: int = 5,
+        cdp_session_lifetime_hours: float = 3.5,
+        max_cdp_rebuilds: int = 5,
     ):
         self.bt_url = 'http://127.0.0.1:54345'
         self.bite_id = bite_id
@@ -115,6 +161,15 @@ class BackfillEngine:
                 "business_heartbeat_silence_seconds 必须大于 "
                 "worker_heartbeat_silence_seconds"
             )
+        if max_attempts <= 0:
+            raise ValueError("max_attempts 必须大于 0")
+        if (
+            not math.isfinite(cdp_session_lifetime_hours)
+            or cdp_session_lifetime_hours <= 0
+        ):
+            raise ValueError("cdp_session_lifetime_hours 必须大于 0")
+        if max_cdp_rebuilds < 0:
+            raise ValueError("max_cdp_rebuilds 不能小于 0")
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = worker_heartbeat_silence_seconds
         # Context 级业务执行页 GC 必须比 Worker 保留更长的观察窗口。
@@ -144,7 +199,12 @@ class BackfillEngine:
         # 普通初始化异常允许短暂恢复，连续达到阈值后隔离当前Worker。
         self.initialization_failure_cooldown_seconds = 20
         self.max_consecutive_initialization_failures = 5
+        self.max_attempts = max_attempts
+        self.cdp_session_lifetime_seconds = cdp_session_lifetime_hours * 3600
+        self.cdp_session_lifetime_hours = cdp_session_lifetime_hours
+        self.max_cdp_rebuilds = max_cdp_rebuilds
         self._error_toast_close_tasks: set[asyncio.Task] = set()
+        self._gc_background_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _fatal_page_error_reason(error: Exception) -> Optional[str]:
@@ -166,6 +226,20 @@ class BackfillEngine:
             return "页面、Context或浏览器已关闭或连接断开"
 
         return None
+
+    @staticmethod
+    def _is_driver_connection_error(error: BaseException) -> bool:
+        """识别可以明确指向 Playwright Driver/CDP 连接失效的异常。"""
+        error_msg = str(error).lower()
+        return any(
+            marker in error_msg
+            for marker in (
+                "connection closed while reading from the driver",
+                "playwright connection closed",
+                "playwright driver connection closed",
+                "the driver connection has been closed",
+            )
+        )
 
     async def _await_page_operation(
         self,
@@ -260,13 +334,19 @@ class BackfillEngine:
                     logger.info(
                         f"[GC Daemon] 滑块验证网页开始后台监控: {url_suffix}"
                     )
-                    asyncio.create_task(self._monitor_and_gc_page(page))
+                    monitor_task = asyncio.create_task(
+                        self._monitor_and_gc_page(page)
+                    )
+                    self._track_gc_background_task(monitor_task)
                     return
                 if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
                     managed_page = True
                     logger.info(f"[GC Daemon] 发现业务执行网页，开始后台监控: {url_suffix}")
-                    asyncio.create_task(self._monitor_and_gc_page(page))
+                    monitor_task = asyncio.create_task(
+                        self._monitor_and_gc_page(page)
+                    )
+                    self._track_gc_background_task(monitor_task)
                     return
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
@@ -291,7 +371,22 @@ class BackfillEngine:
 
     def _on_new_page(self, page: Page):
         """拦截浏览器新建标签页的事件"""
-        asyncio.create_task(self._delayed_check(page))
+        delayed_task = asyncio.create_task(self._delayed_check(page))
+        self._track_gc_background_task(delayed_task)
+
+    def _track_gc_background_task(self, task: asyncio.Task) -> None:
+        """持有当前 CDP 会话的 GC 任务，并在任务结束后自动移除。"""
+        self._gc_background_tasks.add(task)
+        task.add_done_callback(self._gc_background_tasks.discard)
+
+    async def _stop_gc_background_tasks(self) -> None:
+        """停止旧 CDP 会话仍在运行的延迟识别和业务页 GC 任务。"""
+        gc_tasks = list(self._gc_background_tasks)
+        for task in gc_tasks:
+            task.cancel()
+        if gc_tasks:
+            await asyncio.gather(*gc_tasks, return_exceptions=True)
+        self._gc_background_tasks.clear()
 
     def _is_gc_managed_page_url(self, url: str) -> bool:
         """判断 URL 是否属于应由 Context 级 GC 管理的业务执行页面。"""
@@ -376,10 +471,29 @@ class BackfillEngine:
             logger.info("程序收尾宽限期内，残留业务执行页面已全部自然关闭。")
             return
 
+        await self._close_remaining_gc_pages(context, "程序最终收尾")
+
+    async def _close_remaining_gc_pages(
+        self,
+        context: BrowserContext,
+        reason: str,
+    ) -> None:
+        """扫描并关闭 GC 管理范围内的残留业务页。"""
+        try:
+            remaining_pages = self._remaining_gc_pages(context)
+        except Exception as error:
+            logger.warning(f"{reason}扫描残留业务页面失败: {error}")
+            return
+
+        if not remaining_pages:
+            logger.info(f"{reason}未发现残留业务执行页面。")
+            return
+
         logger.warning(
-            f"程序收尾宽限期结束后仍有 {len(remaining_pages)} 个业务执行页面，"
-            "执行兜底关闭。"
+            f"{reason}发现 {len(remaining_pages)} 个残留业务执行页面，"
+            "开始立即关闭。"
         )
+
         close_results = await asyncio.gather(
             *(page.close() for page in remaining_pages),
             return_exceptions=True,
@@ -388,9 +502,12 @@ class BackfillEngine:
             isinstance(result, BaseException) for result in close_results
         )
         if failed_count:
-            logger.warning(f"程序收尾时有 {failed_count} 个业务执行页面关闭失败。")
+            logger.warning(
+                f"{reason}有 {failed_count} 个业务执行页面关闭失败；"
+                "记录后继续后续流程。"
+            )
         else:
-            logger.info("程序收尾时的残留业务执行页面已全部关闭。")
+            logger.info(f"{reason}的残留业务执行页面已全部关闭。")
 
     def _track_error_toast_close_task(self, task: asyncio.Task) -> None:
         """持有延迟关闭任务，避免任务被垃圾回收，并在结束后自动移除。"""
@@ -916,24 +1033,37 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} 开始注入采集区间: {start_date} 至 {end_date}")
         try:
             primary_drawer = self._primary_drawer(page)
-            inputs = primary_drawer.locator("input.el-range-input")
-
-            input_count = await self._await_page_operation(
-                inputs.count(),
-                worker_id,
-                "查询日期输入框数量",
+            start_input = primary_drawer.get_by_role(
+                "textbox", name="开始", exact=False
             )
-            if input_count < 2:
-                raise RuntimeError(f"一级弹窗内预期至少 2 个日期输入框，实际找到 {input_count} 个")
+            end_input = primary_drawer.get_by_role(
+                "textbox", name="结束", exact=False
+            )
+
+            start_input_count = await self._await_page_operation(
+                start_input.count(),
+                worker_id,
+                "查询可见开始日期输入框数量",
+            )
+            end_input_count = await self._await_page_operation(
+                end_input.count(),
+                worker_id,
+                "查询可见结束日期输入框数量",
+            )
+            if start_input_count != 1 or end_input_count != 1:
+                raise RuntimeError(
+                    "一级弹窗内预期各找到 1 个可见的开始/结束日期输入框，"
+                    f"实际找到 {start_input_count}/{end_input_count} 个"
+                )
             
             # 填充开始日期并按回车确认
-            await inputs.nth(0).fill(start_date)
-            await page.keyboard.press("Enter")
+            await start_input.fill(start_date)
+            await start_input.press("Enter")
             await page.wait_for_timeout(200) # 给 UI 一点反应时间
             
             # 填充结束日期并按回车确认
-            await inputs.nth(1).fill(end_date)
-            await page.keyboard.press("Enter")
+            await end_input.fill(end_date)
+            await end_input.press("Enter")
             await page.wait_for_timeout(200)
             
             # 避免使用直接赋值，以确保 ElementUI 内部的 v-model 能够正确捕捉到数据变更。
@@ -1595,23 +1725,25 @@ class BackfillEngine:
         task_queue: asyncio.Queue,
         ledger: TaskLedger,
         list_index: int,
-        round_name: str,
+        session_control: CdpSessionControl,
     ) -> bool:
-        """持续消费共享队列；返回值表示当前页面能否继续用于下一轮。"""
+        """在单次 CDP 生命周期内持续消费顶层共享队列。"""
         worker_id = f"页面-{list_index + 1}"
         logger.info(
-            f"Worker-{worker_id} 启动{round_name}，绑定页面: {page.url[-25:]}"
+            f"Worker-{worker_id} 启动持续任务池，绑定页面: {page.url[-25:]}"
         )
         consecutive_initialization_failures = 0
 
         while True:
-            try:
-                task = task_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                logger.info(f"Worker-{worker_id} 已完成{round_name}的任务领取。")
+            task = await self._get_task_for_session(
+                task_queue,
+                session_control,
+            )
+            if task is None:
+                logger.info(f"Worker-{worker_id} 已停止领取新任务。")
                 return True
 
-            fatal_error = False
+            worker_fatal = False
             try:
                 success = await self.execute_task(page, task, list_index)
                 # execute_task 能进入业务流程（无论业务最终成功与否），说明页面初始化正常。
@@ -1628,224 +1760,488 @@ class BackfillEngine:
                     consecutive_initialization_failures
                     >= self.max_consecutive_initialization_failures
                 ):
-                    fatal_error = True
+                    worker_fatal = True
                     logger.error(
                         f"Worker-{worker_id} 已达到连续初始化失败阈值，"
                         "触发熔断并停止领取新任务。"
                     )
             except Exception as error:
-                fatal_reason = self._fatal_page_error_reason(error)
                 success = False
-                if fatal_reason:
-                    fatal_error = True
-                    logger.error(f"Worker-{worker_id} 因{fatal_reason}停止领取新任务。")
-                else:
+                if self._is_driver_connection_error(error):
+                    worker_fatal = True
+                    session_control.request_stop("connection_lost")
                     logger.error(
-                        f"Worker-{worker_id} 执行任务时发生未分类异常，"
-                        f"当前任务记为失败: {error}"
+                        f"Worker-{worker_id} 检测到 Playwright Driver/CDP "
+                        f"连接失效，停止当前会话: {error}"
                     )
+                else:
+                    fatal_reason = self._fatal_page_error_reason(error)
+                    if fatal_reason:
+                        # 单个 Page 被关闭、崩溃或失去响应，只隔离当前 Worker。
+                        worker_fatal = True
+                        logger.error(
+                            f"Worker-{worker_id} 因{fatal_reason}停止领取新任务。"
+                        )
+                    else:
+                        logger.error(
+                            f"Worker-{worker_id} 执行任务时发生未分类异常，"
+                            f"当前任务记为失败: {error}"
+                        )
 
             try:
                 await ledger.record(task, success)
+                if not success and task["attempt"] < self.max_attempts:
+                    retry_task = {
+                        **task,
+                        "attempt": task["attempt"] + 1,
+                        "missing_count": None,
+                        "detail_missing_categories": None,
+                    }
+                    task_queue.put_nowait(retry_task)
+                    logger.warning(
+                        f"任务 {task['task_id']} 第 {task['attempt']}/"
+                        f"{self.max_attempts} 次执行失败，已放回共享队列尾部。"
+                    )
+                elif not success:
+                    logger.error(
+                        f"任务 {task['task_id']} 已达到最大执行次数 "
+                        f"{self.max_attempts}，最终记为失败。"
+                    )
+            except Exception as error:
+                session_control.request_stop("ledger_error")
+                worker_fatal = True
+                logger.exception(
+                    f"任务 {task['task_id']} 写入账本失败，停止当前会话: {error}"
+                )
             finally:
+                # 重试任务必须先入队再结束当前项，避免 queue.join() 提前返回。
                 task_queue.task_done()
 
-            if fatal_error:
+            if worker_fatal:
                 return False
 
-    async def _run_task_round(
+    async def _get_task_for_session(
         self,
-        tasks: List[Dict[str, Any]],
-        worker_pages: List[Page],
-        ledger: TaskLedger,
-        round_name: str,
-    ) -> List[Page]:
-        """让全部可用页面并发消费一轮预先装满的共享任务队列。"""
-        if not tasks:
-            logger.info(f"{round_name}没有需要执行的任务。")
-            return worker_pages
+        task_queue: asyncio.Queue,
+        session_control: CdpSessionControl,
+    ) -> Optional[Dict[str, Any]]:
+        """等待队列任务；截止或停止信号发生后不再领取。"""
+        if session_control.stop_event.is_set():
+            return None
 
-        task_queue: asyncio.Queue = asyncio.Queue()
-        for task in tasks:
-            task_queue.put_nowait(task)
+        remaining_seconds = session_control.deadline - time.monotonic()
+        if remaining_seconds <= 0:
+            session_control.request_stop("lifetime_expired")
+            return None
+
+        get_task = asyncio.create_task(task_queue.get())
+        stop_task = asyncio.create_task(session_control.stop_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {get_task, stop_task},
+                timeout=remaining_seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if get_task not in done:
+                if not done:
+                    session_control.request_stop("lifetime_expired")
+                # stop/deadline 先赢时，get 仍可能在 cancel 前恰好完成。
+                get_task.cancel()
+                await asyncio.gather(get_task, return_exceptions=True)
+                if (
+                    not get_task.cancelled()
+                    and get_task.exception() is None
+                ):
+                    unstarted_task = get_task.result()
+                    task_queue.put_nowait(unstarted_task)
+                    task_queue.task_done()
+                return None
+
+            task = get_task.result()
+            # queue.get 与停止信号可能同时完成。任务尚未开始时必须原样归还。
+            if (
+                stop_task in done
+                or session_control.stop_event.is_set()
+                or time.monotonic() >= session_control.deadline
+            ):
+                if time.monotonic() >= session_control.deadline:
+                    session_control.request_stop("lifetime_expired")
+                task_queue.put_nowait(task)
+                task_queue.task_done()
+                return None
+            return task
+        finally:
+            for wait_task in (get_task, stop_task):
+                if not wait_task.done():
+                    wait_task.cancel()
+            await asyncio.gather(get_task, stop_task, return_exceptions=True)
+
+    async def _run_task_pool_session(
+        self,
+        worker_pages: List[Page],
+        task_queue: asyncio.Queue,
+        ledger: TaskLedger,
+        session_control: CdpSessionControl,
+    ) -> CdpSessionResult:
+        """运行一个 CDP 生命周期；队列由 Backfill 顶层持有。"""
+        if not worker_pages:
+            session_control.request_stop("no_workers")
+            logger.error("当前 CDP 会话未找到可用 Worker；队列保持原状。")
+            return CdpSessionResult("no_workers", True, 0)
 
         logger.info(
-            f"\n{'=' * 40}\n{round_name}开始：{len(tasks)} 个任务，"
-            f"{len(worker_pages)} 个可用Worker\n{'=' * 40}"
+            f"CDP 会话任务池开始：队列当前 {task_queue.qsize()} 项，"
+            f"{len(worker_pages)} 个 Worker，每个任务最多 {self.max_attempts} 次。"
         )
-
-        if not worker_pages:
-            logger.error(f"{round_name}没有可用Worker，本轮任务全部记为失败。")
-            while True:
-                try:
-                    task = task_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
-                try:
-                    await ledger.record(task, False)
-                finally:
-                    task_queue.task_done()
-            return []
-
-        worker_results = await asyncio.gather(
-            *[
-                self.worker(page, task_queue, ledger, index, round_name)
-                for index, page in enumerate(worker_pages)
-            ],
-            return_exceptions=True,
-        )
-        healthy_pages = []
-        for index, (page, result) in enumerate(zip(worker_pages, worker_results)):
-            if result is True:
-                healthy_pages.append(page)
-            elif isinstance(result, BaseException):
-                logger.error(
-                    f"Worker-页面-{index + 1} 协程异常退出，已从后续轮次隔离: {result}"
+        worker_tasks = [
+            asyncio.create_task(
+                self.worker(
+                    page,
+                    task_queue,
+                    ledger,
+                    index,
+                    session_control,
                 )
+            )
+            for index, page in enumerate(worker_pages)
+        ]
+        workers_done = asyncio.gather(*worker_tasks, return_exceptions=True)
+        queue_done = asyncio.create_task(task_queue.join())
+        stop_wait = asyncio.create_task(session_control.stop_event.wait())
 
-        # 正常情况下健康Worker会取完全部任务；这里只兜底处理全部页面都崩溃的情况。
-        unprocessed_count = 0
-        while True:
-            try:
-                task = task_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            try:
-                await ledger.record(task, False)
-                unprocessed_count += 1
-            finally:
-                task_queue.task_done()
+        async def expire_session() -> None:
+            remaining = session_control.deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+            session_control.request_stop("lifetime_expired")
 
-        if unprocessed_count:
-            logger.warning(
-                f"{round_name}结束时已无可用Worker，剩余 {unprocessed_count} 个"
-                "未执行任务已记为失败。"
+        lifetime_task = asyncio.create_task(expire_session())
+        queue_completed = False
+        try:
+            done, _ = await asyncio.wait(
+                {workers_done, queue_done, stop_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if queue_done in done:
+                session_control.request_stop("tasks_completed")
+
+            worker_results = await workers_done
+            # task_done() 唤醒 join() 需要一次事件循环调度机会。
+            await asyncio.sleep(0)
+            queue_completed = (
+                queue_done.done()
+                and not queue_done.cancelled()
+                and queue_done.exception() is None
+            )
+            all_workers_failed = all(
+                result is False or isinstance(result, BaseException)
+                for result in worker_results
+            )
+            if not queue_done.done() and (
+                all_workers_failed or session_control.end_reason is None
+            ):
+                session_control.request_stop("no_workers")
+            for index, result in enumerate(worker_results):
+                if isinstance(result, BaseException):
+                    session_control.request_stop("session_error")
+                    logger.error(
+                        f"Worker-页面-{index + 1} 协程异常退出: {result}"
+                    )
+        finally:
+            for wait_task in (queue_done, stop_wait, lifetime_task):
+                if not wait_task.done():
+                    wait_task.cancel()
+            await asyncio.gather(
+                queue_done,
+                stop_wait,
+                lifetime_task,
+                return_exceptions=True,
+            )
+            for worker_task in worker_tasks:
+                if not worker_task.done():
+                    worker_task.cancel()
+            await asyncio.gather(*worker_tasks, return_exceptions=True)
+
+        reason = session_control.end_reason or "tasks_completed"
+        logger.info(
+            f"CDP 会话任务池结束：reason={reason}，"
+            f"队列保留 {task_queue.qsize()} 项。"
+        )
+        return CdpSessionResult(
+            reason=reason,
+            ledger_ready=reason != "ledger_error",
+            worker_count=len(worker_pages),
+            queue_completed=queue_completed,
+        )
+
+    async def _run_cdp_session(
+        self,
+        browser: Browser,
+        task_queue: asyncio.Queue,
+        ledger: TaskLedger,
+    ) -> CdpSessionResult:
+        """校验 BrowserContext/Worker，并完整收束一次会话的后台协程。"""
+        try:
+            contexts = browser.contexts
+            if not contexts:
+                logger.error(
+                    "浏览器中没有默认 Context；不能创建隔离 Context 代替登录态。"
+                )
+                return CdpSessionResult("no_workers", True, 0)
+
+            context = contexts[0]
+            context.on("page", self._on_new_page)
+            for existing_page in context.pages:
+                self._on_new_page(existing_page)
+
+            worker_pages = [
+                page for page in context.pages if "datatoolcenter" in page.url
+            ]
+            if not worker_pages:
+                logger.error(
+                    "当前 CDP 会话未找到 datatoolcenter Worker 页面，停止运行。"
+                )
+                return CdpSessionResult("no_workers", True, 0)
+
+            logger.info(f"检测到 {len(worker_pages)} 个符合条件的 Worker 标签页。")
+            session_control = CdpSessionControl(
+                deadline=time.monotonic() + self.cdp_session_lifetime_seconds
             )
 
-        logger.info(
-            f"{round_name}结束：仍有 {len(healthy_pages)} 个Worker可用于后续调度。"
-        )
-        return healthy_pages
+            def on_disconnected(_browser: Browser) -> None:
+                logger.error("检测到 Browser disconnected，停止当前 CDP 会话领取。")
+                session_control.request_stop("connection_lost")
+
+            browser.on("disconnected", on_disconnected)
+            error_toast_monitors = [
+                asyncio.create_task(
+                    self._monitor_worker_error_toasts(
+                        page,
+                        f"页面-{index + 1}",
+                    )
+                )
+                for index, page in enumerate(worker_pages)
+            ]
+            try:
+                result = await self._run_task_pool_session(
+                    worker_pages,
+                    task_queue,
+                    ledger,
+                    session_control,
+                )
+                if (
+                    result.reason == "tasks_completed"
+                    or (
+                        result.queue_completed
+                        and browser.is_connected()
+                    )
+                ):
+                    await self._cleanup_remaining_gc_pages(context)
+                final_reason = session_control.end_reason or result.reason
+                if final_reason != result.reason:
+                    result = CdpSessionResult(
+                        reason=final_reason,
+                        ledger_ready=result.ledger_ready,
+                        worker_count=result.worker_count,
+                        queue_completed=result.queue_completed,
+                    )
+                return result
+            finally:
+                try:
+                    browser.remove_listener("disconnected", on_disconnected)
+                except Exception:
+                    pass
+                await self._stop_error_toast_monitors(error_toast_monitors)
+                await self._stop_gc_background_tasks()
+        except Exception as error:
+            reason = (
+                "connection_lost"
+                if self._is_driver_connection_error(error)
+                else "session_error"
+            )
+            logger.exception(f"CDP 会话主流程异常（{reason}）: {error}")
+            await self._stop_gc_background_tasks()
+            return CdpSessionResult(reason, reason != "ledger_error", -1)
 
     @staticmethod
     def _log_summary(summary: Dict[str, int]) -> None:
-        """输出本轮首次执行、总体重试和最终完成情况。"""
-        logger.info(
-            "\n任务执行汇总：\n"
-            f"  本轮任务总数：{summary['total']}\n"
-            f"  首次执行成功：{summary['first_success']}\n"
-            f"  首次执行失败：{summary['first_failed']}\n"
-            f"  进入总体重试：{summary['retry_total']}\n"
-            f"  重试成功：{summary['retry_success']}\n"
-            f"  重试仍失败：{summary['retry_failed']}\n"
-            f"  最终完成：{summary['final_success']}\n"
-            f"  最终失败：{summary['final_failed']}"
+        """输出逐次 attempt 和最终完成情况。"""
+        lines = [
+            "\n任务执行汇总：",
+            f"  配置任务总数：{summary['total']}",
+        ]
+        for attempt_result in summary.get("attempt_stats", []):
+            lines.append(
+                f"  第 {attempt_result['attempt']} 次尝试："
+                f"{attempt_result['success']} 成功 / "
+                f"{attempt_result['failed']} 失败 / "
+                f"{attempt_result['total']} 条记录"
+            )
+        lines.extend(
+            [
+                f"  最终完成：{summary['final_success']}",
+                f"  最终失败（含未领取任务）：{summary['final_failed']}",
+            ]
         )
+        logger.info("\n".join(lines))
+
+    async def _browser_identity_matches(
+        self,
+        cdp_address: str,
+        expected_identity: str,
+    ) -> bool:
+        """只读确认缓存 CDP 端点仍属于初次连接的同一个浏览器。"""
+        current_identity = await asyncio.to_thread(
+            get_cdp_browser_identity,
+            cdp_address,
+        )
+        if current_identity is None:
+            logger.error("缓存 CDP 端点已不可达，浏览器可能已关闭。")
+            return False
+        if current_identity != expected_identity:
+            logger.error("缓存 CDP 端点的浏览器身份已变化，拒绝接管替代进程。")
+            return False
+        return True
 
     async def run(self, tasks_config: list = None):
         logger.info(
             "历史补采启动："
             f"浏览器连接器={type(self.browser_connector).__name__}，"
             f"Worker心跳静默阈值={self.silent_timeout_seconds}秒，"
-            f"业务页心跳静默阈值={self.gc_silent_timeout_seconds}秒"
+            f"业务页心跳静默阈值={self.gc_silent_timeout_seconds}秒，"
+            f"任务最多尝试={self.max_attempts}次，"
+            f"CDP会话软生命周期={self.cdp_session_lifetime_hours:g}小时，"
+            f"最多重建={self.max_cdp_rebuilds}次"
         )
-        cdp_address = self.browser_connector.get_cdp_address()
-        if not cdp_address:
-            logger.error("无法获取浏览器 CDP 地址，程序退出")
+        if not tasks_config:
+            logger.error("未传入任何任务配置 tasks_config，引擎停止运行。")
+            return
+        if not isinstance(tasks_config, list) or not all(
+            isinstance(config, dict) for config in tasks_config
+        ):
+            logger.error("tasks_config 必须是 list[dict]，引擎停止运行。")
             return
 
-        async with async_playwright() as p:
-            # CDP 地址的来源由浏览器连接器决定；后续业务逻辑完全共用。
-            browser = await p.chromium.connect_over_cdp(f"http://{cdp_address}")
-            contexts = browser.contexts
-            
-            if not contexts:
-                logger.error("浏览器中没有可用的 Context")
-                return
-                
-            context = contexts[0]
-            
-            # --- 挂载全局 GC 守护进程 ---
-            context.on("page", self._on_new_page)
-            # 把现存的网页也拉进去扫描一遍
-            for existing_page in context.pages:
-                self._on_new_page(existing_page)
-                
-            pages = context.pages
-            
-            # 过滤出符合数据中心 URL 的标签页作为 Workers
-            worker_pages = [page for page in pages if "datatoolcenter" in page.url]
-            
-            if not worker_pages:
-                logger.error("未找到对应的数据检测工具网页，请确认浏览器中是否已打开目标页面！")
-                return
-                
-            logger.info(f"检测到 {len(worker_pages)} 个符合条件的 Worker 标签页。")
+        initial_tasks = self.build_tasks(tasks_config)
+        if not initial_tasks:
+            logger.warning("配置没有生成任何有效日期任务，调度结束。")
+            return
 
-            if not tasks_config:
-                logger.error("未传入任何任务配置 tasks_config，引擎停止运行。")
-                return
+        ledger = TaskLedger(runtime_dir / "backfill_results.jsonl")
+        try:
+            await ledger.reset()
+        except Exception as error:
+            logger.error(f"无法创建或覆盖任务账本，调度停止: {error}")
+            return
 
-            if not isinstance(tasks_config, list) or not all(
-                isinstance(config, dict) for config in tasks_config
-            ):
-                logger.error("tasks_config 必须是 list[dict]，引擎停止运行。")
-                return
+        task_queue: asyncio.Queue = asyncio.Queue()
+        for task in initial_tasks:
+            task_queue.put_nowait(task)
+        logger.info(
+            f"本轮任务账本已重置: {ledger.path}；日志继续追加到: {log_path}；"
+            f"持久化内存队列已装入 {len(initial_tasks)} 个任务。"
+        )
 
-            initial_tasks = self.build_tasks(tasks_config)
-            if not initial_tasks:
-                logger.warning("配置没有生成任何有效日期任务，调度结束。")
-                return
+        # 仅初次启动调用连接器；后续生命周期禁止再次触发 /browser/open。
+        cdp_address = self.browser_connector.get_cdp_address()
+        if not cdp_address:
+            logger.error("无法获取浏览器 CDP 地址，程序退出。")
+            self._log_summary(await ledger.summary(len(initial_tasks)))
+            return
+        cdp_address = normalize_cdp_address(cdp_address)
+        initial_identity = await asyncio.to_thread(
+            get_cdp_browser_identity,
+            cdp_address,
+        )
+        if not initial_identity:
+            logger.error("无法读取初始 CDP 浏览器身份，程序退出。")
+            self._log_summary(await ledger.summary(len(initial_tasks)))
+            return
 
-            ledger = TaskLedger(runtime_dir / "backfill_results.jsonl")
-            try:
-                await ledger.reset()
-            except Exception as error:
-                logger.error(f"无法创建或覆盖任务账本，调度停止: {error}")
-                return
-
-            logger.info(
-                f"本轮任务账本已重置: {ledger.path}；日志继续追加到: {log_path}"
-            )
-
-            # 每个数据中心 Worker 都有独立的错误提示回收器，不与业务任务绑定。
-            error_toast_monitors = [
-                asyncio.create_task(
-                    self._monitor_worker_error_toasts(page, f"页面-{index + 1}")
-                )
-                for index, page in enumerate(worker_pages)
-            ]
-
-            try:
-                # 第一轮：所有页面从同一个共享任务池动态领取日期区块。
-                healthy_pages = await self._run_task_round(
-                    initial_tasks,
-                    worker_pages,
-                    ledger,
-                    "首次执行",
-                )
-
-                # 第二轮：必须从 JSONL 读取第一轮失败项，只进行一次总体重试。
-                retry_tasks = await ledger.failed_tasks(attempt=1)
-                if retry_tasks:
-                    logger.warning(
-                        f"首次执行结束，从任务账本读取到 {len(retry_tasks)} 个失败任务，"
-                        "开始唯一一次总体重试。"
+        rebuild_count = 0
+        first_session = True
+        while True:
+            if not first_session:
+                if rebuild_count >= self.max_cdp_rebuilds:
+                    logger.error(
+                        f"CDP 会话已达到最大重建次数 {self.max_cdp_rebuilds}，"
+                        f"队列仍保留 {task_queue.qsize()} 个未完成项。"
                     )
-                    await self._run_task_round(
-                        retry_tasks,
-                        healthy_pages,
+                    break
+                if not await self._browser_identity_matches(
+                    cdp_address,
+                    initial_identity,
+                ):
+                    logger.error(
+                        f"浏览器已关闭或被替换；队列保留 "
+                        f"{task_queue.qsize()} 个未完成项，Backfill 彻底停止。"
+                    )
+                    break
+                rebuild_count += 1
+                logger.warning(
+                    f"开始第 {rebuild_count}/{self.max_cdp_rebuilds} 次 CDP 重建；"
+                    "只重建 Playwright Driver/代理，不关闭或重启浏览器。"
+                )
+
+            first_session = False
+            connected = False
+            try:
+                async with async_playwright() as playwright:
+                    browser = await playwright.chromium.connect_over_cdp(
+                        f"http://{cdp_address}"
+                    )
+                    connected = True
+                    if rebuild_count > 0:
+                        if browser.contexts:
+                            await self._close_remaining_gc_pages(
+                                browser.contexts[0],
+                                "CDP 重建预清理",
+                            )
+                        logger.info(
+                            f"CDP 重建连接完成：第 {rebuild_count}/"
+                            f"{self.max_cdp_rebuilds} 次；"
+                            "已重新连接原浏览器，"
+                            f"队列剩余 {task_queue.qsize()} 项，"
+                            "开始校验 Worker 并恢复任务调度。"
+                        )
+                    session_result = await self._run_cdp_session(
+                        browser,
+                        task_queue,
                         ledger,
-                        "总体重试",
                     )
-                else:
-                    logger.info("首次执行没有失败任务，无需总体重试。")
-
-                summary = await ledger.summary(total_tasks=len(initial_tasks))
-                self._log_summary(summary)
+            except Exception as error:
+                reason = (
+                    "connection_lost"
+                    if not connected or self._is_driver_connection_error(error)
+                    else "session_error"
+                )
+                logger.exception(f"建立或退出 CDP 会话失败（{reason}）: {error}")
+                session_result = CdpSessionResult(reason, True, -1)
             finally:
-                await self._stop_error_toast_monitors(error_toast_monitors)
-                await self._cleanup_remaining_gc_pages(context)
+                # 防止连接阶段异常时遗留上一会话的后台任务引用。
+                await self._stop_gc_background_tasks()
+
+            if session_result.reason in {"ledger_error", "session_error"}:
+                logger.error(
+                    f"发生不可安全恢复的内部错误 {session_result.reason}，"
+                    f"队列保留 {task_queue.qsize()} 个未完成项。"
+                )
+                break
+            if (
+                session_result.reason == "tasks_completed"
+                or session_result.queue_completed
+            ):
+                logger.info("持久化任务队列已完成。")
+                break
+            if session_result.worker_count == 0:
+                logger.error(
+                    f"当前连接没有默认 Context 或 Worker 页面，"
+                    f"队列保留 {task_queue.qsize()} 个未完成项，停止运行。"
+                )
+                break
+
+        summary = await ledger.summary(total_tasks=len(initial_tasks))
+        self._log_summary(summary)
 
 
 def _load_json_list_env(name: str) -> List[Any]:
@@ -1875,6 +2271,9 @@ class BackfillRuntimeConfig:
     gc_page_url_markers: List[str]
     worker_heartbeat_silence_seconds: int
     business_heartbeat_silence_seconds: int
+    max_attempts: int
+    cdp_session_lifetime_hours: float
+    max_cdp_rebuilds: int
 
 
 def _load_positive_int_env(name: str, default: int) -> int:
@@ -1885,6 +2284,32 @@ def _load_positive_int_env(name: str, default: int) -> int:
         value = int(raw_value)
     except ValueError as error:
         raise ValueError(f".env 中的 {name} 必须是整数") from error
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError(f".env 中的 {name} 必须大于 0")
+    return value
+
+
+def _load_nonnegative_int_env(name: str, default: int) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是整数") from error
+    if value < 0:
+        raise ValueError(f".env 中的 {name} 不能小于 0")
+    return value
+
+
+def _load_positive_float_env(name: str, default: float) -> float:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是数字") from error
     if value <= 0:
         raise ValueError(f".env 中的 {name} 必须大于 0")
     return value
@@ -1958,6 +2383,15 @@ def load_runtime_config() -> BackfillRuntimeConfig:
         gc_page_url_markers=markers_raw,
         worker_heartbeat_silence_seconds=worker_silence,
         business_heartbeat_silence_seconds=business_silence,
+        max_attempts=_load_positive_int_env("MAX_ATTEMPTS", 5),
+        cdp_session_lifetime_hours=_load_positive_float_env(
+            "BACKFILL_CDP_SESSION_LIFETIME_HOURS",
+            3.5,
+        ),
+        max_cdp_rebuilds=_load_nonnegative_int_env(
+            "BACKFILL_MAX_CDP_REBUILDS",
+            5,
+        ),
     )
 
 
@@ -1989,5 +2423,8 @@ if __name__ == "__main__":
         business_heartbeat_silence_seconds=(
             config.business_heartbeat_silence_seconds
         ),
+        max_attempts=config.max_attempts,
+        cdp_session_lifetime_hours=config.cdp_session_lifetime_hours,
+        max_cdp_rebuilds=config.max_cdp_rebuilds,
     )
     asyncio.run(engine.run(config.tasks_config))

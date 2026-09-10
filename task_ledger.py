@@ -68,37 +68,13 @@ class TaskLedger:
                 )
         return records
 
-    async def failed_tasks(self, attempt: int) -> List[Dict[str, Any]]:
-        """读取指定轮次失败项，并生成下一轮可以直接入队的任务。"""
-        records = await self.load()
-        latest_by_task: Dict[str, Dict[str, Any]] = {}
-
-        for record in records:
-            if record.get("attempt") == attempt:
-                latest_by_task[record["task_id"]] = record
-
-        return [
-            {
-                "task_id": record["task_id"],
-                "card": record["card"],
-                "task_name": record.get("task_name"),
-                "start": record["start"],
-                "end": record["end"],
-                "attempt": attempt + 1,
-                "missing_count": None,
-                "detail_missing_categories": None,
-            }
-            for record in latest_by_task.values()
-            if record.get("success") is False
-        ]
-
     async def summary(self, total_tasks: int) -> Dict[str, Any]:
         """按 task_id 的最新尝试结果生成逐次尝试及最终统计。"""
         records = await self.load()
         first_results: Dict[str, Dict[str, Any]] = {}
-        retry_results: Dict[str, Dict[str, Any]] = {}
         latest_results: Dict[str, Dict[str, Any]] = {}
         results_by_attempt: Dict[int, Dict[str, Dict[str, Any]]] = {}
+        retry_records: List[Dict[str, Any]] = []
 
         for record in records:
             task_id = record["task_id"]
@@ -107,8 +83,8 @@ class TaskLedger:
                 results_by_attempt.setdefault(attempt, {})[task_id] = record
             if attempt == 1:
                 first_results[task_id] = record
-            elif attempt == 2:
-                retry_results[task_id] = record
+            elif isinstance(attempt, int) and attempt > 1:
+                retry_records.append(record)
 
             previous = latest_results.get(task_id)
             if previous is None or attempt >= previous.get("attempt", 0):
@@ -118,7 +94,7 @@ class TaskLedger:
             record.get("success") is True for record in first_results.values()
         )
         retry_success = sum(
-            record.get("success") is True for record in retry_results.values()
+            record.get("success") is True for record in retry_records
         )
         final_success = sum(
             record.get("success") is True for record in latest_results.values()
@@ -143,9 +119,9 @@ class TaskLedger:
             "total": total_tasks,
             "first_success": first_success,
             "first_failed": total_tasks - first_success,
-            "retry_total": len(retry_results),
+            "retry_total": len(retry_records),
             "retry_success": retry_success,
-            "retry_failed": len(retry_results) - retry_success,
+            "retry_failed": len(retry_records) - retry_success,
             "final_success": final_success,
             "final_failed": total_tasks - final_success,
             "attempt_stats": attempt_stats,

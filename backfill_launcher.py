@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDoubleSpinBox,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -113,6 +114,11 @@ def build_env_content(values: dict[str, Any]) -> str:
             f"{values['worker_heartbeat_seconds']}",
             "BUSINESS_HEARTBEAT_SILENCE_SECONDS="
             f"{values['business_heartbeat_seconds']}",
+            f"MAX_ATTEMPTS={values['max_attempts']}",
+            "BACKFILL_CDP_SESSION_LIFETIME_HOURS="
+            f"{values['cdp_session_lifetime_hours']:g}",
+            "BACKFILL_MAX_CDP_REBUILDS="
+            f"{values['max_cdp_rebuilds']}",
             "",
         ]
     )
@@ -230,6 +236,18 @@ class BackfillLauncherWindow(QMainWindow):
         self.business_heartbeat_spin.setRange(1, 86400)
         self.business_heartbeat_spin.setSuffix(" 秒")
 
+        self.max_attempts_spin = QSpinBox()
+        self.max_attempts_spin.setRange(1, 100)
+
+        self.cdp_session_lifetime_spin = QDoubleSpinBox()
+        self.cdp_session_lifetime_spin.setRange(0.1, 168.0)
+        self.cdp_session_lifetime_spin.setDecimals(1)
+        self.cdp_session_lifetime_spin.setSingleStep(0.5)
+        self.cdp_session_lifetime_spin.setSuffix(" 小时")
+
+        self.max_cdp_rebuilds_spin = QSpinBox()
+        self.max_cdp_rebuilds_spin.setRange(0, 100)
+
         new_button = QPushButton("新建客户")
         new_button.clicked.connect(self.start_new_customer)
         load_button = QPushButton("加载已有 .env")
@@ -252,6 +270,12 @@ class BackfillLauncherWindow(QMainWindow):
         layout.addWidget(self.worker_heartbeat_spin, 5, 1)
         layout.addWidget(QLabel("业务页心跳静默"), 5, 2)
         layout.addWidget(self.business_heartbeat_spin, 5, 3)
+        layout.addWidget(QLabel("任务最多尝试"), 6, 0)
+        layout.addWidget(self.max_attempts_spin, 6, 1)
+        layout.addWidget(QLabel("CDP 会话生命周期"), 6, 2)
+        layout.addWidget(self.cdp_session_lifetime_spin, 6, 3)
+        layout.addWidget(QLabel("最多 CDP 重建"), 7, 0)
+        layout.addWidget(self.max_cdp_rebuilds_spin, 7, 1)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)
         return group
@@ -403,6 +427,15 @@ class BackfillLauncherWindow(QMainWindow):
         )
         self.business_heartbeat_spin.setValue(
             int(defaults.get("business_heartbeat_seconds", 180))
+        )
+        self.max_attempts_spin.setValue(
+            int(defaults.get("max_attempts", 5))
+        )
+        self.cdp_session_lifetime_spin.setValue(
+            float(defaults.get("cdp_session_lifetime_hours", 3.5))
+        )
+        self.max_cdp_rebuilds_spin.setValue(
+            int(defaults.get("max_cdp_rebuilds", 5))
         )
 
         # 新建任务默认补采最新完整日期；加载已有任务时会由任务值覆盖。
@@ -641,6 +674,11 @@ class BackfillLauncherWindow(QMainWindow):
             "tasks": tasks,
             "worker_heartbeat_seconds": self.worker_heartbeat_spin.value(),
             "business_heartbeat_seconds": self.business_heartbeat_spin.value(),
+            "max_attempts": self.max_attempts_spin.value(),
+            "cdp_session_lifetime_hours": (
+                self.cdp_session_lifetime_spin.value()
+            ),
+            "max_cdp_rebuilds": self.max_cdp_rebuilds_spin.value(),
         }
 
     def _customer_dir(self, customer_name: str | None = None) -> Path:
@@ -674,6 +712,18 @@ class BackfillLauncherWindow(QMainWindow):
             )
             self.business_heartbeat_spin.setValue(
                 int(values.get("BUSINESS_HEARTBEAT_SILENCE_SECONDS") or 180)
+            )
+            self.max_attempts_spin.setValue(
+                int(values.get("MAX_ATTEMPTS") or 5)
+            )
+            self.cdp_session_lifetime_spin.setValue(
+                float(
+                    values.get("BACKFILL_CDP_SESSION_LIFETIME_HOURS")
+                    or 3.5
+                )
+            )
+            self.max_cdp_rebuilds_spin.setValue(
+                int(values.get("BACKFILL_MAX_CDP_REBUILDS") or 5)
             )
 
             markers = json.loads(str(values.get("GC_PAGE_URL_MARKERS") or "[]"))

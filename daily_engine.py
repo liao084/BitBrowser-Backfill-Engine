@@ -20,7 +20,7 @@ os.environ.setdefault("RPA_CONSOLE_LOGGING", "0")
 from dotenv import load_dotenv
 from playwright.async_api import BrowserContext, Page, async_playwright
 
-from auth_manager import AuthReport, CookieAuthManager
+from auth_manager import AuthManager, AuthReport
 from backfill_engine import (
     BackfillEngine,
     TaskPageInitializationError,
@@ -78,6 +78,8 @@ class DailyRuntimeConfig:
     daily_tasks: List[Dict[str, Any]]
     platforms: List[Dict[str, Any]]
     gc_page_url_markers: List[str]
+    worker_heartbeat_silence_seconds: int
+    business_heartbeat_silence_seconds: int
     keep_browser_after_run: bool
 
 
@@ -107,6 +109,19 @@ def _load_int_env(name: str, minimum: int) -> int:
         raise ValueError(f".env 中的 {name} 必须是整数") from error
     if value < minimum:
         raise ValueError(f".env 中的 {name} 不能小于 {minimum}")
+    return value
+
+
+def _load_positive_int_env(name: str, default: int) -> int:
+    raw_value = (os.getenv(name) or "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as error:
+        raise ValueError(f".env 中的 {name} 必须是整数") from error
+    if value <= 0:
+        raise ValueError(f".env 中的 {name} 必须大于 0")
     return value
 
 
@@ -209,6 +224,20 @@ def load_daily_runtime_config(
     if not task_url:
         raise ValueError("TASK_URL 不能为空")
 
+    worker_silence = _load_positive_int_env(
+        "WORKER_HEARTBEAT_SILENCE_SECONDS",
+        120,
+    )
+    business_silence = _load_positive_int_env(
+        "BUSINESS_HEARTBEAT_SILENCE_SECONDS",
+        180,
+    )
+    if business_silence <= worker_silence:
+        raise ValueError(
+            "BUSINESS_HEARTBEAT_SILENCE_SECONDS 必须大于 "
+            "WORKER_HEARTBEAT_SILENCE_SECONDS"
+        )
+
     return DailyRuntimeConfig(
         bite_id=_require_env("BITE_ID"),
         worker_count=_load_int_env("WORKER_COUNT", 1),
@@ -221,6 +250,8 @@ def load_daily_runtime_config(
         daily_tasks=daily_tasks_raw,
         platforms=platforms_raw,
         gc_page_url_markers=[marker.strip() for marker in markers_raw],
+        worker_heartbeat_silence_seconds=worker_silence,
+        business_heartbeat_silence_seconds=business_silence,
         keep_browser_after_run=_load_bool_env("KEEP_BROWSER_AFTER_RUN", True),
     )
 
@@ -239,10 +270,18 @@ class DailyEngine(BackfillEngine):
         cookie_dir: Optional[Path] = None,
         task_url: str = DEFAULT_TASK_URL,
         keep_browser_after_run: bool = True,
+        worker_heartbeat_silence_seconds: int = 120,
+        business_heartbeat_silence_seconds: int = 180,
     ):
         super().__init__(
             bite_id,
             gc_page_url_markers=list(gc_page_url_markers),
+            worker_heartbeat_silence_seconds=(
+                worker_heartbeat_silence_seconds
+            ),
+            business_heartbeat_silence_seconds=(
+                business_heartbeat_silence_seconds
+            ),
         )
         if worker_count <= 0:
             raise ValueError("worker_count 必须大于 0")
@@ -263,7 +302,7 @@ class DailyEngine(BackfillEngine):
         self.task_url = task_url
         self.keep_browser_after_run = keep_browser_after_run
         self.browser_manager = BitBrowserManager(bite_id, self.bt_url)
-        self.auth_manager = CookieAuthManager(bite_id, self.cookie_dir)
+        self.auth_manager = AuthManager(bite_id, self.cookie_dir)
 
     def build_daily_tasks(
         self,
@@ -846,6 +885,12 @@ if __name__ == "__main__":
         cookie_dir=config.cookie_dir,
         task_url=config.task_url,
         keep_browser_after_run=config.keep_browser_after_run,
+        worker_heartbeat_silence_seconds=(
+            config.worker_heartbeat_silence_seconds
+        ),
+        business_heartbeat_silence_seconds=(
+            config.business_heartbeat_silence_seconds
+        ),
     )
     success = asyncio.run(
         engine.run_daily(

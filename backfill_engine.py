@@ -38,6 +38,7 @@ from browser_connector import (
     normalize_cdp_address,
 )
 from github_info import GIT_SHA
+from slider_motion_tools import solve_closed_shadow_slider
 from task_ledger import TaskLedger
 
 
@@ -188,7 +189,7 @@ class BackfillEngine:
             marker.strip() for marker in gc_page_url_markers
         )
         # 红色错误提示短暂保留后自动关闭，避免堆积遮挡后续业务按钮。
-        self.error_toast_grace_seconds = 8
+        self.error_toast_grace_seconds = 2
         # 一级【启动检测】按钮可能正等待错误提示完成退出动画，适当延长可点击性检查。
         self.primary_actionability_timeout_ms = 15000
         # 本应快速完成的页面状态查询，由asyncio从Playwright外层施加硬超时。
@@ -304,6 +305,40 @@ class BackfillEngine:
                 url_suffix = (
                     current_url[-25:] if len(current_url) > 25 else current_url
                 )
+                if self._is_slider_page_url(current_url):
+                    logger.info(
+                        f"[Slider] 发现滑块验证网页，开始处理: {url_suffix}"
+                    )
+                    try:
+                        solved = await self._solve_slider_page(page)
+                    except Exception as error:
+                        logger.exception(
+                            f"[Slider] 滑块验证处理异常，仍将交给 GC 监控: "
+                            f"{error}"
+                        )
+                        solved = False
+
+                    if solved:
+                        logger.info(f"[Slider] 滑块验证处理完成: {url_suffix}")
+                    else:
+                        logger.warning(
+                            f"[Slider] 滑块验证未通过，仍将交给 GC 监控: "
+                            f"{url_suffix}"
+                        )
+                    if page.is_closed():
+                        return
+
+                    # 滑块通过后页面内容会变化，但 URL 仍可能保留原前缀；
+                    # 无论验证结果如何，都按业务执行页部署心跳和静默回收。
+                    managed_page = True
+                    logger.info(
+                        f"[GC Daemon] 滑块验证网页开始后台监控: {url_suffix}"
+                    )
+                    monitor_task = asyncio.create_task(
+                        self._monitor_and_gc_page(page)
+                    )
+                    self._track_gc_background_task(monitor_task)
+                    return
                 if self._is_gc_managed_page_url(current_url):
                     # 确认为受 GC 管理的业务执行页，部署监控协程。
                     managed_page = True
@@ -360,6 +395,19 @@ class BackfillEngine:
             marker.lower() in normalized_url
             for marker in self.gc_page_url_markers
         )
+
+    def _is_slider_page_url(self, url: str) -> bool:
+        """判断 URL 是否属于需要自动处理的独立滑块页面。"""
+        SLIDER_PAGE_URL_MARKERS = ("mobile.yangkeduo.com",)
+        normalized_url = url.lower()
+        return any(
+            marker.lower() in normalized_url
+            for marker in SLIDER_PAGE_URL_MARKERS
+        )
+
+    async def _solve_slider_page(self, page: Page) -> bool:
+        """处理独立滑块页，并根据滑块控件状态判断是否通过。"""
+        return await solve_closed_shadow_slider(page)
 
     def _remaining_gc_pages(self, context: BrowserContext) -> List[Page]:
         """返回 Context 中尚未关闭、且符合 GC URL 规则的业务执行页面。"""
@@ -834,8 +882,60 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} {layer_name}已关闭。")
         return True
 
+    async def _close_message_box_if_visible(
+        self,
+        page: Page,
+        worker_id: str,
+    ) -> bool:
+        """关闭遮挡任务弹窗的最上层可见 ElementUI MessageBox。"""
+        message_box = page.locator("div.el-message-box:visible").last
+        if not await self._locator_is_visible(
+            message_box,
+            worker_id,
+            "提示弹窗",
+        ):
+            return False
+
+        close_button = message_box.locator("i.el-icon-close")
+        close_count = await self._await_page_operation(
+            close_button.count(),
+            worker_id,
+            "查询提示弹窗关闭按钮数量",
+        )
+        if close_count != 1:
+            raise RuntimeError(
+                f"Worker-{worker_id} 提示弹窗内部预期 1 个关闭按钮，"
+                f"实际找到 {close_count} 个"
+            )
+
+        logger.info(f"Worker-{worker_id} 正在关闭页面提示弹窗...")
+        await self._await_page_operation(
+            close_button.evaluate("node => node.click()"),
+            worker_id,
+            "精准点击提示弹窗关闭按钮",
+        )
+
+        try:
+            await message_box.wait_for(state="hidden", timeout=5000)
+        except PlaywrightTimeoutError as error:
+            await self._assert_page_healthy(page, worker_id)
+            if not await self._locator_is_visible(
+                message_box,
+                worker_id,
+                "提示弹窗",
+            ):
+                logger.info(f"Worker-{worker_id} 提示弹窗已在超时边界完成关闭。")
+                return True
+            raise WorkerUnresponsiveError(
+                f"Worker-{worker_id} 提示弹窗关闭指令已发出，但弹窗仍未隐藏"
+            ) from error
+
+        logger.info(f"Worker-{worker_id} 页面提示弹窗已关闭。")
+        return True
+
     async def _restore_primary_state(self, page: Page, worker_id: str):
         """依次关闭三级、二级弹窗，恢复到可操作的一级弹窗。"""
+        await self._close_message_box_if_visible(page, worker_id)
         await self._close_layer_if_visible(
             self._progress_dialog(page), "三级进度弹窗", worker_id
         )
@@ -862,6 +962,7 @@ class BackfillEngine:
 
     async def _close_all_task_layers(self, page: Page, worker_id: str):
         """Worker 初始化时按层级关闭三级、二级和一级弹窗。"""
+        await self._close_message_box_if_visible(page, worker_id)
         await self._close_layer_if_visible(
             self._progress_dialog(page), "三级进度弹窗", worker_id
         )

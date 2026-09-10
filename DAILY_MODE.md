@@ -31,11 +31,19 @@ Daily-mode 使用以下字段：
 | `COOKIE_DIR` | pkl Cookie 文件目录 |
 | `TASK_URL` | datatoolcenter 工作台地址；省略时使用源码默认值 |
 | `DAILY_TASKS` | 每日任务卡片 JSON 数组；`card_id` 表示数仓任务卡片 ID，单项可用 `target_date_offset_days` 设置独立偏移，或用 `date` 指定日期 |
-| `PLATFORMS` | 本客户所有可能触发业务执行页的平台 JSON 数组；程序会按顺序重建每个平台的 pkl Cookie 登录态 |
+| `PLATFORMS` | 本客户所有可能触发业务执行页的平台 JSON 数组；程序会按顺序调用各项 `auth_mode` 对应的登录流程 |
 | `CUSTOMER_NAME` | 仅供 `daily_notify_agent.py` 在飞书中显示客户名称；daily_engine 不读取 |
 | `REPORT_READY_TIME` | 由 Dailyfill Launcher 配置统一生成；仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总，daily_engine 不读取 |
 
 JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`。建议将 `.env` 保存为 UTF-8。
+
+天猫超市后台当前需要在 Launcher 生成 `.env` 后，人工把对应平台配置为：
+
+```dotenv
+PLATFORMS='[{"name":"天猫超市后台","home_url":"https://web.txcs.tmall.com/pages/chaoshi/merchandise_sc_item_list_rex?fromSC=1","auth_mode":"tmall_supermarket_active_login","auth_params":{"username":"实际账号","password":"实际密码"}}]'
+```
+
+如果同一客户还有其他平台，应将这个对象追加到原有 `PLATFORMS` 数组，而不是覆盖其他平台。再次通过 Launcher 保存该客户时，当前人工添加的 `auth_params` 可能被平台模板覆盖，需要重新核对。
 
 任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
 `target_date_offset_days`、全局 `TARGET_DATE_OFFSET_DAYS`。因此旧 `.env`
@@ -50,8 +58,10 @@ JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`�
 - 账本每次尝试除任务 ID、卡片 ID、日期、次数和成功状态外，还记录卡片标题 `task_name`、后端最终检测到的 `missing_count` 与具体缺失类目 `detail_missing_categories`。类目字段为 `null` 表示未完成可信检测，为空列表表示检测完成且没有缺失类目，非空列表按页面顺序保存全部 `loseItem` 类目。
 - 结束汇总会记录浏览器启动、登录预检、Worker 初始化、任务池执行和本次总运行时间；流程提前失败时也至少记录已经完成的阶段和总耗时。
 - 全部任务成功时，`KEEP_BROWSER_AFTER_RUN=true` 保留浏览器，设为 `false` 则自动关闭；登录失败、初始化失败或存在最终失败任务时始终保留现场供人工检查。
-- 登录态重建预检开始时会清理一次浏览器中的旧 Cookie，再按 `PLATFORMS` 逐个平台注入对应 pkl Cookie 并验证。
-- `context.clear_cookies()` 只在预检开始时运行一次；不能在每个平台注入前运行，否则后一个平台会清掉前一个平台的 Cookie。
+- `auth_manager.py` 负责预检顺序、共享登录环境和结果汇总；`login_flows.py` 保存各 `auth_mode` 的完整页面操作。
+- 登录预检不再全局清空 `BrowserContext` Cookie；`pkl_cookie` 流程先完整加载并格式化 pkl，再只清理其中涉及的精确 domain，随后注入并验证。
+- 同一轮预检的所有流程共用一个 `LoginRuntime`；已经清理过的 domain 会被记录，后续平台遇到相同 domain 时只注入自己的 Cookie，不再重复清理。
+- 天猫超市后台使用 `tmall_supermarket_active_login`：流程从该平台的 `auth_params.username` 和 `auth_params.password` 读取帐密，在登录 iframe 内填写后依次点击“登录”和“进入商家”，最后以 `home_url` 的域名与路径确认进入目标业务页。帐密以明文保存在部署环境的 `.env` 中，不要写入 Launcher 配置或提交到 Git。
 - 登录态重建全部失败时不会创建任务池；失败平台页面会保留供人工登录。
 - `daily_run_status.json` 在任务配置校验完成后先以 `ledger_reset=false` 创建，登录预检后写入平台结果，Worker 稳定且账本重置成功后改为 `true`，最外层退出时将阶段改为 `finished`。新进程启动后拥有状态文件，旧进程不能再覆盖它。
 - 任务失败且未达到 `MAX_ATTEMPTS` 时，会立即以 `attempt + 1` 放回共享队列尾部，不再等待其他任务全部结束后进行总体重试。

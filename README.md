@@ -5,7 +5,7 @@
 | 模式 | 入口 | 用途 |
 | --- | --- | --- |
 | 历史补采 | `backfill_engine.py` | 通过 `.env` 选择 BitBrowser 或外部 Chromium CDP，将日期范围切分为区块并由多个既有 Worker 动态补采。 |
-| 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按 pkl Cookie 重建业务平台登录态、创建 Worker，并让失败的单日任务立即回队重试。 |
+| 日常采集 | `daily_engine.py` | 重启指定 Bit 浏览器、按平台配置执行登录预检、创建 Worker，并让失败的单日任务立即回队重试。 |
 
 `daily_notify_agent.py` 是日常采集的旁路巡检器：它读取各客户目录中的 `.env`、`daily_run_status.json`、`daily_results.jsonl` 和 `daily_run.log`，定时发送一条可展开客户详情的本机飞书汇总卡片，不参与任何浏览器操作。
 
@@ -24,7 +24,8 @@ backfill/
   browser_connector.py     # BitBrowser / 外部 Chromium CDP 连接器
   daily_engine.py          # 日常采集入口
   dailyfill_launcher.py    # Dailyfill 客户配置和实例启动 GUI
-  auth_manager.py          # pkl Cookie 登录态重建预检
+  auth_manager.py          # 登录预检编排与 AuthReport 汇总
+  login_flows.py           # pkl Cookie、1688 等具体登录流程
   browser_manager.py       # Bit 浏览器启动、关闭与 CDP 地址获取
   task_ledger.py           # JSONL 任务账本与重试结果汇总
   daily_run_status.py      # Daily 单次运行状态与跨进程归属保护

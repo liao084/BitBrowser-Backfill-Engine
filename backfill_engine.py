@@ -98,6 +98,13 @@ class CdpSessionResult:
     worker_count: int = 0
     queue_completed: bool = False
 
+
+@dataclass
+class TaskExecutionState:
+    """把 execute_task 内部的提交状态显式交给外层 Worker。"""
+
+    submitted: bool = False
+
 # 配置全局日志（同时输出到控制台和本地文件）
 log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger("BackfillEngine")
@@ -144,6 +151,7 @@ class BackfillEngine:
         max_attempts: int = 5,
         cdp_session_lifetime_hours: float = 3.5,
         max_cdp_rebuilds: int = 5,
+        inter_task_cooldown_seconds: int = 1800,
     ):
         self.bt_url = 'http://127.0.0.1:54345'
         self.bite_id = bite_id
@@ -169,6 +177,8 @@ class BackfillEngine:
             raise ValueError("cdp_session_lifetime_hours 必须大于 0")
         if max_cdp_rebuilds < 0:
             raise ValueError("max_cdp_rebuilds 不能小于 0")
+        if inter_task_cooldown_seconds <= 0:
+            raise ValueError("inter_task_cooldown_seconds 必须大于 0")
         # 心跳静默判定机制超时时间（秒）
         self.silent_timeout_seconds = worker_heartbeat_silence_seconds
         # Context 级业务执行页 GC 必须比 Worker 保留更长的观察窗口。
@@ -202,6 +212,9 @@ class BackfillEngine:
         self.cdp_session_lifetime_seconds = cdp_session_lifetime_hours * 3600
         self.cdp_session_lifetime_hours = cdp_session_lifetime_hours
         self.max_cdp_rebuilds = max_cdp_rebuilds
+        self.inter_task_cooldown_seconds = inter_task_cooldown_seconds
+        # Engine 实例跨 CDP 会话存在，因此冷却截止时间不会随 Worker 重建丢失。
+        self.next_task_allowed_at = 0.0
         self._error_toast_close_tasks: set[asyncio.Task] = set()
         self._gc_background_tasks: set[asyncio.Task] = set()
 
@@ -1375,8 +1388,11 @@ class BackfillEngine:
         page: Page,
         task: Dict[str, Any],
         list_index: int,
+        execution_state: Optional[TaskExecutionState] = None,
     ) -> bool:
         """执行一个独立日期区块；普通失败返回 False，致命页面异常向外抛出。"""
+        if execution_state is None:
+            execution_state = TaskExecutionState()
         task_card_id = task["card"]
         # 每次 attempt 都必须重新产生终态结果，不能继承上一次失败详情。
         task["missing_count"] = None
@@ -1544,6 +1560,7 @@ class BackfillEngine:
                     return False
 
                 task_submitted = True
+                execution_state.submitted = True
                 
                 # 4. 完成弹窗触发自动检测核验；若未捕获，则在心跳静默后执行后端复检。
                 missing_count = await self.wait_for_completion_or_heartbeat(
@@ -1618,6 +1635,47 @@ class BackfillEngine:
         logger.info(f"Worker-{worker_id} 任务 {task['task_id']} 无缺失数据，账本记为成功。")
         return True
 
+    def _start_inter_task_cooldown(self, task: Dict[str, Any]) -> None:
+        """从已提交任务结束时开始计算下一任务的最早领取时间。"""
+        self.next_task_allowed_at = (
+            time.monotonic() + self.inter_task_cooldown_seconds
+        )
+        logger.info(
+            f"任务 {task['task_id']} 已实际提交采集；"
+            f"下一任务将在至少 {self.inter_task_cooldown_seconds} 秒后领取。"
+        )
+
+    async def _wait_for_inter_task_cooldown(
+        self,
+        session_control: CdpSessionControl,
+    ) -> bool:
+        """等待 Engine 级冷却截止；会话停止时退出并由新会话续等。"""
+        remaining = self.next_task_allowed_at - time.monotonic()
+        if remaining <= 0:
+            return True
+
+        logger.info(
+            f"精选联盟任务冷却中，剩余约 {math.ceil(remaining)} 秒。"
+        )
+        try:
+            await asyncio.wait_for(
+                session_control.stop_event.wait(),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            logger.info("精选联盟任务冷却结束，可以领取下一任务。")
+            return True
+
+        remaining = max(0.0, self.next_task_allowed_at - time.monotonic())
+        if session_control.end_reason == "tasks_completed":
+            logger.info("任务队列已经完成，无需等待最后一次任务的剩余冷却。")
+            return False
+        logger.info(
+            f"CDP 会话在任务冷却期间停止；剩余约 {math.ceil(remaining)} 秒。"
+            "冷却截止时间仍由 Engine 保留，如有下一会话将继续等待。"
+        )
+        return False
+
     async def worker(
         self,
         page: Page,
@@ -1634,6 +1692,10 @@ class BackfillEngine:
         consecutive_initialization_failures = 0
 
         while True:
+            if not await self._wait_for_inter_task_cooldown(session_control):
+                logger.info(f"Worker-{worker_id} 已在任务冷却期间停止领取。")
+                return True
+
             task = await self._get_task_for_session(
                 task_queue,
                 session_control,
@@ -1643,8 +1705,14 @@ class BackfillEngine:
                 return True
 
             worker_fatal = False
+            execution_state = TaskExecutionState()
             try:
-                success = await self.execute_task(page, task, list_index)
+                success = await self.execute_task(
+                    page,
+                    task,
+                    list_index,
+                    execution_state=execution_state,
+                )
                 # execute_task 能进入业务流程（无论业务最终成功与否），说明页面初始化正常。
                 consecutive_initialization_failures = 0
             except TaskPageInitializationError as error:
@@ -1686,6 +1754,9 @@ class BackfillEngine:
                             f"Worker-{worker_id} 执行任务时发生未分类异常，"
                             f"当前任务记为失败: {error}"
                         )
+
+            if execution_state.submitted:
+                self._start_inter_task_cooldown(task)
 
             try:
                 await ledger.record(task, success)
@@ -1893,16 +1964,22 @@ class BackfillEngine:
             for existing_page in context.pages:
                 self._on_new_page(existing_page)
 
-            worker_pages = [
+            detected_worker_pages = [
                 page for page in context.pages if "datatoolcenter" in page.url
             ]
-            if not worker_pages:
+            if not detected_worker_pages:
                 logger.error(
                     "当前 CDP 会话未找到 datatoolcenter Worker 页面，停止运行。"
                 )
                 return CdpSessionResult("no_workers", True, 0)
 
-            logger.info(f"检测到 {len(worker_pages)} 个符合条件的 Worker 标签页。")
+            if len(detected_worker_pages) > 1:
+                logger.warning(
+                    f"检测到 {len(detected_worker_pages)} 个符合条件的 Worker "
+                    "标签页；QTMM 专用模式仅使用第一个，其余页面保持打开但不参与调度。"
+                )
+            worker_pages = detected_worker_pages[:1]
+            logger.info("QTMM 专用模式已启用唯一 Worker 调度。")
             session_control = CdpSessionControl(
                 deadline=time.monotonic() + self.cdp_session_lifetime_seconds
             )
@@ -2009,6 +2086,7 @@ class BackfillEngine:
             f"Worker心跳静默阈值={self.silent_timeout_seconds}秒，"
             f"业务页心跳静默阈值={self.gc_silent_timeout_seconds}秒，"
             f"任务最多尝试={self.max_attempts}次，"
+            f"任务间冷却={self.inter_task_cooldown_seconds}秒，"
             f"CDP会话软生命周期={self.cdp_session_lifetime_hours:g}小时，"
             f"最多重建={self.max_cdp_rebuilds}次"
         )
@@ -2173,6 +2251,7 @@ class BackfillRuntimeConfig:
     max_attempts: int
     cdp_session_lifetime_hours: float
     max_cdp_rebuilds: int
+    inter_task_cooldown_seconds: int
 
 
 def _load_positive_int_env(name: str, default: int) -> int:
@@ -2291,6 +2370,10 @@ def load_runtime_config() -> BackfillRuntimeConfig:
             "BACKFILL_MAX_CDP_REBUILDS",
             5,
         ),
+        inter_task_cooldown_seconds=_load_positive_int_env(
+            "BACKFILL_INTER_TASK_COOLDOWN_SECONDS",
+            1800,
+        ),
     )
 
 
@@ -2325,5 +2408,6 @@ if __name__ == "__main__":
         max_attempts=config.max_attempts,
         cdp_session_lifetime_hours=config.cdp_session_lifetime_hours,
         max_cdp_rebuilds=config.max_cdp_rebuilds,
+        inter_task_cooldown_seconds=config.inter_task_cooldown_seconds,
     )
     asyncio.run(engine.run(config.tasks_config))

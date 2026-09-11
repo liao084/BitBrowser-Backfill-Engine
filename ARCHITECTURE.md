@@ -47,6 +47,7 @@ mindmap
     后台守护
       Worker 红色提示回收
       Context 业务执行页 GC
+      拼多多 closed Shadow DOM 滑块
       页面健康探测
     可靠性
       JSONL 任务账本
@@ -87,6 +88,7 @@ flowchart LR
     subgraph Business["实际业务执行页面"]
         JD1["业务执行页面 A"]
         JDN["业务执行页面 N"]
+        Slider["拼多多独立滑块页<br/>CDP 穿透 closed Shadow DOM"]
         GC["Context 级业务执行页 GC<br/>独立静默阈值 + 退出收尾"]
     end
 
@@ -114,6 +116,7 @@ flowchart LR
     W1 --> JD1
     WN --> JDN
     PageEvent --> GC
+    PageEvent --> Slider --> GC
     GC -.监控并回收.-> JD1
     GC -.监控并回收.-> JDN
     Engine --> Log
@@ -137,7 +140,7 @@ flowchart TD
     D --> E["5. worker<br/>持续领取、即时回队与熔断"]
     E --> F["6. execute_task<br/>阅读单任务业务主流程"]
     F --> G["7. wait_for_completion_or_heartbeat<br/>理解完成信号、心跳与静默兜底"]
-    G --> H["8. _monitor_and_gc_page<br/>理解业务执行页旁路 GC"]
+    G --> H["8. _delayed_check + _monitor_and_gc_page<br/>理解滑块处理与业务页旁路 GC"]
     H --> I["9. _monitor_worker_error_toasts<br/>理解红色提示回收"]
     I --> J["10. TaskLedger<br/>理解重试与最终汇总"]
 ```
@@ -149,7 +152,7 @@ flowchart TD
 | Worker | `worker()` | 一个页面如何持续领取任务，何时熔断？ |
 | 业务 | `execute_task()` | 一个日期区块如何完成检测与补齐？ |
 | 状态判断 | `wait_for_completion_or_heartbeat()` | 完成弹窗如何触发自动检测结果读取，静默时如何主动复检？ |
-| 页面 GC | `_monitor_and_gc_page()` | 业务执行页为什么独立于 Worker，何时关闭？ |
+| 新页面与 GC | `_delayed_check()`、`_solve_slider_page()`、`_monitor_and_gc_page()` | 普通业务页与拼多多滑块页如何识别、处理和回收？ |
 | UI 守护 | `_monitor_worker_error_toasts()` | 红色提示如何事件驱动回收并避免重复处理？ |
 | 持久化 | `TaskLedger` | 每个真实 attempt 如何落账并形成最终汇总？ |
 
@@ -282,8 +285,8 @@ stateDiagram-v2
     Initializing --> Executing: 页面初始化成功
     Executing --> Healthy: 业务成功或普通任务失败<br/>初始化失败计数归零
     Initializing --> InitFailed: TaskPageInitializationError
-    InitFailed --> Claiming: 连续失败少于 3 次
-    InitFailed --> Fused: 连续失败达到 3 次
+    InitFailed --> Claiming: 连续失败少于 5 次
+    InitFailed --> Fused: 连续失败达到 5 次
     Initializing --> Fused: 页面崩溃 / 关闭 / 断连 / 无响应
     Executing --> Fused: WorkerUnresponsiveError 或致命页面异常
     Finished --> [*]: 返回 True
@@ -294,7 +297,7 @@ stateDiagram-v2
 
 - **业务任务失败**：任务写入 `success=false`，Worker 可以继续工作；
 - **执行者失败**：Worker 熔断，停止领取后续任务；
-- **普通初始化失败**：允许最多连续出现 3 次，给页面短暂恢复机会；
+- **普通初始化失败**：允许最多连续出现 5 次，给页面短暂恢复机会；
 - **页面无响应或断连**：立即熔断，不消耗更多共享任务。
 
 ## 八、单个日期任务的完整业务流程
@@ -434,14 +437,19 @@ sequenceDiagram
     autonumber
     participant Ctx as BrowserContext
     participant Detect as _delayed_check
-    participant JD as 业务执行页面
+    participant JD as 新建业务页面
+    participant Slider as 滑块处理器
     participant GC as _monitor_and_gc_page
     participant Toast as 同步成功节点
 
     Ctx->>Detect: page 事件
     loop 最多检查 10 秒
         Detect->>JD: 读取 URL
-        alt URL 命中 GC_PAGE_URL_MARKERS
+        alt URL 命中 mobile.yangkeduo.com
+            Detect->>Slider: CDP 读取 closed Shadow DOM 并最多拖动 5 次
+            Slider-->>Detect: 返回通过或失败
+            Detect->>GC: 无论结果都 create_task 独立监控
+        else URL 命中 GC_PAGE_URL_MARKERS
             Detect->>GC: create_task 独立监控
         else 尚未跳转到目标 URL
             Detect->>Detect: sleep 1 秒后重查
@@ -464,17 +472,17 @@ sequenceDiagram
     end
 ```
 
-GC 不维护业务执行页面与某个 Worker 的固定映射。原因是一个任务队列中的商智页面可能自动关闭并重新创建；Context 级捕获可以覆盖运行期间出现的全部业务页面生命周期，启动时已经存在的页面也会被扫描。
+GC 不维护业务执行页面与某个 Worker 的固定映射。原因是一个任务队列中的业务执行页可能自动关闭并重新创建；Context 级捕获可以覆盖运行期间出现的全部业务页面生命周期，启动时已经存在的页面也会被扫描。
 
 Worker 与业务页使用两套可独立配置的静默阈值，业务页阈值必须更长。默认 120/180 秒时错开 60 秒：
 
 - Worker 先判断数仓任务完成或卡死，并清理数仓弹窗；
-- 商智 GC 后处理仍未自行消失的执行页面；
+- 业务执行页 GC 后处理仍未自行消失的执行页面；
 - 两套机制不需要互相持有引用。
 
 ### URL 识别规则与多平台扩展
 
-当前纳入 GC 的页面由 `.env` 中的统一 URL 标记决定：
+普通业务页是否纳入 GC，由 `.env` 中的统一 URL 标记决定：
 
 ```dotenv
 GC_PAGE_URL_MARKERS=["ppzh.jd.com"]
@@ -483,6 +491,14 @@ GC_PAGE_URL_MARKERS=["ppzh.jd.com"]
 程序启动后，该 JSON 数组会转换为 `BackfillEngine.gc_page_url_markers` 元组。`_delayed_check()` 的实时页面捕获和程序结束时的残留页扫描都调用 `_is_gc_managed_page_url()`，因此不会出现两个地方分别维护多组 `or` 条件。未来增加抖音时，可以把对应域名标记追加到 `.env` 数组中。
 
 但只增加 URL 的前提是该平台使用相同的心跳协议，即同样通过 `.el-message__content:has-text('同步成功')` 产生并隐藏成功节点。如果抖音的提示文字、DOM 或任务生命周期不同，就应进一步把配置扩展为“URL 标记 + 心跳选择器 + 静默时间”的平台策略，而不能只增加 URL。
+
+### 拼多多独立滑块页
+
+`mobile.yangkeduo.com` 是当前代码内置的特殊 URL 标记，不依赖 `GC_PAGE_URL_MARKERS`。页面的滑块节点位于 closed Shadow DOM，普通 Locator 无法进入，因此 `slider_motion_tools.py` 通过页面级 CDP Session 获取 `pierce=true` 的完整 DOM 树，读取背景图、缺口图、渲染尺寸和按钮中心点。
+
+ddddocr 的 `slide_match()` 返回缺口中心坐标；脚本将原图像素换算为页面 CSS 像素，再生成 Minimum Jerk 进度的随机贝塞尔轨迹并使用 Playwright 鼠标拖动。单页最多重新读取图片并尝试 5 次，以滑块按钮连续 3 次从 CDP DOM 树中消失作为成功条件，而不是依赖 URL 变化。
+
+`_delayed_check()` 无论滑块最终通过、失败还是处理抛出异常，只要页面仍存在，就会给它部署 `_monitor_and_gc_page()`。该协程与延迟识别任务都由 `_track_gc_background_task()` 持有。当前 CDP 会话结束时，管理器先对它们请求取消，再通过 `asyncio.gather(..., return_exceptions=True)` 等待所有任务完成取消收尾，并统一回收取消或异常结果。最终收尾与 CDP 重建预清理的主动扫描仍只匹配 `GC_PAGE_URL_MARKERS`；滑块页如果也需要被这两次扫描兜底，应同时把相应 URL 标记加入部署环境配置。
 
 ### 程序退出前的 GC 收尾
 
@@ -499,7 +515,7 @@ GC_PAGE_URL_MARKERS=["ppzh.jd.com"]
 最终 GC 收尾只属于整个 Backfill 运行的结束阶段。单次 CDP 会话因软生命周期或 Worker 全部退出而准备重建时，不继承旧 GC 计时，也不等待最终收尾宽限：
 
 1. 先停止领取新任务，并等待所有在途 Worker attempt 完成记账、按需回队及 `task_done()`；
-2. 取消并 gather 旧会话的业务页 GC 协程，避免旧 Page 代理继续操作页面；
+2. 逐个调用 `cancel()` 请求取消旧会话的业务执行页 GC 任务，再用 `asyncio.gather(..., return_exceptions=True)` 等待它们真正结束并回收取消或异常结果，避免旧 Page 代理继续操作页面；
 3. 退出旧 Playwright/CDP 会话并校验缓存浏览器身份；
 4. 重连成功后，在新 Worker 领取任务前扫描并关闭符合 `GC_PAGE_URL_MARKERS` 的残留业务页，但保留 `datatoolcenter` Worker 页；
 5. 单个页面关闭失败只记录日志，随后继续启动 Worker，不为这项清理增加额外状态机。
@@ -515,7 +531,7 @@ flowchart TD
     Found --> Mark["写入 data-rpa-error-close-scheduled 标记"]
     Mark --> Read["读取错误内容"]
     Read --> Task["create_task 延迟关闭任务"]
-    Task --> Grace["保留 30 秒供人工观察"]
+    Task --> Grace["保留 2 秒供日志与页面观察"]
     Grace --> Alive{"页面和提示仍可见?"}
     Alive -->|"否"| Dispose["释放句柄"]
     Alive -->|"是"| Close["查找该提示内部专属叉号"]
@@ -532,16 +548,16 @@ flowchart TD
 
 该机制是事件驱动的：没有红色提示时，协程阻塞在浏览器事件等待上，不会每秒轮询 DOM。
 
-它与商智 GC 的共同思想是“捕获具体对象后管理它的生命周期”，但回收粒度不同：
+它与业务执行页 GC 的共同思想是“捕获具体对象后管理它的生命周期”，但回收粒度不同：
 
 - 红色提示回收器处理 Worker 页面内的 UI 节点；
-- 商智 GC 处理整个商智标签页。
+- 业务执行页 GC 处理整个业务执行标签页。
 
 ## 十三、短页面操作的硬超时与健康探测
 
 ```mermaid
 flowchart LR
-    Op["本应快速返回的页面操作<br/>count / is_visible / evaluate"] --> WaitFor["asyncio.wait_for<br/>默认 10 秒"]
+    Op["本应快速返回的页面操作<br/>count / is_visible / evaluate"] --> WaitFor["asyncio.wait_for<br/>默认 20 秒"]
     WaitFor --> Fast{"按时返回?"}
     Fast -->|"是"| Value["返回查询结果"]
     Fast -->|"否"| Error["WorkerUnresponsiveError"]
@@ -557,7 +573,7 @@ flowchart LR
 - `interactive`：DOM 已构建；
 - `complete`：页面及资源完成加载。
 
-这里的主要目的不是要求页面必须达到 `complete`，而是验证浏览器渲染进程能否在 10 秒内执行一次 JavaScript 并返回合法状态。只要 JS 往返及时完成，就证明页面事件循环仍有响应。
+这里的主要目的不是要求页面必须达到 `complete`，而是验证浏览器渲染进程能否在 20 秒内执行一次 JavaScript 并返回合法状态。只要 JS 往返及时完成，就证明页面事件循环仍有响应。
 
 硬超时只包裹理论上应快速完成的页面探针，不包裹完整补采任务，因此不会因为任务实际运行数小时而误杀 Worker。
 
@@ -608,7 +624,7 @@ flowchart TD
 
 ### 1. 配置与入口模块
 
-`load_runtime_config()` 从源码或 exe 同目录的 `.env` 读取浏览器类型、连接参数、任务列表、GC URL 标记和历史模式心跳阈值。列表使用 JSON 表达并经过类型校验；入口随后创建对应连接器和 `BackfillEngine`，再通过 `asyncio.run()` 启动异步总控流程。真实 `.env` 只保留在本地，仓库仅提交 `.env.example`。
+`load_runtime_config()` 从源码或 exe 同目录的 `.env` 读取浏览器类型、连接参数、任务列表、GC URL 标记和历史模式心跳阈值。列表使用 JSON 表达并经过类型校验；入口随后创建对应连接器和 `BackfillEngine`，再通过 `asyncio.run()` 启动异步总控流程。真实 `.env` 只保留在本地，仓库提交可直接复制的 `backfill.env.example` 脱敏模板。
 
 ### 2. 浏览器连接模块
 
@@ -624,7 +640,7 @@ flowchart TD
 
 ### 5. Worker 执行与熔断模块
 
-`worker()` 负责循环领取任务、调用 `execute_task()`、把结果写入账本，并维护连续初始化失败次数。普通业务失败不会淘汰 Worker；连续 3 次初始化失败、页面无响应、崩溃或断连会触发熔断。
+`worker()` 负责循环领取任务、调用 `execute_task()`、把结果写入账本，并维护连续初始化失败次数。普通业务失败不会淘汰 Worker；连续 5 次初始化失败、页面无响应、崩溃或断连会触发熔断。
 
 ### 6. 单任务业务模块
 
@@ -640,15 +656,15 @@ flowchart TD
 
 ### 9. 业务执行页面 GC 模块
 
-`_on_new_page()` 与 `_delayed_check()` 从 BrowserContext 层识别符合 URL 标记的业务执行页面，`_monitor_and_gc_page()` 独立监听每个页面的成功心跳。达到业务页静默阈值或单个心跳节点异常滞留时，GC 关闭该页面。CDP 重建成功后，`_close_remaining_gc_pages()` 在新 Worker 领取任务前清理残留页；整个 Backfill 完成时，`_cleanup_remaining_gc_pages()` 才按两个静默阈值之差再加 5 秒提供最终收尾宽限。历史模式默认 Worker/业务页为 120/180 秒。
+`_on_new_page()` 与 `_delayed_check()` 从 BrowserContext 层识别符合 URL 标记的业务执行页面，`_monitor_and_gc_page()` 独立监听每个页面的成功心跳。达到业务页静默阈值或单个心跳节点异常滞留时，GC 关闭该页面。`mobile.yangkeduo.com` 会先交给 `slider_motion_tools.py` 处理 closed Shadow DOM 滑块，无论结果如何都继续部署 GC。CDP 重建成功后，`_close_remaining_gc_pages()` 在新 Worker 领取任务前清理配置标记命中的残留页；整个 Backfill 完成时，`_cleanup_remaining_gc_pages()` 才按两个静默阈值之差再加 5 秒提供最终收尾宽限。Backfill 与 Daily 默认 Worker/业务页为 120/180 秒，均可通过 `.env` 调整。
 
 ### 10. 红色错误提示回收模块
 
-`_monitor_worker_error_toasts()` 事件等待每个 Worker 页面的红色提示，为具体节点添加防重复标记，并创建延迟关闭任务。提示保留 30 秒后关闭；常规点击被遮挡时，仅对专属叉号使用 `node.click()`。
+`_monitor_worker_error_toasts()` 事件等待每个 Worker 页面的红色提示，为具体节点添加防重复标记，并创建延迟关闭任务。提示保留 2 秒后关闭；常规点击被遮挡时，仅对专属叉号使用 `node.click()`。
 
 ### 11. 页面健康与硬超时模块
 
-`_await_page_operation()` 为本应快速完成的 DOM 查询增加 10 秒外层硬超时。`_assert_page_healthy()` 通过 `document.readyState` 执行一次 JavaScript 往返，用于确认超时页面的渲染事件循环是否还能响应。
+`_await_page_operation()` 为本应快速完成的 DOM 查询增加 20 秒外层硬超时。`_assert_page_healthy()` 通过 `document.readyState` 执行一次 JavaScript 往返，用于确认超时页面的渲染事件循环是否还能响应。
 
 ### 12. 任务账本与重试模块
 
@@ -659,18 +675,18 @@ flowchart TD
 1. 从 `.env` 读取并校验浏览器来源、连接参数、任务、GC URL 和心跳阈值；
 2. 使用 `BITE_ID` 启动比特浏览器，或使用 `CDP_ADDRESS` 检查外部 Chromium；
 3. 连接 BrowserContext，识别数仓 Worker 页面；
-4. 在 Context 层挂载业务执行页面 GC，并扫描已有页面；
+4. 在 Context 层挂载新页面观察器，扫描已有页面，并按 URL 分发滑块处理或业务页 GC；
 5. 把配置日期切分成唯一日期区块，并一次性装入顶层持久队列；
 6. 重置 JSONL 任务账本，为每个 Worker 启动红色提示监控器；
 7. 为当前 CDP 生命周期的多个 Worker 启动持续任务池；
 8. 每个 Worker 清理遗留弹窗，按任务卡片 ID 查询、校验并打开唯一结果，再注入当前区间日期；
 9. 检测缺失数据；无缺失则直接成功，有缺失则进入全店补齐；
 10. 提交后并发监听心跳和数据补齐完成；完成信号出现后读取自动检测缺失量并据此判定结果，未捕获时在静默后执行主动后端复检兜底；
-11. 业务执行页 GC 使用更长的独立静默阈值回收没有正常关闭的页面；
+11. 拼多多独立滑块页最多自动拖动 5 次；普通业务页和处理后的滑块页均由更长的独立静默阈值回收；
 12. 每次真实 attempt 结束后立即把结果追加到 JSONL，失败且未达上限则复制后放回队尾；
 13. 单 Page 关闭或崩溃只淘汰当前 Worker，全局 Driver/CDP 断连才停止整个会话；
 14. 到达软生命周期后禁止新领取，等待所有在途任务正常或异常收尾；
-15. 停止并 gather 当前会话全部 Worker 和 GC 后台任务；
+15. 请求取消当前会话全部 Worker 和 GC 后台任务，并等待它们完成取消收尾；
 16. 队列未完成时，只读校验缓存 `/json/version` 的浏览器身份；
 17. 身份一致且有额度时新建 Playwright/CDP 会话，在 Worker 启动前清理一次残留业务页，再继续消费同一队列；
 18. 整个队列完成后执行一次带宽限期的最终 GC 收尾；
@@ -706,19 +722,23 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 
 ### 登录态重建预检
 
-日常模式不能假定 Bit 浏览器中的登录态可靠可用。`auth_manager.py` 只负责共享环境准备、按配置顺序分发流程并生成 `AuthReport`；具体 URL、等待、定位器、点击和验证动作保存在 `login_flows.py`，第一版不提前抽象跨平台基类。
+日常模式不能假定 Bit 浏览器中的登录态可靠可用。`auth_manager.py` 只负责共享环境准备、按配置顺序分发流程并生成 `AuthReport`；具体 URL、等待、定位器、点击和验证动作保存在 `login_flows.py`。
 
 当前登录预检规则为：
 
 1. `auth_manager.py` 为整轮预检创建一个共享 `LoginRuntime`，再按配置顺序将每个平台交给 `auth_mode` 对应的注册流程；
 2. `pkl_cookie` 流程在清理旧状态前完整加载并格式化 pkl，无法得到有效 Cookie 或 domain 时直接失败；
 3. 流程只清理 pkl 中涉及的精确 Cookie domain，不再清空整个 `BrowserContext`；
-4. `LoginRuntime` 保存本轮已经清理的 domain；多个平台涉及同一父域时，只有第一个平台清理，后续平台直接补充自己的 Cookie；
+4. `LoginRuntime` 保存本轮已经清理的精确 domain 字符串；后续平台遇到完全相同的 domain 时不重复清理，父域与子域不会被视为同一个值；
 5. 注入完成后再次访问 `home_url`，仍进入 `login_url_markers` 指定的登录页则判定失败；
 6. `1688_button_login` 流程沿用现有按钮登录和成功元素校验；
 7. 成功预检页关闭，失败预检页保留给人工巡检或登录。
 
+当前注册表包含 `pkl_cookie`、`1688_button_login`、`tmall_supermarket_active_login`、`qianniu_workbench_active_login`、`dou_shop_active_login`、`kuaishou_xiaodian_active_login`、`pdd_active_login`、`reduyun_active_login` 和 `jingzuanke_active_login`。平台未填写 `auth_mode` 时默认走 `pkl_cookie`；未知模式会在该平台预检阶段明确失败，不会静默回退。
+
 按 domain 清理会移除该 domain 下所有名称和路径的旧 Cookie。该策略适用于当前“一台浏览器通常只重建一个平台登录态”的业务模式，同时保留其他未涉及 domain 的既有登录态。
+
+Daily 只在至少一个平台预检成功后挂载 Context 新页面观察器，并且不扫描挂载前已有页面。这样登录失败后特意保留的诊断页不会被当成任务执行页回收；后续创建 Worker 及任务运行期间产生的新业务页才进入滑块处理与 GC。
 
 ### 单机飞书巡检器
 
@@ -732,7 +752,7 @@ Daily 的计时使用 `time.perf_counter()`，分别覆盖浏览器关闭并重�
 6. 任务未完成时检查 `daily_run.log` 的最后修改时间，超过阈值则标记“疑似故障”；
 7. 将全部客户状态合并为一条可展开详情的飞书交互卡片。
 
-这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器读取上一次账本和日志；通知器异常也不会影响采集任务。
+这使采集 EXE 与通知 EXE 可以独立运行：采集异常不会阻止通知器继续巡检；状态文件会决定旧账本是否可读，避免把上一次结果误算到本轮。通知器异常也不会影响采集任务。
 
 ### Daily 专属即时重试
 
@@ -755,8 +775,8 @@ Backfill 与 Daily 共用的任务卡片弹窗、检测按钮、缺失数量节�
 
 - 一级弹窗恢复后的 5 秒 `trial=True` 可操作性检查；
 - `page.goto()` 与 datatoolcenter 自动登录后的稳定等待；
-- 10 秒页面健康探针；
-- Worker 心跳静默判断（历史模式可配置，默认 120 秒）；
-- 业务执行页 GC 静默判断（历史模式可配置，默认 180 秒）；
+- 20 秒页面健康探针；
+- Worker 心跳静默判断（Backfill 与 Daily 均可配置，默认 120 秒）；
+- 业务执行页 GC 静默判断（Backfill 与 Daily 均可配置，默认 180 秒）；
 - 单个 Worker/GC 心跳节点 30 秒隐藏等待；
 - 红色提示和弹窗关闭器的旁路回收超时。

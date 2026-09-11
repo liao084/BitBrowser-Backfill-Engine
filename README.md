@@ -26,22 +26,30 @@ backfill/
   dailyfill_launcher.py    # Dailyfill 客户配置和实例启动 GUI
   auth_manager.py          # 登录预检编排与 AuthReport 汇总
   login_flows.py           # pkl Cookie、1688 等具体登录流程
+  slider_motion_tools.py   # 拼多多 closed Shadow DOM 滑块识别与拖动
   browser_manager.py       # Bit 浏览器启动、关闭与 CDP 地址获取
   task_ledger.py           # JSONL 任务账本与重试结果汇总
   daily_run_status.py      # Daily 单次运行状态与跨进程归属保护
   daily_notify_agent.py    # 本机飞书巡检通知器
-  .env.example             # 历史补采 / 日常采集配置模板
+  backfill.env.example     # 历史补采配置模板
+  dailyfill.env.example    # 日常采集配置模板
   backfill_launcher_config.example.json # Backfill Launcher 配置模板
   dailyfill_launcher_config.example.json # Dailyfill Launcher 配置模板
   notify_agent.env.example # 飞书通知器配置模板
+  sync_backfill_engine.bat # 同步 Backfill _release Engine 到客户目录
+  sync_daily_engine.bat    # 同步 Dailyfill _release Engine 到客户目录
 ```
 
 真实 `.env`、Cookie、日志、JSONL 账本、Daily 运行状态和 PyInstaller 产物均不会提交到仓库。
 
+手工新建客户任务时，历史补采复制 `backfill.env.example` 为 `.env`，日常采集复制 `dailyfill.env.example` 为 `.env`；两份模板只保留各自模式需要的字段。
+
 ## 开发与打包
 
+项目要求 Python 3.12 或更高版本；依赖版本以 `uv.lock` 为可复现构建基准。
+
 ```powershell
-uv sync
+uv sync --locked
 
 # 历史补采
 uv run pyinstaller --onefile --name backfill_engine backfill_engine.py
@@ -61,7 +69,9 @@ uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 
 部署时将对应 EXE 与其配置文件放在同一目录：`backfill_engine.exe` 和 `daily_engine.exe` 使用 `.env`，`daily_notify_agent.exe` 使用 `notify_agent.env`。
 
-CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。部署包还会分别包含 `backfill\sync_backfill_engine.bat` 和 `dailyfill\sync_daily_engine.bat`，用于把 `_release` 中的新版 Engine 批量同步到已有客户目录。
+CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。部署包还会分别包含 `backfill\sync_backfill_engine.bat` 和 `dailyfill\sync_daily_engine.bat`：前者扫描 `backfill` 根目录下一层、包含 `.env` 的客户目录；后者递归扫描 `dailyfill\DY_JD`、`dailyfill\JD` 和 `dailyfill\SYCM` 三个分类目录。两者都把 `_release` 中的新版 Engine 覆盖同步到匹配的客户目录，正在运行而无法覆盖的 EXE 会计入失败。
+
+两个 Launcher 都可以先保存平台留空的基础 `.env`，方便之后人工补充特化字段；Engine 启动时仍会执行自己的必填校验。Launcher 再次保存会重写 `.env`，因此人工维护的帐密、额外平台和其他特化项必须重新核对。
 
 历史补采的浏览器连接方式由 `.env` 决定：
 
@@ -71,3 +81,5 @@ CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署�
 两种方式都要求浏览器中已经准备好并登录 `datatoolcenter` Worker 页面。历史模式使用贯穿整次运行的共享队列，失败任务立即进入队尾，最多执行 `MAX_ATTEMPTS` 次。`BACKFILL_CDP_SESSION_LIFETIME_HOURS` 是停止领取新任务的软期限；在途任务收尾后按 `BACKFILL_MAX_CDP_REBUILDS` 重建 Playwright/CDP 会话，但不会例行关闭或重启 BitBrowser。重建前必须确认缓存端点仍属于初次连接的同一个浏览器；重建出的新会话会在 Worker 领取任务前清理残留业务页，初始会话不执行这一步。
 
 历史模式还可通过 `WORKER_HEARTBEAT_SILENCE_SECONDS` 和 `BUSINESS_HEARTBEAT_SILENCE_SECONDS` 调整不同业务速度下的静默阈值；后者必须大于前者。
+
+Backfill 与 Daily 共用 Context 级新页面观察器。普通业务页按 `GC_PAGE_URL_MARKERS` 进入心跳与静默回收；URL 命中 `mobile.yangkeduo.com` 的独立滑块页会通过 CDP 穿透 closed Shadow DOM，使用 ddddocr 计算缺口中心和 Playwright 鼠标轨迹，最多尝试 5 次。无论滑块是否通过，该页面随后都会进入同一套 GC 监控，避免长期堆积。

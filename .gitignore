@@ -10,7 +10,8 @@
 !*.md
 !*.bat
 !.gitignore
-!.env.example
+!backfill.env.example
+!dailyfill.env.example
 !notify_agent.env.example
 !backfill_launcher_config.example.json
 !dailyfill_launcher_config.example.json
@@ -43,10 +44,11 @@ temp/
 *.log
 *.jsonl
 
-# 真实部署配置不进入仓库；只提交脱敏模板 .env.example
+# 真实部署配置不进入仓库；只提交脱敏的模式专用模板。
 .env
 .env.*
-!.env.example
+!backfill.env.example
+!dailyfill.env.example
 
 # 虚拟环境与缓存
 .venv/

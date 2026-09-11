@@ -8,13 +8,13 @@
 
 - `daily_engine.exe`
 - `.env`
-- `COOKIE` 目录或 `.env` 中指定的其他 Cookie 目录
+- `.env` 的 `COOKIE_DIR` 指向的 Cookie 目录（仅 `pkl_cookie` 平台实际读取）
 
 程序核心逻辑保存在 EXE 中。推荐使用 Dailyfill Launcher 创建和更新客户实例；也可以直接编辑 `.env` 调整客户、任务卡片 ID、日期或并发量，无需重新打包。
 
 ## 创建配置
 
-复制 `.env.example` 并重命名为 `.env`。真实 `.env` 已被 Git 忽略，不会上传仓库。
+复制 `dailyfill.env.example` 并重命名为 `.env`。真实 `.env` 已被 Git 忽略，不会上传仓库。
 
 Daily-mode 使用以下字段：
 
@@ -22,9 +22,11 @@ Daily-mode 使用以下字段：
 | --- | --- |
 | `BITE_ID` | 比特浏览器 ID |
 | `GC_PAGE_URL_MARKERS` | 需要由业务页面 GC 监控的 URL 片段数组 |
+| `WORKER_HEARTBEAT_SILENCE_SECONDS` | Worker 等待业务完成信号的静默阈值；默认 120 秒 |
+| `BUSINESS_HEARTBEAT_SILENCE_SECONDS` | 业务执行页 GC 的静默阈值；默认 180 秒，必须大于 Worker 阈值 |
 | `WORKER_COUNT` | Worker 页面数量上限；实际数量不会超过任务数 |
 | `MAX_ATTEMPTS` | 每个单日任务最多执行次数，包含首次执行 |
-| `KEEP_BROWSER_AFTER_RUN` | 全部任务成功时是否保留比特浏览器；默认 `true`。失败或未进入有效任务阶段时始终保留现场 |
+| `KEEP_BROWSER_AFTER_RUN` | 全部任务成功时是否保留比特浏览器；默认 `true`。任务失败时，已经打开的浏览器始终保留现场 |
 | `TARGET_DATE_OFFSET_DAYS` | 旧配置和未填写单任务偏移时使用的默认日期偏移 |
 | `TARGET_DATE` | 可选的统一指定日期；留空时使用日期偏移 |
 | `TIME_TYPE` | 可选时间维度：`日`、`周`、`近7天`、`近30天`、`月`；留空或缺失时默认 `日` |
@@ -35,7 +37,23 @@ Daily-mode 使用以下字段：
 | `CUSTOMER_NAME` | 仅供 `daily_notify_agent.py` 在飞书中显示客户名称；daily_engine 不读取 |
 | `REPORT_READY_TIME` | 由 Dailyfill Launcher 配置统一生成；仅供 `daily_notify_agent.py` 判断该客户从几点起纳入汇总，daily_engine 不读取 |
 
-JSON 字段必须写在一行，使用双引号以及小写的 `true` / `false`。建议将 `.env` 保存为 UTF-8。
+JSON 内容必须使用双引号以及小写的 `true` / `false`。可以直接写成单行；需要像 Launcher 输出或 `dailyfill.env.example` 那样跨行时，整段 JSON 必须由同一对单引号包住。`DAILY_TASKS`、`PLATFORMS` 和 `GC_PAGE_URL_MARKERS` 在 Engine 启动时都必须是非空数组。建议将 `.env` 保存为 UTF-8。
+
+`auth_mode` 省略时默认使用 `pkl_cookie`。当前注册模式如下：
+
+| `auth_mode` | 用途 |
+| --- | --- |
+| `pkl_cookie` | 从 `COOKIE_DIR` 加载平台 Cookie、按精确 domain 清理旧 Cookie 后注入并验证 |
+| `1688_button_login` | 1688 页面按钮登录与成功元素校验 |
+| `tmall_supermarket_active_login` | 天猫超市帐密登录 |
+| `qianniu_workbench_active_login` | 千牛工作台帐密登录 |
+| `dou_shop_active_login` | 抖店帐密、店铺选择登录 |
+| `kuaishou_xiaodian_active_login` | 快手小店帐密、店铺选择登录 |
+| `pdd_active_login` | 拼多多商家后台帐密登录 |
+| `reduyun_active_login` | 热度云帐密登录 |
+| `jingzuanke_active_login` | 鲸钻客帐密登录 |
+
+`dailyfill.env.example` 的 `PLATFORMS_EXAMPLE` 提供这些模式的完整结构。Launcher 的平台模板只覆盖通用基础配置；客户专属帐密和未纳入模板的主动登录平台需要在保存后人工补充。
 
 天猫超市后台当前需要在 Launcher 生成 `.env` 后，人工把对应平台配置为：
 
@@ -45,10 +63,11 @@ PLATFORMS='[{"name":"天猫超市后台","home_url":"https://web.txcs.tmall.com/
 
 如果同一客户还有其他平台，应将这个对象追加到原有 `PLATFORMS` 数组，而不是覆盖其他平台。再次通过 Launcher 保存该客户时，当前人工添加的 `auth_params` 可能被平台模板覆盖，需要重新核对。
 
-任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
+Daily Engine 的任务日期优先级为：单任务 `date`、全局 `TARGET_DATE`、单任务
 `target_date_offset_days`、全局 `TARGET_DATE_OFFSET_DAYS`。因此旧 `.env`
 可以继续运行，新 Launcher 保存后则会为每个任务写入各自的日期偏移。
-飞书通知器按 Launcher 格式还原当天预期任务，因此需要通知汇总的客户应确保每个任务均包含 `card_id` 和 `target_date_offset_days`。
+
+飞书通知器当前只按 Launcher 格式还原当天预期任务，不实现 Engine 的完整日期优先级。需要通知汇总的客户应确保每个任务均包含 `card_id` 和 `target_date_offset_days`；只配置单任务 `date`、全局 `TARGET_DATE` 或全局偏移会被通知器判为配置异常或得到与 Engine 不一致的预期任务日期。
 
 ## 运行结果
 
@@ -60,13 +79,16 @@ PLATFORMS='[{"name":"天猫超市后台","home_url":"https://web.txcs.tmall.com/
 - 全部任务成功时，`KEEP_BROWSER_AFTER_RUN=true` 保留浏览器，设为 `false` 则自动关闭；登录失败、初始化失败或存在最终失败任务时始终保留现场供人工检查。
 - `auth_manager.py` 负责预检顺序、共享登录环境和结果汇总；`login_flows.py` 保存各 `auth_mode` 的完整页面操作。
 - 登录预检不再全局清空 `BrowserContext` Cookie；`pkl_cookie` 流程先完整加载并格式化 pkl，再只清理其中涉及的精确 domain，随后注入并验证。
-- 同一轮预检的所有流程共用一个 `LoginRuntime`；已经清理过的 domain 会被记录，后续平台遇到相同 domain 时只注入自己的 Cookie，不再重复清理。
+- 同一轮预检的所有流程共用一个 `LoginRuntime`；已经清理过的精确 domain 字符串会被记录，后续平台遇到完全相同的 domain 时只注入自己的 Cookie，不再重复清理。父域和子域仍是两个不同值。
 - 天猫超市后台使用 `tmall_supermarket_active_login`：流程从该平台的 `auth_params.username` 和 `auth_params.password` 读取帐密，在登录 iframe 内填写后依次点击“登录”和“进入商家”，最后以 `home_url` 的域名与路径确认进入目标业务页。帐密以明文保存在部署环境的 `.env` 中，不要写入 Launcher 配置或提交到 Git。
 - 登录态重建全部失败时不会创建任务池；失败平台页面会保留供人工登录。
+- Context 新页面观察器只在至少一个平台预检成功后挂载，不扫描登录预检阶段已经存在的页面，因此保留下来的失败诊断页不会被业务页 GC 误关。
+- 每个新建 Worker 最多等待 90 秒，以首个可见的 `div.workTool_page_card_test_dataCard:visible` 可点击作为就绪信号；隐藏的同名旧节点不会再阻塞全部 Worker 初始化。
 - `daily_run_status.json` 在任务配置校验完成后先以 `ledger_reset=false` 创建，登录预检后写入平台结果，Worker 稳定且账本重置成功后改为 `true`，最外层退出时将阶段改为 `finished`。新进程启动后拥有状态文件，旧进程不能再覆盖它。
 - 任务失败且未达到 `MAX_ATTEMPTS` 时，会立即以 `attempt + 1` 放回共享队列尾部，不再等待其他任务全部结束后进行总体重试。
 - 健康 Worker 会持续等待队列；所有任务成功或达到各自执行上限后，调度器才统一停止 Worker。
-- Backfill 与 Daily 共用的普通业务元素渲染、可见性和点击等待统一为 30 秒；5 秒 trial、页面导航与稳定等待、页面健康探针、120 秒 Worker 心跳和 180 秒 GC 均保持原值。
+- Backfill 与 Daily 共用的普通业务元素渲染、可见性和点击等待统一为 30 秒；5 秒 trial、页面导航与稳定等待、20 秒页面健康探针，以及由 `.env` 配置的 Worker/业务页心跳静默阈值保留各自语义。
+- Context 新页面命中 `mobile.yangkeduo.com` 时会自动处理 closed Shadow DOM 滑块，最多识别并拖动 5 次；无论最终是否通过，页面都会继续部署业务页 GC 监控。
 - Worker 并发监听“同步成功”和“数据补齐完成”。完成信号只表示业务队列遍历结束；脚本等待网页自动检测结果稳定，确认无缺失后才写入 `success=true`，仍有缺失或结果不可信时进入重试。未捕获完成信号且静默超时时执行主动后端复检兜底。
 - 每次缺失检测都会先等待一级弹窗内的结果项标题 `div.testContent_list_title_dayType` 渲染，再等待 1 秒读取顶部统计；若统计仍是固定占位文本 `：表示缺失数据`，按 0、2、4 秒退避读取同一轮结果，连续 3 次仍未完成时记为失败。
 
@@ -75,7 +97,7 @@ PLATFORMS='[{"name":"天猫超市后台","home_url":"https://web.txcs.tmall.com/
 在 Windows 项目目录执行：
 
 ```powershell
-uv sync
+uv sync --locked
 uv run pyinstaller --onefile --noconsole --name daily_engine daily_engine.py
 ```
 
@@ -113,3 +135,7 @@ Desktop\
 `defaults.task_url` 以及客户或默认的 `report_ready_time` 是 Launcher
 权威值：加载旧 `.env` 时不会用其中的旧值覆盖，再次保存即会回写最新值。
 `_release` 只保存通用发布文件，不存放客户实例。
+
+Launcher 允许平台留空，以便先生成客户目录后人工完成特化配置；但 `daily_engine.py` 本身仍要求 `PLATFORMS` 和 `GC_PAGE_URL_MARKERS` 为非空数组，未补齐时会在启动校验阶段停止。Launcher 每次保存都会重写 `.env`，人工添加的帐密、平台或其他特化字段需要重新核对。
+
+部署包中的 `sync_daily_engine.bat` 只递归同步 `DY_JD`、`JD` 和 `SYCM` 三个分类目录；Launcher 虽然能扫描其他分类，但同步脚本不会自动覆盖这些目录中的 Engine。新增分类时需要同步扩展 BAT 的 `call :SYNC_GROUP` 列表。

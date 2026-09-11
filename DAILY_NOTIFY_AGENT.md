@@ -33,6 +33,8 @@ dailyfill/
 `target_date_offset_days` 还原当天应该出现的 `task_id`；这两个字段
 缺失或无效时，该客户会显示为“配置异常”。
 
+这比 `daily_engine.py` 支持的日期配置更窄：通知器当前不解析单任务 `date`、全局 `TARGET_DATE` 或全局 `TARGET_DATE_OFFSET_DAYS`。需要进入通知汇总的客户应保留 Launcher 生成的逐任务 `target_date_offset_days`，否则通知器可能与 Engine 实际执行日期不一致。
+
 ## 客户 .env 需要增加的字段
 
 ```env
@@ -135,5 +137,6 @@ daily_notify_agent.exe
 ## 打包
 
 ```powershell
-uv run pyinstaller --onefile --noconsole --name daily_notify_agent daily_notify_agent.py
+uv sync --locked
+uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 ```

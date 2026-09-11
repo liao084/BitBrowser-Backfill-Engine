@@ -599,7 +599,7 @@ class BackfillEngine:
 
         while not page.is_closed():
             try:
-                # 与商智 GC 相同：没有目标元素时长期挂起，不做固定频率的 DOM 扫描。
+                # 与业务执行页 GC 相同：没有目标元素时长期挂起，不做固定频率的 DOM 扫描。
                 # 已安排处理的节点带有标记，因此新提示出现后才会重新满足选择器。
                 toast_handle = await page.wait_for_selector(
                     pending_selector,
@@ -689,7 +689,7 @@ class BackfillEngine:
 
     async def _monitor_and_gc_page(self, page: Page):
         """
-        后台垃圾回收协程：基于事件倒计时监控特定商智页面的心跳。
+        后台垃圾回收协程：基于事件倒计时监控特定业务执行页的心跳。
         """
         toast_selector = ".el-message__content:has-text('同步成功')"
         url_suffix = page.url[-25:] if len(page.url) > 25 else page.url
@@ -2320,7 +2320,7 @@ def load_runtime_config() -> BackfillRuntimeConfig:
     env_path = runtime_dir / ".env"
     if not env_path.exists():
         raise FileNotFoundError(
-            f"未找到运行配置 {env_path}；请复制 .env.example 为 .env 后填写。"
+            f"未找到运行配置 {env_path}；请复制 backfill.env.example 为 .env 后填写。"
         )
 
     load_dotenv(env_path)

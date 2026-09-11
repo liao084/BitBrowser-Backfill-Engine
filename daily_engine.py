@@ -154,7 +154,7 @@ def load_daily_runtime_config(
     config_path = Path(env_path) if env_path else runtime_dir / ".env"
     if not config_path.exists():
         raise FileNotFoundError(
-            f"未找到运行配置 {config_path}；请复制 .env.example 为 .env 后填写。"
+            f"未找到运行配置 {config_path}；请复制 dailyfill.env.example 为 .env 后填写。"
         )
 
     # 部署时以 EXE 同目录文件为准，避免机器上遗留的同名系统环境变量覆盖客户配置。

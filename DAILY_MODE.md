@@ -50,7 +50,7 @@ JSON 内容必须使用双引号以及小写的 `true` / `false`。可以直接�
 | `dou_shop_active_login` | 抖店帐密、店铺选择登录 |
 | `kuaishou_xiaodian_active_login` | 快手小店帐密、店铺选择登录 |
 | `pdd_active_login` | 拼多多商家后台帐密登录 |
-| `reduyun_active_login` | 热度云帐密登录 |
+| `reduyun_active_login` | 热度云帐密登录；登录后出现团队选择面板时，按 `auth_params.shop_name` 选择店铺 |
 | `jingzuanke_active_login` | 鲸钻客帐密登录 |
 
 `dailyfill.env.example` 的 `PLATFORMS_EXAMPLE` 提供这些模式的完整结构。Launcher 的平台模板只覆盖通用基础配置；客户专属帐密和未纳入模板的主动登录平台需要在保存后人工补充。

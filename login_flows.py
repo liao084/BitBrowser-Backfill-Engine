@@ -917,7 +917,7 @@ async def login_reduyun(
     runtime: LoginRuntime,
     platform: Dict[str, Any],
 ) -> bool:
-    """使用平台 auth_params 中的帐密主动登录热度云。"""
+    """使用平台 auth_params 中的帐密主动登录热度云，并按需选择店铺。"""
     platform_name = platform["name"]
     home_url = platform["home_url"]
     success_url_marker = _business_url_marker(home_url)
@@ -928,11 +928,15 @@ async def login_reduyun(
 
     username = auth_params.get("username")
     password = auth_params.get("password")
+    shop_name = auth_params.get("shop_name")
     if not isinstance(username, str) or not username.strip():
         logger.error(f"{platform_name} auth_params 缺少有效的 username。")
         return False
     if not isinstance(password, str) or not password:
         logger.error(f"{platform_name} auth_params 缺少有效的 password。")
+        return False
+    if not isinstance(shop_name, str) or not shop_name.strip():
+        logger.error(f"{platform_name} auth_params 缺少有效的 shop_name。")
         return False
 
     page = await runtime.context.new_page()
@@ -986,6 +990,30 @@ async def login_reduyun(
                 exact=True,
             )
             await login_button.click(timeout=10000)
+
+            shop_dialog = page.get_by_role(
+                "dialog",
+                name="请选择要进入的团队",
+                exact=True,
+            )
+            try:
+                await shop_dialog.wait_for(
+                    state="visible",
+                    timeout=10000,
+                )
+            except PlaywrightTimeoutError:
+                logger.info(
+                    f"{platform_name} 未出现店铺选择面板，"
+                    "继续等待登录成功 URL。"
+                )
+            else:
+                target_shop = shop_dialog.get_by_text(
+                    shop_name,
+                    exact=False,
+                )
+                logger.info(f"正在选择热度云店铺: {shop_name}")
+                await target_shop.click(timeout=30000)
+
             await page.wait_for_url(
                 lambda url: success_url_marker in str(url).lower(),
                 timeout=30000,

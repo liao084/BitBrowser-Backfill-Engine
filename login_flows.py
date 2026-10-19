@@ -1014,6 +1014,13 @@ async def login_reduyun(
                 logger.info(f"正在选择热度云店铺: {shop_name}")
                 await target_shop.click(timeout=30000)
 
+                enter_team_button = shop_dialog.get_by_role(
+                    "button",
+                    name="进入团队",
+                    exact=True,
+                )
+                await enter_team_button.click(timeout=30000)
+
             await page.wait_for_url(
                 lambda url: success_url_marker in str(url).lower(),
                 timeout=30000,

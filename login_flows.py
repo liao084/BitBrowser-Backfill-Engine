@@ -1007,14 +1007,17 @@ async def login_reduyun(
                     "继续等待登录成功 URL。"
                 )
             else:
-                target_shop = shop_dialog.get_by_text(
+                target_group = shop_dialog.locator("div.group-item").filter(
+                    has_text=shop_name,
+                )
+                target_shop = target_group.get_by_text(
                     shop_name,
                     exact=False,
                 )
                 logger.info(f"正在选择热度云店铺: {shop_name}")
                 await target_shop.click(timeout=30000)
 
-                enter_team_button = shop_dialog.get_by_role(
+                enter_team_button = target_group.get_by_role(
                     "button",
                     name="进入团队",
                     exact=True,

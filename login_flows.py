@@ -18,6 +18,8 @@ from playwright.async_api import (
     TimeoutError as PlaywrightTimeoutError,
 )
 
+from slider_motion_tools import generate_drag_trajectory
+
 
 logger = logging.getLogger("BackfillEngine")
 
@@ -520,7 +522,7 @@ async def login_qianniu_workbench(
             succeeded = True
             return True
 
-        login_frame = page.frame_locator("iframe").nth(0)
+        login_frame = page.frame_locator("iframe#alibaba-login-box")
         username_input = login_frame.locator("#fm-login-id")
         password_input = login_frame.locator("#fm-login-password")
         try:
@@ -537,6 +539,44 @@ async def login_qianniu_workbench(
             exact=True,
         )
         await login_button.click(timeout=10000)
+        slider_frame = login_frame.frame_locator("iframe#baxia-dialog-content")
+        slider_button = slider_frame.get_by_role("button", name="滑块", exact=True)
+        try:
+            await slider_button.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeoutError:
+            logger.info(f"{platform_name} 登录后 10 秒内未出现滑块，继续检查登录结果。")
+        else:
+            sliding_region = slider_frame.locator("span.nc-lang-cnt")
+            await sliding_region.wait_for(state="visible", timeout=10000)
+            await slider_button.scroll_into_view_if_needed(timeout=10000)
+            slider_box = await slider_button.bounding_box()
+            region_box = await sliding_region.bounding_box()
+            if slider_box is None or region_box is None:
+                raise RuntimeError(f"{platform_name} 无法读取滑块或滑动区域的位置")
+
+            start_x = slider_box["x"] + slider_box["width"] / 2
+            start_y = slider_box["y"] + slider_box["height"] / 2
+            end_x = region_box["x"] + region_box["width"] - slider_box["width"] / 2
+            distance_x = end_x - start_x
+            if distance_x <= 0:
+                raise RuntimeError(f"{platform_name} 滑块可拖动距离无效: {distance_x}")
+
+            trajectory = generate_drag_trajectory(distance_x)
+            logger.info(f"{platform_name} 检测到登录滑块，开始拖动 {distance_x:.2f} CSS 像素。")
+            await page.mouse.move(start_x, start_y)
+            await page.mouse.down()
+            try:
+                loop = asyncio.get_running_loop()
+                started_at = loop.time()
+                for point in trajectory[1:]:
+                    remaining_seconds = started_at + point.elapsed_seconds - loop.time()
+                    if remaining_seconds > 0:
+                        await asyncio.sleep(remaining_seconds)
+                    await page.mouse.move(start_x + point.x, start_y + point.y)
+            finally:
+                await page.mouse.up()
+            logger.info(f"{platform_name} 登录滑块拖动完成，等待成功 URL。")
+
         await page.wait_for_url(
             lambda url: success_url_marker in str(url).lower(),
             timeout=30000,

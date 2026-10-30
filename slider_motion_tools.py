@@ -10,10 +10,11 @@ import binascii
 import logging
 import math
 import random
-from functools import lru_cache
 from io import BytesIO
 from typing import Any, NamedTuple
 
+import cv2
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 from playwright.async_api import Page
 
@@ -24,6 +25,7 @@ RenderedSize = tuple[float, float]
 _SAMPLE_INTERVAL_SECONDS = 0.0167
 _MIN_RANDOM_POINT_COUNT = 49
 _MAX_RANDOM_POINT_COUNT = 74
+_DEFAULT_MINIMUM_MATCH_CONFIDENCE = 0.60
 
 
 class TrajectoryPoint(NamedTuple):
@@ -32,6 +34,13 @@ class TrajectoryPoint(NamedTuple):
     elapsed_seconds: float
     x: float
     y: float
+
+
+class SliderMatchResult(NamedTuple):
+    """滑块模板匹配结果。"""
+
+    distance_x: float
+    confidence: float
 
 
 class _SliderSnapshot(NamedTuple):
@@ -112,41 +121,75 @@ def _validate_uniform_scale(
     return scale_x, scale_y
 
 
-@lru_cache(maxsize=1)
-def _get_slider_matcher():
-    """复用无需 OCR 模型的 ddddocr 滑块匹配器。"""
-    import ddddocr
+def _load_rgb_image_array(
+    image_bytes: bytes,
+    image_name: str,
+) -> np.ndarray:
+    """把图片字节解码为 OpenCV 模板匹配使用的 RGB 数组。"""
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            return np.asarray(image.convert("RGB")).copy()
+    except (UnidentifiedImageError, OSError) as error:
+        raise ValueError(f"{image_name} 不是可识别的图片") from error
 
-    return ddddocr.DdddOcr(ocr=False, det=False, show_ad=False)
+
+def _match_slider_center(
+    target_bytes: bytes,
+    background_bytes: bytes,
+    *,
+    simple_target: bool,
+) -> tuple[float, float, float]:
+    """使用 OpenCV 返回缺口中心坐标和归一化匹配置信度。"""
+    target = _load_rgb_image_array(target_bytes, "target")
+    background = _load_rgb_image_array(background_bytes, "background")
+
+    target_gray = cv2.cvtColor(target, cv2.COLOR_RGB2GRAY)
+    background_gray = cv2.cvtColor(background, cv2.COLOR_RGB2GRAY)
+    target_height, target_width = target_gray.shape
+    background_height, background_width = background_gray.shape
+    if target_width > background_width or target_height > background_height:
+        raise ValueError(
+            "target 原始尺寸不能大于 background: "
+            f"{target_width}x{target_height} > "
+            f"{background_width}x{background_height}"
+        )
+
+    if simple_target:
+        target_for_match = target_gray
+        background_for_match = background_gray
+    else:
+        target_for_match = cv2.Canny(target_gray, 50, 150)
+        background_for_match = cv2.Canny(background_gray, 50, 150)
+
+    # 常量模板没有可用于定位的特征，但 TM_CCOEFF_NORMED 会给出 1.0。
+    # 按低置信度处理，让调用方刷新图片，避免将无效结果用于拖动。
+    if np.ptp(target_for_match) == 0:
+        return float(target_width // 2), float(target_height // 2), 0.0
+
+    response = cv2.matchTemplate(
+        background_for_match,
+        target_for_match,
+        cv2.TM_CCOEFF_NORMED,
+    )
+    _, max_value, _, max_location = cv2.minMaxLoc(response)
+    confidence = float(max_value)
+    if not math.isfinite(confidence):
+        raise ValueError("OpenCV 滑块匹配返回了非有限置信度")
+
+    center_x = float(max_location[0] + target_width // 2)
+    center_y = float(max_location[1] + target_height // 2)
+    return center_x, center_y, confidence
 
 
-def calculate_slider_drag_distance(
+def calculate_slider_match(
     target_data_url: str,
     background_data_url: str,
     target_rendered_size: RenderedSize,
     background_rendered_size: RenderedSize,
     *,
     simple_target: bool = False,
-) -> float:
-    """计算 Playwright 鼠标需要水平移动的 CSS 像素距离。
-
-    本函数采用 ddddocr 1.6.1 的中心点返回协议。它假定：
-
-    - target 与 background 的初始左边缘处于同一水平坐标原点；
-    - target 的中心点与页面滑块按钮的中心点一致；
-    - 两张图片都在浏览器中完整、等比例缩放，没有裁剪。
-
-    Args:
-        target_data_url: target 图片的 Base64 Data URL。
-        background_data_url: background 图片的 Base64 Data URL。
-        target_rendered_size: target 在浏览器中的 ``(width, height)``。
-        background_rendered_size: background 在浏览器中的
-            ``(width, height)``。
-        simple_target: 直接传递给 ddddocr ``slide_match``。
-
-    Returns:
-        鼠标需要水平移动的 CSS 像素距离。正值表示向右。
-    """
+) -> SliderMatchResult:
+    """计算水平拖动距离，并保留 OpenCV 模板匹配置信度。"""
     target_bytes = _decode_image_data_url(target_data_url, "target")
     background_bytes = _decode_image_data_url(
         background_data_url,
@@ -178,29 +221,65 @@ def calculate_slider_drag_distance(
         "background",
     )
 
-    match_result = _get_slider_matcher().slide_match(
+    matched_center_x, matched_center_y, confidence = _match_slider_center(
         target_bytes,
         background_bytes,
         simple_target=simple_target,
     )
-    try:
-        matched_center_x = float(match_result["target_x"])
-        matched_center_y = float(match_result["target_y"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError(
-            "ddddocr 返回值缺少有效的 target_x/target_y 中心点"
-        ) from error
 
     background_width, background_height = background_original_size
     if not 0 <= matched_center_x <= background_width:
-        raise ValueError(f"ddddocr target_x 超出背景图片范围: {matched_center_x}")
+        raise ValueError(
+            f"OpenCV target_x 超出背景图片范围: {matched_center_x}"
+        )
     if not 0 <= matched_center_y <= background_height:
-        raise ValueError(f"ddddocr target_y 超出背景图片范围: {matched_center_y}")
+        raise ValueError(
+            f"OpenCV target_y 超出背景图片范围: {matched_center_y}"
+        )
 
     target_center_source_x = target_original_size[0] / 2
     target_center_css_x = target_center_source_x * target_scale_x
     matched_center_css_x = matched_center_x * background_scale_x
-    return matched_center_css_x - target_center_css_x
+    return SliderMatchResult(
+        distance_x=matched_center_css_x - target_center_css_x,
+        confidence=confidence,
+    )
+
+
+def calculate_slider_drag_distance(
+    target_data_url: str,
+    background_data_url: str,
+    target_rendered_size: RenderedSize,
+    background_rendered_size: RenderedSize,
+    *,
+    simple_target: bool = False,
+) -> float:
+    """计算 Playwright 鼠标需要水平移动的 CSS 像素距离。
+
+    本函数使用 OpenCV 边缘模板匹配。它假定：
+
+    - target 与 background 的初始左边缘处于同一水平坐标原点；
+    - target 的中心点与页面滑块按钮的中心点一致；
+    - 两张图片都在浏览器中完整、等比例缩放，没有裁剪。
+
+    Args:
+        target_data_url: target 图片的 Base64 Data URL。
+        background_data_url: background 图片的 Base64 Data URL。
+        target_rendered_size: target 在浏览器中的 ``(width, height)``。
+        background_rendered_size: background 在浏览器中的
+            ``(width, height)``。
+        simple_target: 是否跳过 Canny 边缘检测，直接匹配灰度图。
+
+    Returns:
+        鼠标需要水平移动的 CSS 像素距离。正值表示向右。
+    """
+    return calculate_slider_match(
+        target_data_url,
+        background_data_url,
+        target_rendered_size,
+        background_rendered_size,
+        simple_target=simple_target,
+    ).distance_x
 
 
 async def calculate_slider_drag_distance_async(
@@ -214,6 +293,25 @@ async def calculate_slider_drag_distance_async(
     """在线程池中计算拖动距离，避免阻塞 Playwright 事件循环。"""
     return await asyncio.to_thread(
         calculate_slider_drag_distance,
+        target_data_url,
+        background_data_url,
+        target_rendered_size,
+        background_rendered_size,
+        simple_target=simple_target,
+    )
+
+
+async def calculate_slider_match_async(
+    target_data_url: str,
+    background_data_url: str,
+    target_rendered_size: RenderedSize,
+    background_rendered_size: RenderedSize,
+    *,
+    simple_target: bool = False,
+) -> SliderMatchResult:
+    """在线程池中计算拖动距离和匹配置信度。"""
+    return await asyncio.to_thread(
+        calculate_slider_match,
         target_data_url,
         background_data_url,
         target_rendered_size,
@@ -480,18 +578,26 @@ async def solve_closed_shadow_slider(
     ready_timeout_seconds: float = 10.0,
     success_timeout_seconds: float = 8.0,
     max_attempts: int = 5,
+    minimum_match_confidence: float = _DEFAULT_MINIMUM_MATCH_CONFIDENCE,
 ) -> bool:
     """识别并拖动拼多多 closed Shadow DOM 滑块。
 
     验证通过后的页面仍可能保留 ``mobile.yangkeduo.com`` URL 前缀，
     因此成功条件是滑块按钮连续三次未出现在 CDP DOM 树中。单个
-    滑块页面最多重新识别并拖动 ``max_attempts`` 次；失败后优先等待
-    页面换出新图片，再重新读取坐标和计算距离。
+    滑块页面最多重新识别 ``max_attempts`` 次。置信度低于
+    ``minimum_match_confidence`` 时不执行拖动，而是刷新页面获取新图；
+    已拖动但未通过时优先等待页面自行换出新图。
     """
     if isinstance(max_attempts, bool) or not isinstance(max_attempts, int):
         raise TypeError("max_attempts 必须是整数")
     if max_attempts < 1:
         raise ValueError("max_attempts 必须大于等于 1")
+    minimum_match_confidence = float(minimum_match_confidence)
+    if (
+        not math.isfinite(minimum_match_confidence)
+        or not -1.0 <= minimum_match_confidence <= 1.0
+    ):
+        raise ValueError("minimum_match_confidence 必须在 -1 到 1 之间")
 
     cdp_session = await page.context.new_cdp_session(page)
     mouse_is_down = False
@@ -535,15 +641,39 @@ async def solve_closed_shadow_slider(
                     "仍使用当前图片重新识别。"
                 )
 
-            distance_x = await calculate_slider_drag_distance_async(
+            match_result = await calculate_slider_match_async(
                 snapshot.target_data_url,
                 snapshot.background_data_url,
                 snapshot.target_rendered_size,
                 snapshot.background_rendered_size,
             )
+            if match_result.confidence < minimum_match_confidence:
+                logger.warning(
+                    f"[Slider] 第 {attempt}/{max_attempts} 次识别置信度 "
+                    f"{match_result.confidence:.3f} 低于阈值 "
+                    f"{minimum_match_confidence:.3f}，跳过拖动。"
+                )
+                previous_snapshot = snapshot
+                if attempt < max_attempts:
+                    try:
+                        await page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=30000,
+                        )
+                    except Exception as error:
+                        if page.is_closed():
+                            return False
+                        logger.warning(
+                            "[Slider] 低置信度后刷新页面异常，"
+                            f"将继续重新识别: {error}"
+                        )
+                continue
+
+            distance_x = match_result.distance_x
             logger.info(
                 f"[Slider] 开始第 {attempt}/{max_attempts} 次拖动，"
-                f"识别距离 {distance_x:.2f} CSS 像素。"
+                f"识别距离 {distance_x:.2f} CSS 像素，"
+                f"置信度 {match_result.confidence:.3f}。"
             )
             trajectory = generate_drag_trajectory(distance_x)
             start_x, start_y = snapshot.button_center
@@ -594,7 +724,9 @@ async def solve_closed_shadow_slider(
                     "等待验证码图片刷新后重试。"
                 )
 
-        logger.error(f"[Slider] 连续 {max_attempts} 次拖动均未通过。")
+        logger.error(
+            f"[Slider] 连续 {max_attempts} 次识别/拖动尝试均未通过。"
+        )
         return False
     finally:
         if mouse_is_down:

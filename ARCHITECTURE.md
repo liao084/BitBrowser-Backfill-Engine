@@ -496,7 +496,7 @@ GC_PAGE_URL_MARKERS=["ppzh.jd.com"]
 
 `mobile.yangkeduo.com` 是当前代码内置的特殊 URL 标记，不依赖 `GC_PAGE_URL_MARKERS`。页面的滑块节点位于 closed Shadow DOM，普通 Locator 无法进入，因此 `slider_motion_tools.py` 通过页面级 CDP Session 获取 `pierce=true` 的完整 DOM 树，读取背景图、缺口图、渲染尺寸和按钮中心点。
 
-ddddocr 的 `slide_match()` 返回缺口中心坐标；脚本将原图像素换算为页面 CSS 像素，再生成 Minimum Jerk 进度的随机贝塞尔轨迹并使用 Playwright 鼠标拖动。单页最多重新读取图片并尝试 5 次，以滑块按钮连续 3 次从 CDP DOM 树中消失作为成功条件，而不是依赖 URL 变化。
+`slider_motion_tools.py` 使用 OpenCV 完成灰度化、Canny 边缘检测与 `TM_CCOEFF_NORMED` 模板匹配，同时得到缺口中心坐标和归一化置信度。置信度低于默认阈值 `0.60` 时，脚本不执行这次拖动，而是刷新滑块页换取新图。通过阈值后，脚本将原图像素换算为页面 CSS 像素，生成 Minimum Jerk 进度的随机贝塞尔轨迹，再使用 Playwright 鼠标拖动。单页最多识别 5 次，以滑块按钮连续 3 次从 CDP DOM 树中消失作为成功条件，而不是依赖 URL 变化。
 
 `_delayed_check()` 无论滑块最终通过、失败还是处理抛出异常，只要页面仍存在，就会给它部署 `_monitor_and_gc_page()`。该协程与延迟识别任务都由 `_track_gc_background_task()` 持有。当前 CDP 会话结束时，管理器先对它们请求取消，再通过 `asyncio.gather(..., return_exceptions=True)` 等待所有任务完成取消收尾，并统一回收取消或异常结果。最终收尾与 CDP 重建预清理的主动扫描仍只匹配 `GC_PAGE_URL_MARKERS`；滑块页如果也需要被这两次扫描兜底，应同时把相应 URL 标记加入部署环境配置。
 

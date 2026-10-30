@@ -14,6 +14,7 @@
 - [历史补采架构与执行流程](ARCHITECTURE.md)
 - [日常采集部署与配置说明](DAILY_MODE.md)
 - [飞书巡检通知器说明](DAILY_NOTIFY_AGENT.md)
+- [Go / Fyne 统一启动器：界面、部署与构建](launcher-go/README.md)
 
 ## 目录结构
 
@@ -24,6 +25,7 @@ backfill/
   browser_connector.py     # BitBrowser / 外部 Chromium CDP 连接器
   daily_engine.py          # 日常采集入口
   dailyfill_launcher.py    # Dailyfill 客户配置和实例启动 GUI
+  launcher-go/            # Go / Fyne 统一启动器，可切换每日采集与历史补采
   auth_manager.py          # 登录预检编排与 AuthReport 汇总
   login_flows.py           # pkl Cookie、1688 等具体登录流程
   slider_motion_tools.py   # 拼多多 closed Shadow DOM 滑块识别与拖动
@@ -71,6 +73,8 @@ uv run pyinstaller --onefile --name daily_notify_agent daily_notify_agent.py
 
 CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署包根目录，对应的 Engine 与 Launcher 配置位于 `backfill\_release` 或 `dailyfill\_release`。`_release` 中只保存通用发布文件，客户实例由 Launcher 在对应主目录下创建。部署包还会分别包含 `backfill\sync_backfill_engine.bat` 和 `dailyfill\sync_daily_engine.bat`：前者扫描 `backfill` 根目录下一层、包含 `.env` 的客户目录；后者递归扫描 `dailyfill\DY_JD`、`dailyfill\JD` 和 `dailyfill\SYCM` 三个分类目录。两者都把 `_release` 中的新版 Engine 覆盖同步到匹配的客户目录，正在运行而无法覆盖的 EXE 会计入失败。
 
+另有独立构建的 Go / Fyne 统一启动器 `Launcher.exe`，默认每日采集，可切换历史补采。它放在 `dailyfill` 与 `backfill` 的共同父目录，沿用各模式 `_release` 中的 JSON 和 Python 引擎 EXE；不依赖 PySide6。当前 CI 仍生成原 Python Launcher，Go 版的 Mac 构建与 Windows 交叉构建见上述专用说明。
+
 两个 Launcher 都可以先保存平台留空的基础 `.env`，方便之后人工补充特化字段；Engine 启动时仍会执行自己的必填校验。Launcher 再次保存会重写 `.env`，因此人工维护的帐密、额外平台和其他特化项必须重新核对。
 
 历史补采的浏览器连接方式由 `.env` 决定：
@@ -82,4 +86,4 @@ CI 生成的两个 Launcher 部署包使用相同结构：Launcher 位于部署�
 
 历史模式还可通过 `WORKER_HEARTBEAT_SILENCE_SECONDS` 和 `BUSINESS_HEARTBEAT_SILENCE_SECONDS` 调整不同业务速度下的静默阈值；后者必须大于前者。
 
-Backfill 与 Daily 共用 Context 级新页面观察器。普通业务页按 `GC_PAGE_URL_MARKERS` 进入心跳与静默回收；URL 命中 `mobile.yangkeduo.com` 的独立滑块页会通过 CDP 穿透 closed Shadow DOM，使用 ddddocr 计算缺口中心和 Playwright 鼠标轨迹，最多尝试 5 次。无论滑块是否通过，该页面随后都会进入同一套 GC 监控，避免长期堆积。
+Backfill 与 Daily 共用 Context 级新页面观察器。普通业务页按 `GC_PAGE_URL_MARKERS` 进入心跳与静默回收；URL 命中 `mobile.yangkeduo.com` 的独立滑块页会通过 CDP 穿透 closed Shadow DOM，使用 OpenCV 边缘模板匹配计算缺口中心和置信度，再生成 Playwright 鼠标轨迹。单页最多识别 5 次；低于 `0.60` 的结果不执行拖动，而是刷新页面获取新图。无论滑块是否通过，该页面随后都会进入同一套 GC 监控，避免长期堆积。

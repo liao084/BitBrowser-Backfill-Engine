@@ -18,6 +18,13 @@
 !pyproject.toml
 !uv.lock
 !.python-version
+!launcher-go/
+!launcher-go/*.go
+!launcher-go/*.md
+!launcher-go/*.sh
+!launcher-go/*.plist
+!launcher-go/go.mod
+!launcher-go/go.sum
 !.github/
 !.github/workflows/
 !.github/workflows/*.yml

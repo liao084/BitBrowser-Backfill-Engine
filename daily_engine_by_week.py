@@ -126,26 +126,44 @@ class WeeklyEngine(DailyEngine):
         field_name: str,
     ) -> Dict[str, Any]:
         """调用已验证的组件事件链，并复用父类的页面操作硬超时。"""
-        # 两端传入自然周边界，组件统一接收该周的周一：周编号相同，
-        # 也避免周一运行时上周日仍被页面的“最近几天不可选”规则禁用。
-        target = date.fromisoformat(target_date)
-        week_monday = (target - timedelta(days=target.weekday())).isoformat()
+        # 保留周一/周日边界：两端可选范围按实际日期联动，不能都改成周一。
+        normalized_date = date.fromisoformat(target_date).isoformat()
         await input_locator.wait_for(state="visible", timeout=30000)
         result = await self._await_page_operation(
-            input_locator.evaluate(INJECT_WEEK_DATE_JS, week_monday),
+            input_locator.evaluate(INJECT_WEEK_DATE_JS, normalized_date),
             worker_id,
             f"注入{field_name}周日期 {target_date}",
         )
         logger.info(
-            "Worker-%s %s日期 %s（周一锚点 %s）→ %s，组件绑定日期=%s",
+            "Worker-%s %s日期 %s → %s，组件绑定日期=%s",
             worker_id,
             field_name,
-            target_date,
-            week_monday,
+            normalized_date,
             result["displayValue"],
             result["boundDate"],
         )
         return result
+
+    async def _initialize_week_range(
+        self,
+        start_input: Locator,
+        end_input: Locator,
+        worker_id: str,
+    ) -> None:
+        """以最晚可用完整周初始化区间：先放宽结束边界，再设置开始边界。
+
+        初始化日期独立于采集目标；调用方随后仍须完整设置目标开始、结束日期。
+        即使初始化跨周发生变化，最终目标仍使用任务中已经确定的区间。
+        """
+        init_start, init_end = previous_week_range(date.today())
+        logger.info(
+            "Worker-%s 初始化周区间：%s 至 %s，先结束、后开始",
+            worker_id,
+            init_start,
+            init_end,
+        )
+        await self._inject_week_date(end_input, init_end, worker_id, "结束")
+        await self._inject_week_date(start_input, init_start, worker_id, "开始")
 
     async def inject_dates(
         self,
@@ -154,7 +172,7 @@ class WeeklyEngine(DailyEngine):
         end_date: str,
         worker_id: str,
     ) -> None:
-        """首次检测、失败重试和静默终态复检均通过本方法注入周日期。"""
+        """统一执行区间初始化和目标注入；目标由调用方提供，与采集模式无关。"""
         logger.info(
             "Worker-%s 开始注入周采集区间：%s 至 %s",
             worker_id,
@@ -162,6 +180,11 @@ class WeeklyEngine(DailyEngine):
             end_date,
         )
         try:
+            monday = date.fromisoformat(start_date)
+            sunday = date.fromisoformat(end_date)
+            if monday.weekday() != 0 or sunday.weekday() != 6 or monday > sunday:
+                raise ValueError("目标周区间必须从周一开始、周日结束，且开始不晚于结束")
+
             primary_drawer = self._primary_drawer(page)
             start_input = primary_drawer.get_by_role("textbox", name="开始", exact=False)
             end_input = primary_drawer.get_by_role("textbox", name="结束", exact=False)
@@ -172,24 +195,15 @@ class WeeklyEngine(DailyEngine):
                 if count != 1:
                     raise RuntimeError(f"预期找到 1 个{field_name}日期输入框，实际 {count} 个")
 
-            start_result = await self._inject_week_date(
+            await self._initialize_week_range(start_input, end_input, worker_id)
+
+            logger.info("Worker-%s 初始化完成，按先开始、后结束设置目标区间", worker_id)
+            await self._inject_week_date(
                 start_input, start_date, worker_id, "开始"
             )
-            end_result = await self._inject_week_date(
+            await self._inject_week_date(
                 end_input, end_date, worker_id, "结束"
             )
-            # 结束日期的业务回调可能联动开始日期；两端设置后再复核显示。
-            for field_name, input_locator, result in (
-                ("开始", start_input, start_result),
-                ("结束", end_input, end_result),
-            ):
-                actual = await self._await_page_operation(
-                    input_locator.input_value(), worker_id, f"复核{field_name}周日期"
-                )
-                if actual != result["displayValue"]:
-                    raise RuntimeError(
-                        f"{field_name}周日期被联动修改：预期 {result['displayValue']}，实际 {actual}"
-                    )
         except Exception:
             logger.exception("Worker-%s 周日期注入失败", worker_id)
             raise

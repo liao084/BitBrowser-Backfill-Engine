@@ -19,9 +19,15 @@ from github_info import GIT_SHA
 
 
 INJECT_WEEK_DATE_JS = r"""async (input, dateText) => {
-    const vm = input.closest('.el-date-editor')?.__vue__?.$parent;
-    if (vm?.$options.name !== 'ElDatePicker' || vm.type !== 'week') {
-        throw new Error('未找到当前输入框对应的 ElDatePicker 周组件');
+    // 共享根 DOM 的关联实例可能是 ElInput，也可能已是 ElDatePicker。
+    const entry = input.closest('.el-date-editor')?.__vue__;
+    let vm = entry;
+    while (vm && (vm.$options?.name !== 'ElDatePicker' || vm.type !== 'week')) {
+        vm = vm.$parent;
+    }
+    if (!vm) {
+        const entryName = entry?.$options?.name || entry?.$options?._componentTag || '无';
+        throw new Error(`未找到当前输入框对应的 ElDatePicker 周组件（入口=${entryName}，type=${entry?.type || '无'}）`);
     }
     if (vm.pickerDisabled || vm.readonly) {
         throw new Error('周日期组件当前不可修改');

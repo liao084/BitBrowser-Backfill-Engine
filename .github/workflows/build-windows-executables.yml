@@ -12,6 +12,7 @@ on:
       - "backfill_launcher_config.example.json"
       - "browser_connector.py"
       - "daily_engine.py"
+      - "daily_engine_by_week.py"
       - "daily_run_status.py"
       - "dailyfill_launcher.py"
       - "dailyfill_launcher_config.example.json"
@@ -69,6 +70,7 @@ jobs:
           backfill_launcher.py
           browser_connector.py
           daily_engine.py
+          daily_engine_by_week.py
           daily_run_status.py
           dailyfill_launcher.py
           daily_notify_agent.py
@@ -95,6 +97,15 @@ jobs:
           --noconsole
           --name daily_engine
           daily_engine.py
+
+      - name: Build Weekly Daily EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --noconsole
+          --name daily_engine_by_week
+          daily_engine_by_week.py
 
       - name: Build Daily Notify Agent EXE
         run: >
@@ -150,6 +161,14 @@ jobs:
         with:
           name: daily-engine-windows
           path: dist/daily_engine.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Weekly Daily EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: daily-engine-by-week-windows
+          path: dist/daily_engine_by_week.exe
           if-no-files-found: error
           retention-days: 30
 

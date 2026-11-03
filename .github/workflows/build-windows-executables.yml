@@ -8,6 +8,7 @@ on:
       - main
     paths:
       - "backfill_engine.py"
+      - "backfill_engine_by_week.py"
       - "backfill_launcher.py"
       - "backfill_launcher_config.example.json"
       - "browser_connector.py"
@@ -67,6 +68,7 @@ jobs:
         run: >
           uv run python -m py_compile
           backfill_engine.py
+          backfill_engine_by_week.py
           backfill_launcher.py
           browser_connector.py
           daily_engine.py
@@ -88,6 +90,14 @@ jobs:
           --onefile
           --name backfill_engine
           backfill_engine.py
+
+      - name: Build Weekly Backfill EXE
+        run: >
+          uv run pyinstaller
+          --clean
+          --onefile
+          --name backfill_engine_by_week
+          backfill_engine_by_week.py
 
       - name: Build Daily EXE
         run: >
@@ -153,6 +163,14 @@ jobs:
         with:
           name: backfill-engine-windows
           path: dist/backfill_engine.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload Weekly Backfill EXE
+        uses: actions/upload-artifact@v7
+        with:
+          name: backfill-engine-by-week-windows
+          path: dist/backfill_engine_by_week.exe
           if-no-files-found: error
           retention-days: 30
 
